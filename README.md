@@ -127,7 +127,8 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Usage | `quota-axi --no-credential-refresh --json` | 5 min |
 
 Each source runs on its own thread, with a timeout, and never overlaps itself.
-A source that fails keeps its last good data, is marked with `!` in the footer (a fleet snapshot error is spelled out under the summary line), and is retried less often, doubling up to 5 minutes, until it recovers.
+A source that fails keeps its last good data and is marked with `!` in the footer (a fleet snapshot error is spelled out under the summary line).
+When its read fails outright, it is retried less often, doubling up to 5 minutes, until it recovers; a read where only some items failed, such as one unresolvable PR or one worktree, is still marked but keeps its normal cadence.
 The fleet snapshot is the expensive one (a few CPU-seconds per run), which is why it runs once a minute; everything else is close to free.
 Crowsnest itself, not counting the commands it runs, measured about 1% of one core and 7 MB of memory over two minutes against a six-worker fleet.
 
