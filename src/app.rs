@@ -1,8 +1,10 @@
 //! UI state and key handling. Pure: no I/O, so it is unit-testable.
 
+use crate::config::{Overrides, Panel, Settings};
 use crate::model::{
     CheckState, Pipeline, PrChecks, Snapshot, Stale, Thresholds, Worker, WorkerState, classify,
 };
+use crate::options::{self, Category, Item, Target};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +44,67 @@ pub enum Action {
     Pause,
     Help,
     Quit,
+    /// Open or close the options menu.
+    Options,
+    /// Show or hide a panel.
+    Panel(Panel),
+    /// In the options menu: change the selected row, up or down.
+    Change {
+        up: bool,
+    },
+    /// In the options menu: the next or previous category.
+    Category {
+        next: bool,
+    },
+}
+
+/// The open options menu.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Menu {
+    pub category: Category,
+    /// The selected row, by position.
+    pub selected: usize,
+    /// The selected row, by what it changes, so the selection stays on it
+    /// when usage windows come and go between reads.
+    focus: Option<Target>,
+}
+
+impl Menu {
+    fn new(category: Category) -> Self {
+        Menu {
+            category,
+            selected: 0,
+            focus: None,
+        }
+    }
+
+    /// The selected row of `items`, if there is one.
+    pub fn index(&self, items: &[Item]) -> Option<usize> {
+        if items.is_empty() {
+            return None;
+        }
+        let by_focus = self
+            .focus
+            .as_ref()
+            .and_then(|f| items.iter().position(|i| &i.target == f));
+        Some(by_focus.unwrap_or(self.selected.min(items.len() - 1)))
+    }
+
+    fn select(&mut self, i: usize, items: &[Item]) {
+        self.selected = i;
+        self.focus = items.get(i).map(|it| it.target.clone());
+    }
+}
+
+/// What the options menu shows about the config file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigStatus {
+    /// Where settings are saved, as shown to the reader.
+    pub path: String,
+    /// Entries of the file that were ignored, and why.
+    pub problems: Vec<String>,
+    /// When settings were last saved, and the error if that failed.
+    pub saved: Option<(i64, Option<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +115,14 @@ pub struct App {
     pub help: bool,
     pub quit: bool,
     pub paused: bool,
+    /// The settings as the config file has them; the options menu edits these.
+    pub settings: Settings,
+    /// Settings given on the command line, which win over the file.
+    pub overrides: Overrides,
+    /// The thresholds in effect: the file's, with the overrides on top.
     pub thresholds: Thresholds,
+    pub menu: Option<Menu>,
+    pub config: ConfigStatus,
     /// A fleet read this old is overdue, unless refresh is paused.
     pub read_overdue_secs: i64,
     changes: BTreeMap<String, Seen>,
@@ -72,8 +142,15 @@ struct Seen {
     changed_at: Option<i64>,
 }
 
+impl Default for App {
+    fn default() -> Self {
+        App::new(Settings::default(), Overrides::default())
+    }
+}
+
 impl App {
-    pub fn new(thresholds: Thresholds) -> Self {
+    pub fn new(settings: Settings, overrides: Overrides) -> Self {
+        let thresholds = overrides.apply(&settings).thresholds();
         App {
             selected: None,
             expanded: BTreeSet::new(),
@@ -81,7 +158,11 @@ impl App {
             help: false,
             quit: false,
             paused: false,
+            settings,
+            overrides,
             thresholds,
+            menu: None,
+            config: ConfigStatus::default(),
             read_overdue_secs: DEFAULT_READ_OVERDUE_SECS,
             changes: BTreeMap::new(),
             seeded: false,
@@ -142,23 +223,79 @@ impl App {
             .map(|at| (now - at).max(0))
     }
 
-    /// Apply a key action against the rows currently on screen. Returns true
-    /// when the action asks the collector to refresh.
-    pub fn apply(&mut self, action: Action, rows: &[Row]) -> bool {
+    /// The settings in effect: the file's, with the overrides on top.
+    pub fn effective(&self) -> Settings {
+        self.overrides.apply(&self.settings)
+    }
+
+    /// The rows of the options menu's current category.
+    pub fn menu_items(&self, snap: &Snapshot) -> Vec<Item> {
+        self.menu.as_ref().map_or_else(Vec::new, |m| {
+            options::items(m.category, &self.settings, &self.overrides, &snap.quota)
+        })
+    }
+
+    /// Apply a key action to the screen drawn from `snap`. Returns true when
+    /// the action asks the collector to refresh. A change to the settings
+    /// shows in [`App::settings`]; saving them is the caller's job.
+    pub fn apply(&mut self, action: Action, snap: &Snapshot) -> bool {
         if self.help && !matches!(action, Action::Quit) {
             self.help = false;
             return false;
         }
-        let idx = self.selected_index(rows);
-        let pick = |i: usize| rows.get(i).map(|r| r.worker.id.clone());
+        match action {
+            Action::Quit => self.quit = true,
+            Action::Panel(p) => {
+                options::change(&Target::Panel(p), &mut self.settings, &self.overrides, true);
+            }
+            Action::Options if self.menu.is_some() => self.menu = None,
+            Action::Options => self.menu = Some(Menu::new(Category::Panels)),
+            _ if self.menu.is_some() => self.apply_menu(action, snap),
+            _ => {
+                let rows = visible_rows(snap, self);
+                let ids: Vec<String> = rows.iter().map(|r| r.worker.id.clone()).collect();
+                let idx = self.selected_index(&rows);
+                return self.apply_roster(action, &ids, idx);
+            }
+        }
+        self.thresholds = self.effective().thresholds();
+        false
+    }
+
+    fn apply_menu(&mut self, action: Action, snap: &Snapshot) {
+        let Some(mut menu) = self.menu.take() else {
+            return;
+        };
+        let items = options::items(menu.category, &self.settings, &self.overrides, &snap.quota);
+        let idx = menu.index(&items).unwrap_or(0);
+        let last = items.len().saturating_sub(1);
+        match action {
+            Action::Up => menu.select(idx.saturating_sub(1), &items),
+            Action::Down => menu.select((idx + 1).min(last), &items),
+            Action::Top => menu.select(0, &items),
+            Action::Bottom => menu.select(last, &items),
+            Action::Change { up } => {
+                if let Some(item) = items.get(idx) {
+                    options::change(&item.target, &mut self.settings, &self.overrides, up);
+                    menu.select(idx, &items);
+                }
+            }
+            Action::Category { next } => menu = Menu::new(menu.category.cycle(next)),
+            _ => {}
+        }
+        self.menu = Some(menu);
+    }
+
+    fn apply_roster(&mut self, action: Action, ids: &[String], idx: Option<usize>) -> bool {
+        let pick = |i: usize| ids.get(i).cloned();
         match action {
             Action::Up => self.selected = pick(idx.map_or(0, |i| i.saturating_sub(1))),
             Action::Down => {
-                let last = rows.len().saturating_sub(1);
+                let last = ids.len().saturating_sub(1);
                 self.selected = pick(idx.map_or(0, |i| (i + 1).min(last)));
             }
             Action::Top => self.selected = pick(0),
-            Action::Bottom => self.selected = pick(rows.len().saturating_sub(1)),
+            Action::Bottom => self.selected = pick(ids.len().saturating_sub(1)),
             Action::Toggle => {
                 if let Some(id) = idx.and_then(pick) {
                     if !self.expanded.remove(&id) {
@@ -176,7 +313,12 @@ impl App {
             Action::Refresh => return true,
             Action::Pause => self.paused = !self.paused,
             Action::Help => self.help = true,
-            Action::Quit => self.quit = true,
+            // Handled by `apply`, or only meaningful in the options menu.
+            Action::Quit
+            | Action::Options
+            | Action::Panel(_)
+            | Action::Change { .. }
+            | Action::Category { .. } => {}
         }
         false
     }
@@ -369,7 +511,8 @@ pub fn visible_rows<'a>(snap: &'a Snapshot, app: &App) -> Vec<Row<'a>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Fleet;
+    use crate::config::Setting;
+    use crate::model::{Fleet, QuotaWindow};
 
     fn snap() -> Snapshot {
         let w = |id: &str, state: &str| Worker {
@@ -417,7 +560,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut app = App::new(Thresholds::new(1800));
+        let mut app = App::default();
         app.observe(&s);
         let state = |s: &Snapshot| {
             all_rows(s, &Thresholds::new(1800))
@@ -448,7 +591,7 @@ mod tests {
     fn a_pipeline_read_after_the_fleet_is_met_not_changed() {
         let mut s = snap();
         s.now = 1_000_000;
-        let mut app = App::new(Thresholds::new(1800));
+        let mut app = App::default();
         // The fleet is read first; the pipeline tier has not read yet.
         app.observe(&s);
         // Five seconds on it reads a run parked at its gate for 1h17m.
@@ -478,26 +621,106 @@ mod tests {
     #[test]
     fn navigation_filter_and_expand() {
         let s = snap();
-        let mut app = App::new(Thresholds::new(1800));
-        let rows = visible_rows(&s, &app);
-        app.apply(Action::Down, &rows);
+        let mut app = App::default();
+        app.apply(Action::Down, &s);
         assert_eq!(app.selected.as_deref(), Some("b-work"));
-        app.apply(Action::Toggle, &rows);
+        app.apply(Action::Toggle, &s);
         assert!(app.expanded.contains("b-work"));
-        app.apply(Action::Toggle, &rows);
+        app.apply(Action::Toggle, &s);
         assert!(!app.expanded.contains("b-work"));
-        app.apply(Action::Bottom, &rows);
+        app.apply(Action::Bottom, &s);
         assert_eq!(app.selected.as_deref(), Some("idle"));
-        app.apply(Action::Filter, &rows);
+        app.apply(Action::Filter, &s);
         assert_eq!(visible_rows(&s, &app).len(), 2);
-        app.apply(Action::Filter, &rows);
+        app.apply(Action::Filter, &s);
         assert_eq!(visible_rows(&s, &app).len(), 1);
-        assert!(app.apply(Action::Refresh, &rows));
-        app.apply(Action::Help, &rows);
+        assert!(app.apply(Action::Refresh, &s));
+        app.apply(Action::Help, &s);
         assert!(app.help);
-        app.apply(Action::Down, &rows);
+        app.apply(Action::Down, &s);
         assert!(!app.help, "any key closes help");
-        app.apply(Action::Quit, &rows);
+        app.apply(Action::Quit, &s);
         assert!(app.quit);
+    }
+
+    #[test]
+    fn panel_hotkeys_toggle_from_the_dashboard_and_the_menu() {
+        let s = snap();
+        let mut app = App::default();
+        app.apply(Action::Panel(Panel::Runners), &s);
+        assert!(!app.settings.shown(Panel::Runners));
+        app.apply(Action::Options, &s);
+        app.apply(Action::Panel(Panel::Runners), &s);
+        assert!(
+            app.settings.shown(Panel::Runners),
+            "1-5 work in the menu too"
+        );
+        assert!(app.menu.is_some(), "and leave it open");
+        app.apply(Action::Options, &s);
+        app.apply(Action::Help, &s);
+        app.apply(Action::Panel(Panel::Host), &s);
+        assert!(!app.help);
+        assert!(
+            app.settings.shown(Panel::Host),
+            "a key that closes help does nothing else"
+        );
+    }
+
+    #[test]
+    fn menu_keys_select_and_change_rows() {
+        let mut s = snap();
+        s.quota = vec![
+            QuotaWindow {
+                provider: "claude".into(),
+                id: "five_hour".into(),
+                label: "session".into(),
+                ..Default::default()
+            },
+            QuotaWindow {
+                provider: "copilot".into(),
+                id: "premium_interactions".into(),
+                label: "premium interactions".into(),
+                pct_used: 100.0,
+                ..Default::default()
+            },
+        ];
+        let mut overrides = Overrides::default();
+        overrides.set(Setting::ParkedMinutes, 3);
+        let mut app = App::new(Settings::default(), overrides);
+        assert_eq!(app.thresholds.parked_secs, 180, "the flag is in effect");
+        app.apply(Action::Options, &s);
+        // Down to runners, and hide it.
+        app.apply(Action::Down, &s);
+        app.apply(Action::Change { up: false }, &s);
+        assert!(!app.settings.shown(Panel::Runners));
+        // Roster keys mean nothing here.
+        app.apply(Action::Filter, &s);
+        assert_eq!(app.filter, Filter::All);
+        // Usage: the last row is copilot's premium window.
+        app.apply(Action::Category { next: true }, &s);
+        app.apply(Action::Bottom, &s);
+        app.apply(Action::Change { up: true }, &s);
+        assert!(app.settings.usage_hidden("copilot", "premium_interactions"));
+        // A new read drops claude: the selection stays on the same window.
+        s.quota.remove(0);
+        app.apply(Action::Up, &s);
+        let items = app.menu_items(&s);
+        let menu = app.menu.as_ref().unwrap();
+        assert_eq!(items[menu.index(&items).unwrap()].label, "copilot");
+        // Thresholds: stale steps up, the pinned parked row does not change.
+        app.apply(Action::Category { next: true }, &s);
+        app.apply(Action::Change { up: true }, &s);
+        assert_eq!(app.settings.stale_minutes, 45);
+        assert_eq!(app.thresholds.stale_secs, 45 * 60, "applied at once");
+        app.apply(Action::Down, &s);
+        app.apply(Action::Change { up: true }, &s);
+        assert_eq!(app.settings.parked_minutes, 10);
+        assert_eq!(app.thresholds.parked_secs, 180);
+        // Back around to panels, then close.
+        app.apply(Action::Category { next: false }, &s);
+        app.apply(Action::Category { next: false }, &s);
+        assert_eq!(app.menu.as_ref().unwrap().category, Category::Panels);
+        app.apply(Action::Options, &s);
+        assert!(app.menu.is_none());
     }
 }

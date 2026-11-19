@@ -20,7 +20,7 @@ use crate::model::{Fleet, Freshness, Job, PrChecks, Snapshot};
 use crate::sources::{self, host::HostReader, runners};
 use crate::timefmt::now_epoch;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -55,6 +55,28 @@ pub type Shared = Arc<Mutex<Snapshot>>;
 pub struct Handle {
     wakers: Vec<Sender<()>>,
     paused: Arc<AtomicBool>,
+    intervals: Arc<Intervals>,
+}
+
+/// The cadences the options menu can change while crowsnest runs, in
+/// milliseconds.
+#[derive(Debug, Default)]
+struct Intervals {
+    fleet: AtomicU64,
+    pipeline: AtomicU64,
+}
+
+impl Intervals {
+    fn get(v: &AtomicU64) -> Duration {
+        Duration::from_millis(v.load(Ordering::Relaxed))
+    }
+
+    fn set(v: &AtomicU64, d: Duration) {
+        v.store(
+            d.as_millis().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 impl Handle {
@@ -71,6 +93,13 @@ impl Handle {
 
     pub fn paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Change the fleet and pipeline cadences; each tier picks the new one up
+    /// on its next check.
+    pub fn set_intervals(&self, fleet: Duration, pipeline: Duration) {
+        Intervals::set(&self.intervals.fleet, fleet);
+        Intervals::set(&self.intervals.pipeline, pipeline);
     }
 }
 
@@ -204,6 +233,9 @@ fn spawn_tier<F, I>(
 pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     let shared: Shared = Arc::new(Mutex::new(Snapshot::default()));
     let paused = Arc::new(AtomicBool::new(false));
+    let intervals = Arc::new(Intervals::default());
+    Intervals::set(&intervals.fleet, cfg.fleet_interval);
+    Intervals::set(&intervals.pipeline, cfg.pipeline_interval);
     let mut wakers = Vec::new();
     let mut channel = || {
         let (tx, rx) = mpsc::channel();
@@ -269,7 +301,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let ledger = cfg.ledger();
         let mut last_run: Option<Instant> = None;
         let mut ledger_seen = mtime(&ledger);
-        let interval = cfg.fleet_interval;
+        let intervals = intervals.clone();
         let min_gap = cfg.fleet_min_gap;
         let paused2 = paused.clone();
         let (gh_read, gh_tx) = (gh_read.clone(), gh_tx.clone());
@@ -288,7 +320,9 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     None => true,
                     Some(e) if forced => e >= Duration::from_secs(3),
                     Some(_) if paused2.load(Ordering::Relaxed) => false,
-                    Some(e) => e >= interval || (ledger_moved && e >= min_gap),
+                    Some(e) => {
+                        e >= Intervals::get(&intervals.fleet) || (ledger_moved && e >= min_gap)
+                    }
                 };
                 if !due {
                     return Read::Skipped;
@@ -318,14 +352,14 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     // Pipelines.
     {
         let (shared, gh_read) = (shared.clone(), gh_read.clone());
-        let interval = cfg.pipeline_interval;
+        let intervals = intervals.clone();
         spawn_tier(
             "nm",
             shared.clone(),
             changed.clone(),
             pipe_rx,
             paused.clone(),
-            move || interval,
+            move || Intervals::get(&intervals.pipeline),
             move |_| {
                 let targets = {
                     let s = shared.lock().unwrap();
@@ -415,7 +449,12 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         );
     }
 
-    (shared, Handle { wakers, paused })
+    let handle = Handle {
+        wakers,
+        paused,
+        intervals,
+    };
+    (shared, handle)
 }
 
 /// Pipelines are read one task at a time: the read fails outright only when

@@ -2,10 +2,14 @@
 //! first, an inline drawer on Enter, and runner, host and usage panels. Below
 //! 140 columns the panels sit under the roster; from 140 columns they move
 //! to a right-hand column and the held captain calls get their own panel.
+//! Each panel can be hidden, and the rest take its room; the options menu is
+//! drawn over the middle of the screen.
 
+mod menu;
 pub mod theme;
 
 use crate::app::{App, Row, visible_rows};
+use crate::config::Panel;
 use crate::model::{
     CheckState, PrChecks, Snapshot, StaleKind, StepStatus, Thresholds, WorkerState,
 };
@@ -969,7 +973,10 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
     content.extend((0..pad).map(|_| Content::Line(Line::default())));
     content.extend(bottom);
 
-    let mut title = vec![span("crowsnest", t.title())];
+    let mut title = vec![
+        span(panel_mark(t, Panel::Roster), t.title()),
+        span("crowsnest", t.title()),
+    ];
     if !host.is_empty() {
         title.push(span(format!(" firstmate @ {host}"), t.dim()));
     }
@@ -1111,7 +1118,10 @@ fn runner_panel(view: &View, buf: &mut Buffer, area: Rect, with_jobs: bool) {
         buf,
         area,
         t,
-        vec![span("RUNNERS", t.bold())],
+        vec![
+            span(panel_mark(t, Panel::Runners), t.bold()),
+            span("RUNNERS", t.bold()),
+        ],
         right,
         t.border(),
         lines,
@@ -1181,18 +1191,40 @@ fn host_panel(view: &View, buf: &mut Buffer, area: Rect) {
         buf,
         area,
         t,
-        vec![span("HOST", t.bold())],
+        vec![
+            span(panel_mark(t, Panel::Host), t.bold()),
+            span("HOST", t.bold()),
+        ],
         vec![],
         t.border(),
         lines,
     );
 }
 
+/// The usage windows the settings do not hide.
+fn shown_usage<'a>(view: &View<'a>) -> Vec<&'a crate::model::QuotaWindow> {
+    let s = &view.app.settings;
+    view.snap
+        .quota
+        .iter()
+        .filter(|w| !s.usage_hidden(&w.provider, &w.id))
+        .collect()
+}
+
+/// A panel's hotkey, set before its title like btop's: a superscript digit.
+fn panel_mark(t: &Theme, p: Panel) -> &'static str {
+    const SUP: [&str; 5] = ["\u{b9}", "\u{b2}", "\u{b3}", "\u{2074}", "\u{2075}"];
+    const ASCII: [&str; 5] = ["1 ", "2 ", "3 ", "4 ", "5 "];
+    let i = p.key() as usize - 1;
+    t.g(SUP[i], ASCII[i])
+}
+
 fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
     let rows = area.height.saturating_sub(2) as usize;
-    let q = &view.snap.quota;
+    let q = shown_usage(view);
+    let hidden = view.snap.quota.len() - q.len();
     let one_provider = q
         .iter()
         .all(|x| x.provider == q.first().map(|f| f.provider.clone()).unwrap_or_default());
@@ -1200,12 +1232,13 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     if q.is_empty() {
         let msg = match view.snap.fresh.get("quota").and_then(|f| f.error.clone()) {
             Some(e) => trunc(&e, w),
+            None if hidden > 0 => "every usage window is hidden".into(),
             None => "no usage windows reported".into(),
         };
         lines.push(Content::Line(Line::from(span(msg, t.dim()))));
     }
-    // Most-used windows first, so a nearly spent one is never hidden.
-    let mut q: Vec<&crate::model::QuotaWindow> = q.iter().collect();
+    // Most-used windows first, so a nearly spent one is never cut off.
+    let mut q = q;
     q.sort_by(|a, b| b.pct_used.total_cmp(&a.pct_used));
     let n = 6;
     let with_reset = w >= 44;
@@ -1251,8 +1284,15 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
         buf,
         area,
         t,
-        vec![span("USAGE", t.bold())],
-        vec![],
+        vec![
+            span(panel_mark(t, Panel::Usage), t.bold()),
+            span("USAGE", t.bold()),
+        ],
+        if hidden > 0 {
+            vec![span(format!("{hidden} hidden"), t.dim())]
+        } else {
+            vec![]
+        },
         t.border(),
         lines,
     );
@@ -1309,10 +1349,13 @@ fn held_panel(view: &View, buf: &mut Buffer, area: Rect) {
         buf,
         area,
         t,
-        vec![span(
-            format!("HELD CALLS{count}"),
-            t.captain().add_modifier(ratatui::style::Modifier::BOLD),
-        )],
+        {
+            let style = t.captain().add_modifier(ratatui::style::Modifier::BOLD);
+            vec![
+                span(panel_mark(t, Panel::Held), style),
+                span(format!("HELD CALLS{count}"), style),
+            ]
+        },
         vec![],
         t.border(),
         lines,
@@ -1320,22 +1363,34 @@ fn held_panel(view: &View, buf: &mut Buffer, area: Rect) {
 }
 
 fn footer(view: &View, buf: &mut Buffer, area: Rect) {
+    // A terminal too short for the roster's minimum leaves no footer row.
+    if area.is_empty() {
+        return;
+    }
     let t = &view.theme;
-    let keys = [
+    let w = area.width as usize;
+    let wide = area.width >= WIDE;
+    let mut keys = vec![
         (t.g("\u{2191}\u{2193}", "j/k"), "select"),
         (t.g("\u{23ce}", "ret"), "detail"),
         ("f", "filter"),
-        ("r", "refresh"),
-        ("p", "pause"),
-        ("?", "help"),
-        ("q", "quit"),
     ];
-    let mut left = Vec::new();
-    for (k, v) in keys {
-        left.push(span(format!(" {k} "), t.key()));
-        left.push(span(format!(" {v} "), t.dim()));
+    // Below the wide layout, refresh and pause give way; help lists them.
+    if wide {
+        keys.extend([("r", "refresh"), ("p", "pause")]);
     }
+    keys.push(("o", "options"));
+    if wide {
+        keys.push(("1-5", "panels"));
+    }
+    keys.extend([("?", "help"), ("q", "quit")]);
     let mut right: Vec<Span<'static>> = Vec::new();
+    if let Some(note) = config_note(view) {
+        right.push(span(
+            format!("{}  ", trunc(&note, (w / 3).max(12))),
+            t.warn(),
+        ));
+    }
     if view.app.filter != crate::app::Filter::All {
         right.push(span(
             format!("filter: {}  ", view.app.filter.label()),
@@ -1344,6 +1399,20 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     }
     if view.app.paused {
         right.push(span("PAUSED  ", t.warn()));
+    }
+    let hidden: Vec<String> = Panel::ALL
+        .into_iter()
+        .filter(|p| !view.app.settings.shown(*p))
+        .map(|p| {
+            if t.ascii {
+                format!("{}:{}", p.key(), p.name())
+            } else {
+                format!("{}{}", panel_mark(t, p), p.name())
+            }
+        })
+        .collect();
+    if !hidden.is_empty() {
+        right.push(span(format!("hidden {}  ", hidden.join(" ")), t.dim()));
     }
     for tier in ["nm", "gh", "quota"] {
         let Some(f) = view.snap.fresh.get(tier) else {
@@ -1356,12 +1425,44 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         }
     }
     let rw = width_of(&right);
-    let w = area.width as usize;
+    // Drop whole keys, the least needed first, rather than cut one in half.
+    let fits = |keys: &[(&str, &str)]| {
+        keys.iter()
+            .map(|(k, v)| k.width() + v.width() + 4)
+            .sum::<usize>()
+            + rw
+            < w
+    };
+    for drop in ["detail", "select", "filter", "help"] {
+        if fits(&keys) {
+            break;
+        }
+        keys.retain(|(_, v)| *v != drop);
+    }
+    let mut left = Vec::new();
+    for (k, v) in keys {
+        left.push(span(format!(" {k} "), t.key()));
+        left.push(span(format!(" {v} "), t.dim()));
+    }
     let mut spans = fit(left, w.saturating_sub(rw + 1)).spans;
     let lw = width_of(&spans);
     spans.push(span(" ".repeat(w.saturating_sub(lw + rw)), Style::new()));
     spans.extend(right);
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+}
+
+/// A failed save, or else what the config file had wrong, for the footer.
+fn config_note(view: &View) -> Option<String> {
+    let c = &view.app.config;
+    if let Some((_, Some(e))) = &c.saved {
+        return Some(format!("! not saved: {e}"));
+    }
+    let first = c.problems.first()?;
+    let more = match c.problems.len() {
+        1 => String::new(),
+        n => format!(" (+{} more)", n - 1),
+    };
+    Some(format!("! config: {first}{more}"))
 }
 
 fn help(view: &View, buf: &mut Buffer, area: Rect) {
@@ -1379,6 +1480,14 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
     lines.push(key("f", "filter: all, active, needs you"));
     lines.push(key("r", "refresh everything now"));
     lines.push(key("p", "pause or resume automatic refresh"));
+    lines.push(key(
+        "o / F2",
+        "options: panels, usage, thresholds, refresh, display",
+    ));
+    lines.push(key(
+        "1-5",
+        "show or hide roster, runners, host, usage, held calls",
+    ));
     lines.push(key("q / ctrl-c", "quit"));
     lines.push(Content::Sep);
     for s in [
@@ -1449,51 +1558,108 @@ pub fn draw(frame: &mut Frame, view: &View, host: &str) {
     render(frame.buffer_mut(), area, view, host);
 }
 
+fn draw_panel(view: &View, buf: &mut Buffer, p: Panel, r: Rect, host: &str, with_jobs: bool) {
+    match p {
+        Panel::Roster => roster(view, buf, r, host),
+        Panel::Runners => runner_panel(view, buf, r, with_jobs),
+        Panel::Host => host_panel(view, buf, r),
+        Panel::Usage => usage_panel(view, buf, r),
+        Panel::Held => held_panel(view, buf, r),
+    }
+}
+
 /// Render into any buffer (used by the TestBackend snapshot tests).
 pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
     let [main, foot] = Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(area);
-    if area.width >= WIDE {
+    let settings = &view.app.settings;
+    let wide = area.width >= WIDE;
+    let roster_shown = settings.shown(Panel::Roster);
+    // The held calls need the wide layout's right column, or the whole
+    // screen once the roster is hidden.
+    let side: Vec<Panel> = Panel::ALL[1..]
+        .iter()
+        .copied()
+        .filter(|p| settings.shown(*p) && (wide || *p != Panel::Held || !roster_shown))
+        .collect();
+    if roster_shown && side.is_empty() {
+        roster(view, buf, main, host);
+    } else if roster_shown && wide {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(RIGHT_COL)]).areas(main);
         roster(view, buf, left, host);
-        let runner_h = (view.snap.runners.len().max(1) + view.snap.jobs.len() + 2) as u16;
-        let usage_h = (view.snap.quota.len().max(1) + 2) as u16;
-        let [r1, r2, r3, r4] = Layout::vertical([
-            Constraint::Length(runner_h.min(right.height / 3)),
-            Constraint::Length(7),
-            Constraint::Length(usage_h),
-            Constraint::Min(0),
-        ])
-        .areas(right);
-        runner_panel(view, buf, r1, true);
-        host_panel(view, buf, r2);
-        usage_panel(view, buf, r3);
-        if r4.height >= 3 {
-            held_panel(view, buf, r4);
-        }
-    } else {
+        stack(view, buf, right, &side, host);
+    } else if roster_shown {
         let panels_h = if main.height >= 22 { 7 } else { 0 };
         let [roster_area, panels] =
             Layout::vertical([Constraint::Min(6), Constraint::Length(panels_h)]).areas(main);
         roster(view, buf, roster_area, host);
         if panels_h > 0 {
-            let [a, b, c] = Layout::horizontal([
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-            ])
-            .areas(panels);
-            runner_panel(view, buf, a, false);
-            host_panel(view, buf, b);
-            usage_panel(view, buf, c);
+            let n = side.len() as u32;
+            let rects =
+                Layout::horizontal(side.iter().map(|_| Constraint::Ratio(1, n))).split(panels);
+            for (p, r) in side.iter().zip(rects.iter()) {
+                draw_panel(view, buf, *p, *r, host, false);
+            }
         }
+    } else if side.is_empty() {
+        let msg = trunc(
+            "every panel is hidden: press 1-5 to show one, or o for options",
+            main.width as usize,
+        );
+        let x = main.x + main.width.saturating_sub(msg.width() as u16) / 2;
+        buf.set_string(x, main.y + main.height / 2, msg, view.theme.dim());
+    } else if wide {
+        // Lists (runners, held calls) on the left, gauges (host, usage) on the right.
+        let (lists, gauges): (Vec<Panel>, Vec<Panel>) = side
+            .iter()
+            .partition(|p| matches!(p, Panel::Runners | Panel::Held));
+        let cols: Vec<Vec<Panel>> = [lists, gauges]
+            .into_iter()
+            .filter(|c| !c.is_empty())
+            .collect();
+        let n = cols.len() as u32;
+        let rects = Layout::horizontal(cols.iter().map(|_| Constraint::Ratio(1, n))).split(main);
+        for (col, r) in cols.iter().zip(rects.iter()) {
+            stack(view, buf, *r, col, host);
+        }
+    } else {
+        stack(view, buf, main, &side, host);
     }
     footer(view, buf, foot);
     if view.app.help {
         help(view, buf, area);
     }
+    if view.app.menu.is_some() {
+        menu::draw(view, buf, main);
+    }
     if view.theme.ascii {
         ascii_fold(buf, area);
+    }
+}
+
+/// Panels one above the other in `col`. Each takes the height it needs, and
+/// one with a list to show (held calls, else runners, else the last) takes
+/// what is left.
+fn stack(view: &View, buf: &mut Buffer, col: Rect, panels: &[Panel], host: &str) {
+    let filler = [Panel::Held, Panel::Runners]
+        .into_iter()
+        .find(|p| panels.contains(p))
+        .or(panels.last().copied());
+    let runner_h = (view.snap.runners.len().max(1) + view.snap.jobs.len() + 2) as u16;
+    let usage_h = (shown_usage(view).len().max(1) + 2) as u16;
+    let heights = panels.iter().map(|p| match p {
+        _ if Some(*p) == filler => Constraint::Min(0),
+        Panel::Runners => Constraint::Length(runner_h.min(col.height / 3)),
+        Panel::Host => Constraint::Length(7),
+        Panel::Usage => Constraint::Length(usage_h),
+        Panel::Roster | Panel::Held => Constraint::Min(0),
+    });
+    let rects = Layout::vertical(heights).split(col);
+    for (p, r) in panels.iter().zip(rects.iter()) {
+        // A panel squeezed below a border and one line is left out.
+        if r.height >= 3 {
+            draw_panel(view, buf, *p, *r, host, true);
+        }
     }
 }
 

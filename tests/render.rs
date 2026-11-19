@@ -3,10 +3,12 @@
 //! `cargo insta review` (or rerun with `INSTA_UPDATE=always`).
 
 use crowsnest::app::{Action, App, all_rows};
+use crowsnest::config::{Overrides, Panel, Setting, Settings};
 use crowsnest::model::{
-    Check, CheckState, Disk, Freshness, Host, LastEvent, PrChecks, Runner, Snapshot, StaleKind,
-    Thresholds, Worker, WorkerState,
+    Check, CheckState, Disk, Freshness, Host, LastEvent, PrChecks, QuotaWindow, Runner, Snapshot,
+    StaleKind, Thresholds, Worker, WorkerState,
 };
+use crowsnest::options::Category;
 use crowsnest::sources::{fleet, gh, nm, quota};
 use crowsnest::timefmt::parse_iso;
 use crowsnest::ui::{self, View, theme::Theme};
@@ -23,7 +25,7 @@ fn th() -> Thresholds {
 
 /// A fresh app that has watched `snap` once, as the running binary does.
 fn app_for(snap: &Snapshot) -> App {
-    let mut app = App::new(th());
+    let mut app = App::default();
     app.observe(snap);
     app
 }
@@ -143,11 +145,10 @@ fn draw(snap: &Snapshot, app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
 
 /// Select `id` and open its detail drawer, through the same actions the keys use.
 fn open(snap: &Snapshot, app: &mut App, id: &str) {
-    let rows = all_rows(snap, &th());
     while app.selected.as_deref() != Some(id) {
-        app.apply(Action::Down, &rows);
+        app.apply(Action::Down, snap);
     }
-    app.apply(Action::Toggle, &rows);
+    app.apply(Action::Toggle, snap);
 }
 
 #[test]
@@ -778,4 +779,272 @@ fn every_runner_job_names_its_project_and_is_grouped_by_repo() {
         assert!(row.contains("pantry \u{25cb} queued A very long"), "{row}");
         assert!(!row.contains("fit the panel"), "not truncated: {row}");
     }
+}
+
+/// An app with `settings`, opened on the options menu at `category` when
+/// one is given, and moved to the row labelled `row`.
+fn with_settings(
+    snap: &Snapshot,
+    settings: Settings,
+    overrides: Overrides,
+    menu: Option<(Category, &str)>,
+) -> App {
+    let mut app = App::new(settings, overrides);
+    app.observe(snap);
+    app.config.path = "~/.config/crowsnest/config.toml".into();
+    if let Some((category, row)) = menu {
+        app.apply(Action::Options, snap);
+        while app.menu.as_ref().unwrap().category != category {
+            app.apply(Action::Category { next: true }, snap);
+        }
+        for _ in 0..20 {
+            let items = app.menu_items(snap);
+            let i = app.menu.as_ref().unwrap().index(&items);
+            if i.is_some_and(|i| items[i].label.trim() == row) {
+                break;
+            }
+            app.apply(Action::Down, snap);
+        }
+    }
+    app
+}
+
+fn hide(panels: &[Panel], usage: &[&str]) -> Settings {
+    let mut s = Settings::default();
+    s.hidden_panels.extend(panels.iter().copied());
+    s.hidden_usage.extend(usage.iter().map(|u| u.to_string()));
+    s
+}
+
+#[test]
+fn options_menu_on_panels_100() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        hide(&[Panel::Runners], &[]),
+        Overrides::default(),
+        Some((Category::Panels, "runners")),
+    );
+    insta::assert_snapshot!(draw(&s, &app, 100, 40).backend());
+}
+
+#[test]
+fn options_menu_on_usage_180() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        hide(&[], &["copilot/premium_interactions"]),
+        Overrides::default(),
+        Some((Category::Usage, "premium interactions")),
+    );
+    insta::assert_snapshot!(draw(&s, &app, 180, 50).backend());
+}
+
+#[test]
+fn options_menu_shows_flags_as_locked() {
+    utc();
+    let s = snapshot();
+    let mut o = Overrides::default();
+    o.set(Setting::StaleMinutes, 45);
+    let app = with_settings(
+        &s,
+        Settings::default(),
+        o,
+        Some((Category::Thresholds, "stale after")),
+    );
+    let term = draw(&s, &app, 100, 40);
+    let row = row_text(&term, "stale after");
+    assert!(row.contains("set by --stale-minutes"), "{row}");
+    assert!(
+        row.contains("45 min") && !row.contains("\u{25c2} 45"),
+        "{row}"
+    );
+    let about = term.backend().to_string();
+    assert!(about.contains("keeps 30 min."), "{about}");
+}
+
+#[test]
+fn a_hidden_provider_leaves_the_usage_panel() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(&s, hide(&[], &["copilot"]), Overrides::default(), None);
+    let term = draw(&s, &app, 100, 34);
+    let text = term.backend().to_string();
+    assert!(!text.contains("copilot"), "{text}");
+    assert!(row_text(&term, "USAGE").contains("3 hidden"));
+    assert!(
+        row_text(&term, "session").contains("41%"),
+        "one provider left: no name"
+    );
+    insta::assert_snapshot!(term.backend());
+}
+
+#[test]
+fn panels_hidden_100() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        hide(&[Panel::Runners], &["copilot/premium_interactions"]),
+        Overrides::default(),
+        None,
+    );
+    insta::assert_snapshot!(draw(&s, &app, 100, 34).backend());
+}
+
+#[test]
+fn panels_hidden_180() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        hide(&[Panel::Runners, Panel::Host], &[]),
+        Overrides::default(),
+        None,
+    );
+    insta::assert_snapshot!(draw(&s, &app, 180, 44).backend());
+}
+
+#[test]
+fn roster_hidden_180_puts_lists_left_and_gauges_right() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(&s, hide(&[Panel::Roster], &[]), Overrides::default(), None);
+    insta::assert_snapshot!(draw(&s, &app, 180, 44).backend());
+}
+
+#[test]
+fn roster_hidden_100_stacks_the_panels() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(&s, hide(&[Panel::Roster], &[]), Overrides::default(), None);
+    let term = draw(&s, &app, 100, 34);
+    let text = term.backend().to_string();
+    assert!(
+        text.contains("HELD CALLS 8"),
+        "the held calls get room: {text}"
+    );
+    insta::assert_snapshot!(term.backend());
+}
+
+#[test]
+fn only_the_roster() {
+    utc();
+    let s = snapshot();
+    let all_but_roster = hide(
+        &[Panel::Runners, Panel::Host, Panel::Usage, Panel::Held],
+        &[],
+    );
+    for w in [100, 180] {
+        let app = with_settings(&s, all_but_roster.clone(), Overrides::default(), None);
+        let term = draw(&s, &app, w, 34);
+        let text = term.backend().to_string();
+        assert!(!text.contains("HOST"), "{text}");
+        let top = row_text(&term, "crowsnest firstmate");
+        assert!(
+            top.ends_with("\u{256e}\""),
+            "the roster spans the screen: {top}"
+        );
+        assert!(row_text(&term, "hidden").contains("hidden ²runners ³host ⁴usage ⁵held"));
+    }
+}
+
+#[test]
+fn every_panel_hidden_says_how_to_get_one_back() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(&s, hide(&Panel::ALL, &[]), Overrides::default(), None);
+    let term = draw(&s, &app, 100, 34);
+    row_text(
+        &term,
+        "every panel is hidden: press 1-5 to show one, or o for options",
+    );
+}
+
+#[test]
+fn config_problems_show_in_the_footer() {
+    utc();
+    let s = snapshot();
+    let mut app = with_settings(&s, Settings::default(), Overrides::default(), None);
+    app.config.problems = vec![
+        "unknown key display.theme".into(),
+        "refresh.fleet_seconds must be a whole number from 10 to 3600".into(),
+    ];
+    let footer = |app: &App| {
+        let term = draw(&s, app, 180, 44);
+        let text = term.backend().to_string();
+        text.lines().last().unwrap().to_string()
+    };
+    let f = footer(&app);
+    assert!(
+        f.contains("! config: unknown key display.theme (+1 more)"),
+        "{f}"
+    );
+    app.config.saved = Some((s.now, Some("cannot save /x/config.toml: read-only".into())));
+    let f = footer(&app);
+    assert!(f.contains("! not saved: cannot save"), "{f}");
+}
+
+#[test]
+fn the_menu_never_panics_and_says_when_it_has_no_room() {
+    utc();
+    let s = snapshot();
+    let mut items_long = s.clone();
+    // More usage windows than the box has rows for: the selection scrolls.
+    for i in 0..30 {
+        items_long.quota.push(QuotaWindow {
+            provider: "extra".into(),
+            id: format!("w{i}"),
+            label: format!("window {i}"),
+            ..Default::default()
+        });
+    }
+    let mut app = with_settings(
+        &items_long,
+        hide(&Panel::ALL, &[]),
+        Overrides::default(),
+        Some((Category::Usage, "")),
+    );
+    app.apply(Action::Bottom, &items_long);
+    for (w, h) in [
+        (180, 50),
+        (100, 40),
+        (60, 20),
+        (49, 16),
+        (40, 12),
+        (20, 6),
+        (8, 3),
+        (1, 1),
+    ] {
+        let term = draw(&items_long, &app, w, h);
+        let text = term.backend().to_string();
+        if w >= 60 {
+            assert!(
+                text.contains("window 29"),
+                "{w}x{h} scrolls to the selection:\n{text}"
+            );
+        } else if w >= 40 {
+            assert!(text.contains("larger"), "{w}x{h}:\n{text}");
+        }
+    }
+    let ascii = {
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let view = View {
+            snap: &s,
+            app: &with_settings(
+                &s,
+                Settings::default(),
+                Overrides::default(),
+                Some((Category::Panels, "host")),
+            ),
+            theme: Theme::new(false, true),
+        };
+        term.draw(|f| ui::draw(f, &view, "deckhand")).unwrap();
+        term.backend().to_string()
+    };
+    let odd: String = ascii.chars().filter(|c| !c.is_ascii()).collect();
+    assert!(odd.is_empty(), "--ascii drew {odd:?}");
+    assert!(ascii.contains("| > 3 host"), "{ascii}");
 }
