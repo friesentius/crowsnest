@@ -1,0 +1,11 @@
+﻿{
+  "agentId": 21,
+  "agentName": "pantry-local-runner",
+  "poolId": 1,
+  "poolName": "Default",
+  "serverUrl": "https://pipelines.actions.githubusercontent.com/example/",
+  "gitHubUrl": "https://github.com/acme/pantry",
+  "workFolder": "_work",
+  "useV2Flow": true,
+  "serverUrlV2": "https://broker.actions.githubusercontent.com/"
+}

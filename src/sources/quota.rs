@@ -1,0 +1,75 @@
+//! Agent usage windows from `quota-axi --no-credential-refresh --json`.
+//! `--no-credential-refresh` matters: without it a read may renew an expired
+//! vendor session, which is a write.
+
+use crate::model::QuotaWindow;
+use crate::timefmt;
+use serde::Deserialize;
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Report {
+    providers: Vec<Provider>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Provider {
+    provider: String,
+    windows: Vec<Window>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct Window {
+    label: String,
+    percent_remaining: Option<f64>,
+    resets_at: Option<String>,
+    pace: Option<Pace>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct Pace {
+    status: Option<String>,
+}
+
+pub fn parse(json: &str) -> Result<Vec<QuotaWindow>, String> {
+    let r: Report = serde_json::from_str(json).map_err(|e| format!("invalid quota JSON: {e}"))?;
+    Ok(r.providers
+        .into_iter()
+        .flat_map(|p| {
+            let provider = p.provider;
+            p.windows.into_iter().filter_map(move |w| {
+                Some(QuotaWindow {
+                    provider: provider.clone(),
+                    label: w.label,
+                    pct_remaining: w.percent_remaining?,
+                    resets_at: w.resets_at.as_deref().and_then(timefmt::parse_iso),
+                    pace: w.pace.and_then(|p| p.status).filter(|s| s != "unknown"),
+                })
+            })
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_windows_and_skips_signed_out_providers() {
+        let w = parse(include_str!("../../tests/fixtures/quota.json")).unwrap();
+        assert_eq!(w.len(), 6);
+        assert_eq!(w[0].provider, "claude");
+        assert_eq!(w[0].label, "session");
+        assert_eq!(w[0].pct_remaining, 59.0);
+        assert_eq!(w[0].pace.as_deref(), Some("behind"));
+        assert!(w[0].resets_at.is_some());
+        assert_eq!(w[3].provider, "copilot");
+        assert_eq!(w[3].pace, None, "unknown pace is dropped");
+        assert_eq!(w[5].pct_remaining, 0.0);
+        let none = parse("{\"providers\": [{\"provider\": \"codex\", \"windows\": []}]}").unwrap();
+        assert!(none.is_empty());
+    }
+}

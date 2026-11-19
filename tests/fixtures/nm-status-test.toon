@@ -1,0 +1,56 @@
+run:
+  id: "01M7T2S9APR143NGN6G26E0HDY"
+  branch: fm/bs-p1a-parity-copy
+  status: running
+  head: d2c90d54
+  head_sha: d2c90d54d63474475ad80b0057a197538a5aa7b2
+  verification_plan:
+    path: /home/captain/.no-mistakes/run-inputs/01M7T2S9APR143NGN6G26E0HDY/verification-plan.txt
+    sha256: 2d81a4176b17ee7f6a1365b45d00ba6c412e95764fc82cd39e3d6656423aea79
+    source_path: /home/captain/firstmate/data/bs-p1a-parity-copy/verification-plan.txt
+    captured_at: 1795097929
+  findings: 1 auto-fix
+  steps[9]{step,status,findings,duration_ms}:
+    intent,completed,0,25
+    rebase,completed,0,1289
+    review,completed,1,159112
+    test,running,0,0
+    document,pending,0,0
+    lint,pending,0,0
+    push,pending,0,0
+    pr,pending,0,0
+    ci,pending,0,0
+  active_steps[1]{step,status,active_for,round_active_for,last_activity,agent_pid,round}:
+    test,running,4m9s,4m9s,"6s ago: claude producing output","1000610",starting
+branch_sync:
+  state: pipeline_owned
+  changed: false
+  local:
+    branch: fm/bs-p1a-parity-copy
+    head: 93803d59c2a236d6cad97c41eb6a32e8aaa89b80
+    clean: true
+  pipeline:
+    run: "01M7T2S9APR143NGN6G26E0HDY"
+    status: running
+    phase: pre_push
+    submitted_head: 93803d59c2a236d6cad97c41eb6a32e8aaa89b80
+    current_head: d2c90d54d63474475ad80b0057a197538a5aa7b2
+    pushed_head: ""
+    pushed_at: 0
+    push_generation: 0
+  target:
+    kind: ""
+    remote: origin
+    url: "git@github.com:acme/bookshop.git"
+    ref: ""
+  remote:
+    observed_head: ""
+    freshness: pipeline_push
+    observed_at: 0
+  relation: unknown
+  safety: blocked_pipeline_owned
+  pr_state: none
+  note: the pipeline head has moved but has not been successfully pushed; do not make local follow-up commits yet
+  next_action:
+    code: continue_active_run
+    command: no-mistakes axi status
