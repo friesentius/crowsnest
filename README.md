@@ -32,22 +32,31 @@ It is written in Rust with [ratatui](https://ratatui.rs), and it is a single bin
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ next pantry-release-0-4-0 - Next: pantry release 0 4 0                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭ RUNNERS ──────────────────────╮╭ HOST ──────────────────────────╮╭ USAGE ────────────────────────╮
-│ ● pantry   busy 14m           ││ load 3.42 2.95 2.71  16 cpu    ││ copilot premium … ━━━━━━ 100% │
-│ ○ bookshop idle               ││ mem  ━━━━━━──  72% 9.0G avail  ││ claude session    ━━────  41% │
-│                               ││ swap ━━──────  25% 6.0G free   ││ claude week       ━━────  35% │
+╭ RUNNERS ✓ moving ───────── q1 ╮╭ HOST ──────────────────────────╮╭ USAGE ────────────────────────╮
+│ ◐ pantry   ✓ moving 8m/40m    ││ load 3.42 2.95 2.71  16 cpu    ││ copilot premium … ━━━━━━ 100% │
+│   └ Lint wait 6m → 14:58      ││ mem  ━━━━━━──  72% 9.0G avail  ││ claude session    ━━────  41% │
+│ ○ bookshop idle               ││ swap ━━──────  25% 6.0G free   ││ claude week       ━━────  35% │
 │                               ││ disk / 61%  /home 78%          ││ claude Fable week ━─────  11% │
 │                               ││ psi  mem 0.4%  cpu 6.1%        ││ +2 more windows               │
 ╰───────────────────────────────╯╰────────────────────────────────╯╰───────────────────────────────╯
- ↑↓  select  ⏎  detail  f  filter  r  refresh  p  pause  ?  help  q  quit     nm 9s gh 25s quota 2m 
+ ↑↓  select  ⏎  detail  tab  runners  f  filter  ?  help  q  quit             nm 9s gh 25s quota 2m 
 ```
 
 Workers that need you sort to the top and stand out.
 The USAGE panel shows how much of each window is used (quota-axi reports what is left, crowsnest flips it), most-used first, with the reset time beside it.
 Press Enter on a row to open its detail: every pipeline step with its duration, each PR check, the last status line, and the worktree.
+Press Tab to move to the runner panel, pick a runner with the arrows, and press Enter for its detail (see [Runners](#runners)).
 At 140 columns or more the panels move to a right-hand column, and the held captain calls get their own box.
 
 ## Install
@@ -77,6 +86,11 @@ The ones you are most likely to want:
 | `--wait-grace-minutes MIN` | 5 | How long after a worker's declared `until` time its row is flagged because nothing followed. |
 | `--fleet-interval SECS` | 60 | Seconds between fleet snapshots. |
 | `--runner-root DIR` | your home | Where to look for `actions-runner*` directories (repeatable). |
+| `--runner-silent-minutes MIN` | 10 | How long a busy runner's step output may stay still (with its job's processes idle) before it is shown as STALLED. |
+| `--runner-idle-cpu-seconds SECS` | 2 | CPU-seconds a silent job's processes may use over that window and still count as idle. |
+| `--runner-overdue-factor FACTOR` | 2.0 | A job running longer than this many times its typical duration is shown as SLOW. |
+| `--runner-pickup-minutes MIN` | 5 | How long a job may stay queued while its runner is idle before the runner is shown as NOT PICKING UP. |
+| `--runner-unit DIR=UNIT` | the unit `svc.sh install` recorded | The systemd unit that runs a runner directory, for the detail's service line (repeatable). |
 | `--disk PATH` | `/` and your home | Filesystems shown in the host panel (repeatable). |
 | `--no-github`, `--no-quota` | | Skip the GitHub or quota-axi reads. |
 | `--ascii` | | ASCII borders and glyphs, for fonts without box drawing. |
@@ -92,6 +106,7 @@ Colours are the terminal's 16 ANSI colours, so they follow your dark or light th
 | `↑` `↓` or `j` `k` | Select a worker (`g` and `G`: first and last) |
 | `Enter`, `l` or `→` | Open or close its detail |
 | `Esc`, `h` or `←` | Close the detail |
+| `Tab` | Move the keys to the runner panel and back; there `↑` `↓` pick a runner, `Enter` opens its detail, `Esc` goes back |
 | `f` | Filter: all, active, needs you |
 | `r` | Refresh everything now |
 | `p` | Pause or resume automatic refresh |
@@ -125,6 +140,53 @@ A busy pane does not hide a stalled gate: the gate is waiting for an answer eith
 A no-mistakes that does not report how long a gate has waited (no `awaiting_agent` line) still shows `GATE` with the gate's name, but cannot be escalated by time.
 A worker whose declared wait has passed is flagged the same way, except while its pipeline is still moving, which counts as the work.
 
+## Runners
+
+The RUNNERS panel has one lane per self-hosted runner, and its title answers "is a runner stuck?" at a glance: `✗ 1 stalled`, `▲ 1 slow`, `✓ all moving`, or nothing while every runner is idle.
+
+```text
+╭ RUNNERS ✗ 1 stalled ────────────────── queue 1 ╮
+│ ◐ pantry    ✓ moving · online            q1 6m │
+│   ◐ Unit + e2e tests #122   8m ━━──────── ~40m │
+│     step 4/9 setup-node 8m · out 1s ago        │
+│   ○ Lint & typecheck #124      wait 6m → 14:58 │
+│ ○ bookshop  idle · online ?                    │
+│ ✗ millwork  DOWN · offline                     │
+│ ▲ larder    SLOW                               │
+│   ◐ Build docs site #41    52m ━━━━━━━━━▲ ~21m │
+│     out 1s ago                                 │
+│     Tab focus · ↑↓ runner · Enter detail       │
+╰────────────────────────────────────────────────╯
+```
+
+A busy runner's lane shows the running job with its PR (or branch), how long it has run against its typical duration, the current step, and when its output last moved.
+Below it are the jobs queued for that runner, oldest first, with how long each has waited and, for the next one, an estimated start (`→ 14:58`) from the typical durations of what is ahead.
+Below 140 columns the lane folds into one line under the runner.
+GitHub picks which queued job goes next, so only the next start and the time the queue drains are estimates worth trusting; the detail says so.
+
+A typical duration is the median of the job's (or step's) latest successful runs, at most 10; with fewer than 3 samples crowsnest shows the elapsed time only and never calls the job slow.
+
+| Verdict | Rule |
+| --- | --- |
+| `◐ moving` | Busy, and none of the below. |
+| `○ idle` | Nothing running. |
+| `▲ SLOW` | Running longer than `--runner-overdue-factor` times its typical duration, and not stalled. |
+| `✗ STALLED` | Busy, its step output (`_diag/pages`, or the worker log when there is none) has not moved for `--runner-silent-minutes`, and the job's processes used less than `--runner-idle-cpu-seconds` of CPU over that time. Or GitHub says a job is in progress on it and no `Runner.Worker` runs. |
+| `✗ NOT PICKING UP` | A job has been queued for it past `--runner-pickup-minutes` while it sat idle, counted from when it went idle. |
+| `✗ DOWN` | No `Runner.Listener` runs from its directory, or GitHub reports it offline. |
+
+Silence alone is not enough to call a job stalled: a test suite or a long build can print nothing for many minutes while it works, so a silent job whose processes are busy is shown as `quiet 14m, cpu busy` and is not counted.
+Two limits follow from reading CPU:
+
+- A job stuck in a busy loop keeps using CPU, so it is never STALLED; it shows as SLOW once it passes the overdue factor.
+- A job whose steps run in a container (`docker` or `podman` under the worker) does its work outside the worker's process tree, where crowsnest cannot see its CPU; for those, silence alone decides, as it does when the process table cannot be read.
+
+Stalled runners are not counted in the roster's `! stale` yet.
+
+Enter on a runner opens its detail: the verdict in a sentence, the run and job with every step (the running one against its typical time), the queue with the estimated start and drain, recent jobs on that runner with their duration and result plus its busy share and queue waits, and its health: the listener and its uptime, whether GitHub lists it online, its version and labels, and its systemd service with restarts.
+GitHub's runner list needs repository admin read; without it the detail says `online ?` and the rest still works.
+The service line needs a unit: the one `svc.sh install` recorded in the runner's `.service` file, or `--runner-unit DIR=UNIT`.
+
 ## Is it updating?
 
 A quiet fleet should look up to date, not frozen:
@@ -145,8 +207,11 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Roster, held calls | `bin/fm-fleet-snapshot.sh --json`, schema `fm-fleet-snapshot.v1` | 60 s, or 20 s after the opt-in fleet ledger (`state/fleet-ledger.jsonl`) changes |
 | Pipeline strip and steps | `no-mistakes axi status`, inside each no-mistakes task's worktree | 15 s |
 | PR checks | one `gh api graphql` read query for every PR on screen | 60 s while anything is active, otherwise 5 min |
-| Runners | `actions-runner*/.runner` files and a local process scan for `Runner.Worker` | 5 s |
-| Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs` and `.../jobs` | with PR checks |
+| Runners | `actions-runner*/.runner` files; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s |
+| Runner services | `systemctl [--user] show --property=LoadState,ActiveState,SubState,NRestarts` for a runner with a known unit | 30 s |
+| Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress` and each run's `.../jobs` | with PR checks, and every 60 s while a job is queued |
+| Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
+| Runner registration | `gh api --method GET repos/<owner>/<repo>/actions/runners` (needs admin read) | 5 min |
 | Host | load, memory, swap, disks, and Linux pressure stall information | 2 s |
 | Usage | `quota-axi --no-credential-refresh --json` | 5 min |
 

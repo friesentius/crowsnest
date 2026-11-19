@@ -29,6 +29,21 @@ pub enum ReadCommand {
     GhApiGet { path: String },
     /// `quota-axi --no-credential-refresh --json [--provider a,b]`.
     QuotaAxi { providers: Vec<String> },
+    /// `systemctl [--user] show --property=... -- <unit>`: a runner's service.
+    SystemctlShow { unit: String, user: bool },
+}
+
+/// The unit properties [`ReadCommand::SystemctlShow`] asks for.
+pub const UNIT_PROPERTIES: &str = "LoadState,ActiveState,SubState,NRestarts";
+
+/// A systemd unit name: no options, paths or shell syntax.
+pub fn valid_unit(unit: &str) -> bool {
+    !unit.is_empty()
+        && !unit.starts_with('-')
+        && unit.len() <= 256
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.@:\\".contains(c))
 }
 
 #[derive(Debug)]
@@ -168,6 +183,30 @@ impl ReadCommand {
                     timeout: Duration::from_secs(20),
                 }
             }
+            ReadCommand::SystemctlShow { unit, user } => {
+                if !valid_unit(unit) {
+                    return Err(ExecError::Refused(format!("unexpected unit name {unit}")));
+                }
+                let mut args = Vec::new();
+                if *user {
+                    args.push("--user".to_string());
+                }
+                args.extend([
+                    "show".to_string(),
+                    format!("--property={UNIT_PROPERTIES}"),
+                    "--".to_string(),
+                    unit.clone(),
+                ]);
+                let mut env = quiet_env;
+                env.push(("SYSTEMD_PAGER".into(), String::new()));
+                Invocation {
+                    program: "systemctl".into(),
+                    args,
+                    cwd: None,
+                    env,
+                    timeout: Duration::from_secs(5),
+                }
+            }
         };
         Ok(inv)
     }
@@ -285,6 +324,30 @@ mod tests {
         };
         let inv = c.invocation().unwrap();
         assert_eq!(inv.args[..3], ["api", "--method", "GET"]);
+    }
+
+    #[test]
+    fn unit_names_are_constrained() {
+        for bad in ["", "--now", "a b", "a;b", "../x", "a\nb"] {
+            let c = ReadCommand::SystemctlShow {
+                unit: bad.into(),
+                user: true,
+            };
+            assert!(
+                matches!(c.invocation(), Err(ExecError::Refused(_))),
+                "{bad:?}"
+            );
+        }
+        let c = ReadCommand::SystemctlShow {
+            unit: "actions.runner.acme-pantry.pantry-local-runner.service".into(),
+            user: false,
+        };
+        let inv = c.invocation().unwrap();
+        assert_eq!(inv.args[0], "show");
+        assert_eq!(
+            inv.args.last().unwrap(),
+            "actions.runner.acme-pantry.pantry-local-runner.service"
+        );
     }
 
     #[test]

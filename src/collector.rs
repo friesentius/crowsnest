@@ -4,10 +4,12 @@
 //! | tier     | default cadence                                              |
 //! |----------|--------------------------------------------------------------|
 //! | host     | 2 s                                                          |
-//! | runners  | 5 s (process scan), directories re-listed every 60 s         |
+//! | runners  | 5 s (process scan, `_diag` file times), directories re-listed every 60 s, systemd units every 30 s |
 //! | pipelines| 15 s per live no-mistakes task                               |
 //! | fleet    | 60 s, or 20 s after firstmate's fleet ledger changes         |
-//! | github   | 60 s while a PR or runner is active, otherwise 5 min         |
+//! | github   | 60 s while a PR, runner or queued job is active, otherwise 5 min |
+//! | ↳ history| completed runs every 10 min, or when a watched run finishes; each run's jobs once |
+//! | ↳ runners API | 5 min per repository                                    |
 //! | quota    | 5 min                                                        |
 //!
 //! A tier never overlaps itself, keeps its last good data on failure,
@@ -16,9 +18,12 @@
 //! succeeded with errors for some items is shown as an error but keeps the
 //! normal cadence.
 
-use crate::model::{Fleet, Freshness, Job, PrChecks, Snapshot};
-use crate::sources::{self, host::HostReader, runners};
+use crate::model::{
+    Fleet, Freshness, Job, PrChecks, RepoHistory, RepoRunners, Runner, Service, Snapshot,
+};
+use crate::sources::{self, history::RepoCache, host::HostReader, runners};
 use crate::timefmt::now_epoch;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -32,6 +37,8 @@ pub struct Config {
     /// Crowsnest's own cache directory (never inside the firstmate home).
     pub cache_dir: PathBuf,
     pub runner_roots: Vec<PathBuf>,
+    /// `--runner-unit DIR=UNIT`: the systemd unit running a runner directory.
+    pub runner_units: Vec<(PathBuf, String)>,
     pub disk_paths: Vec<PathBuf>,
     pub fleet_interval: Duration,
     pub fleet_min_gap: Duration,
@@ -145,10 +152,153 @@ fn apply_gh(
         Err(e) => failed.push(e),
     }
     match jobs {
-        Ok(j) => s.jobs = j,
+        Ok(j) => {
+            s.jobs = j.into_iter().filter(|j| j.status != "completed").collect();
+            s.jobs_read_at = Some(now_epoch());
+        }
         Err(e) => failed.push(e),
     }
     Read::from_errors(failed, partial)
+}
+
+/// How often the completed runs of a repository are listed.
+const HISTORY_EVERY: Duration = Duration::from_secs(600);
+/// How often GitHub's runner list of a repository is read.
+const RUNNERS_API_EVERY: Duration = Duration::from_secs(300);
+/// How often a runner's systemd unit is read.
+const SERVICE_EVERY: Duration = Duration::from_secs(30);
+
+/// The gh tier's own memory between reads: the finished runs it has read,
+/// and when it last read each slow-moving part. Failures here never fail the
+/// tier: they are kept per repository and shown where they apply.
+#[derive(Default)]
+struct GhState {
+    cache: BTreeMap<String, RepoCache>,
+    history_at: BTreeMap<String, Instant>,
+    history_error: BTreeMap<String, String>,
+    runners_at: BTreeMap<String, Instant>,
+    gh_runners: BTreeMap<String, RepoRunners>,
+    /// Runs that were queued or running at the last read.
+    active: BTreeSet<u64>,
+}
+
+impl GhState {
+    /// Read what is due for the repositories of `runner_list`, given the
+    /// queue just read. Returns the history and runner lists to show.
+    fn read(
+        &mut self,
+        runner_list: &[Runner],
+        jobs: &Result<Vec<Job>, String>,
+    ) -> (BTreeMap<String, RepoHistory>, BTreeMap<String, RepoRunners>) {
+        let repos = sources::runner_repos(runner_list);
+        // A run that left the queue has finished: read its jobs now rather
+        // than at the next listing.
+        let mut finished = false;
+        if let Ok(jobs) = jobs {
+            let active: BTreeSet<u64> = jobs
+                .iter()
+                .filter(|j| j.status != "completed")
+                .map(|j| j.run_id)
+                .collect();
+            finished = self.active.difference(&active).next().is_some();
+            self.active = active;
+        }
+        for repo in &repos {
+            let due = |at: Option<&Instant>, every| at.is_none_or(|t| t.elapsed() >= every);
+            if finished || due(self.history_at.get(repo), HISTORY_EVERY) {
+                self.history_at.insert(repo.clone(), Instant::now());
+                let cache = self.cache.entry(repo.clone()).or_default();
+                match sources::read_history(repo, cache) {
+                    Ok(_) => self.history_error.remove(repo),
+                    Err(e) => self.history_error.insert(repo.clone(), e),
+                };
+            }
+            if due(self.runners_at.get(repo), RUNNERS_API_EVERY) {
+                self.runners_at.insert(repo.clone(), Instant::now());
+                self.gh_runners
+                    .insert(repo.clone(), sources::read_gh_runners(repo));
+            }
+        }
+        let live: &[Job] = jobs.as_deref().unwrap_or(&[]);
+        let history = repos
+            .iter()
+            .map(|repo| {
+                let finished: Vec<Job> = live
+                    .iter()
+                    .filter(|j| &j.repo == repo && j.status == "completed")
+                    .cloned()
+                    .collect();
+                let mut h = self
+                    .cache
+                    .get(repo)
+                    .map(|c| c.summary(&finished))
+                    .unwrap_or_default();
+                h.error = self.history_error.get(repo).cloned();
+                (repo.clone(), h)
+            })
+            .collect();
+        let gh_runners = self
+            .gh_runners
+            .iter()
+            .filter(|(repo, _)| repos.contains(repo))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        (history, gh_runners)
+    }
+}
+
+/// The runner tier's memory of systemd units: which scope each unit lives
+/// in, and its last reading.
+#[derive(Default)]
+struct Services {
+    read_at: Option<Instant>,
+    /// Unit name -> found in the user's own systemd (`--user`).
+    user: BTreeMap<String, bool>,
+    state: BTreeMap<String, Service>,
+}
+
+impl Services {
+    fn update(&mut self, list: &mut [Runner]) {
+        if self.read_at.is_none_or(|t| t.elapsed() >= SERVICE_EVERY) {
+            self.read_at = Some(Instant::now());
+            self.state.clear();
+            for unit in list.iter().filter_map(|r| r.unit.clone()) {
+                if self.state.contains_key(&unit) {
+                    continue;
+                }
+                // A unit lives in the user's systemd or the system's; the
+                // scope it was last found in is asked first, and the other
+                // when that one does not have it or cannot be asked.
+                let first = self.user.get(&unit).copied().unwrap_or(true);
+                let mut failed = None;
+                let mut found = None;
+                for user in [first, !first] {
+                    match sources::read_service(&unit, user) {
+                        Some(svc) if svc.error.is_none() => {
+                            found = Some((svc, user));
+                            break;
+                        }
+                        Some(svc) => failed = failed.or(Some(svc)),
+                        None => {}
+                    }
+                }
+                let svc = match found {
+                    Some((svc, user)) => {
+                        self.user.insert(unit.clone(), user);
+                        svc
+                    }
+                    None => failed.unwrap_or_else(|| Service {
+                        error: Some("not-found".into()),
+                        ..Default::default()
+                    }),
+                };
+                self.state.insert(unit, svc);
+            }
+        }
+        for r in list {
+            r.service = r.unit.as_ref().and_then(|u| self.state.get(u).cloned());
+        }
+    }
 }
 
 /// Longest wait between attempts of a failing tier.
@@ -241,9 +391,13 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     // Runners: directories every minute, processes every 5 s.
     {
         let (shared, roots) = (shared.clone(), cfg.runner_roots.clone());
+        let units = cfg.runner_units.clone();
         let mut scan = runners::ProcessScan::new();
+        let mut services = Services::default();
         let mut list = Vec::new();
         let mut listed: Option<Instant> = None;
+        let gh_wake = gh_tx.clone();
+        let mut repos_seen: Vec<String> = Vec::new();
         spawn_tier(
             "runners",
             shared.clone(),
@@ -253,11 +407,22 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             || Duration::from_secs(5),
             move |_| {
                 if listed.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
-                    list = runners::discover(&roots);
+                    list = runners::discover(&roots, &units);
                     listed = Some(Instant::now());
                 }
                 scan.update(&mut list);
+                for r in &mut list {
+                    runners::read_diag(r);
+                }
+                services.update(&mut list);
                 shared.lock().unwrap().runners = list.clone();
+                // Runners (or their repositories) turned up: read their queue
+                // now, not at the gh tier's next turn a minute away.
+                let repos = sources::runner_repos(&list);
+                if repos != repos_seen {
+                    repos_seen = repos;
+                    let _ = gh_wake.send(());
+                }
                 Read::Ok
             },
         );
@@ -365,6 +530,8 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     // GitHub.
     if cfg.github {
         let (shared, shared2) = (shared.clone(), shared.clone());
+        let mut state = GhState::default();
+        let changed_gh = changed.clone();
         let interval = move || {
             Duration::from_secs(if gh_active(&shared2.lock().unwrap()) {
                 60
@@ -390,7 +557,16 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 gh_read.lock().unwrap().clone_from(&urls);
                 let prs = sources::read_pr_checks(&urls);
                 let jobs = sources::read_queue(&runner_list);
-                apply_gh(&mut shared.lock().unwrap(), prs, jobs)
+                // Show the checks and the queue first: the first history
+                // read fetches several runs' jobs and takes a while.
+                let live = jobs.clone();
+                let read = apply_gh(&mut shared.lock().unwrap(), prs, jobs);
+                let _ = changed_gh.send(());
+                let (history, gh_runners) = state.read(&runner_list, &live);
+                let mut s = shared.lock().unwrap();
+                s.history = history;
+                s.gh_runners = gh_runners;
+                read
             },
         );
     }
@@ -443,9 +619,12 @@ fn has_new_prs(s: &Snapshot, read: &[String]) -> bool {
         .any(|u| !read.contains(u))
 }
 
-/// Whether gh has anything live to watch: a busy runner or a PR on screen.
+/// Whether gh has anything live to watch: a busy runner, a queued job (so a
+/// runner that does not pick it up is seen in time), or a PR on screen.
 fn gh_active(s: &Snapshot) -> bool {
-    s.runners.iter().any(|r| r.busy) || !sources::pr_urls(s.fleet.as_ref(), &s.pipelines).is_empty()
+    s.runners.iter().any(|r| r.busy)
+        || s.jobs.iter().any(Job::is_queued)
+        || !sources::pr_urls(s.fleet.as_ref(), &s.pipelines).is_empty()
 }
 
 fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -463,8 +642,12 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     };
     s.host = Some(HostReader::new(cfg.disk_paths.clone()).read());
     note(&mut s, "host", Read::Ok);
-    let mut list = runners::discover(&cfg.runner_roots);
+    let mut list = runners::discover(&cfg.runner_roots, &cfg.runner_units);
     runners::ProcessScan::new().update(&mut list);
+    for r in &mut list {
+        runners::read_diag(r);
+    }
+    Services::default().update(&mut list);
     s.runners = list;
     note(&mut s, "runners", Read::Ok);
     let r = match sources::read_fleet(&cfg.fm_home, &cfg.cache_dir) {
@@ -496,6 +679,9 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
         let prs = sources::read_pr_checks(&urls);
         let jobs = sources::read_queue(&s.runners);
+        let (history, gh_runners) = GhState::default().read(&s.runners, &jobs);
+        s.history = history;
+        s.gh_runners = gh_runners;
         let r = apply_gh(&mut s, prs, jobs);
         note(&mut s, "gh", r);
     }
@@ -671,6 +857,36 @@ mod tests {
         idle.fm_state = "no_active_work".into();
         s.fleet = Some(fleet(vec![idle]));
         assert!(!gh_active(&s));
+    }
+
+    #[test]
+    fn a_queued_job_keeps_gh_on_its_fast_cadence() {
+        let mut s = Snapshot::default();
+        assert!(!gh_active(&s));
+        // An idle runner with a job queued for it must be re-read soon, or a
+        // runner that never picks the job up is seen minutes late.
+        s.jobs.push(Job {
+            status: "queued".into(),
+            ..Default::default()
+        });
+        assert!(gh_active(&s));
+    }
+
+    #[test]
+    fn the_queue_read_keeps_only_unfinished_jobs() {
+        let mut s = Snapshot::default();
+        let job = |status: &str| Job {
+            status: status.into(),
+            ..Default::default()
+        };
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(vec![job("completed"), job("in_progress"), job("queued")]),
+        );
+        assert_eq!(r, Read::Ok);
+        assert_eq!(s.jobs.len(), 2);
+        assert!(s.jobs_read_at.is_some());
     }
 
     #[test]

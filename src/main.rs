@@ -1,9 +1,9 @@
 //! `crowsnest`: run it in a pane beside firstmate. It only reads.
 
 use clap::Parser;
-use crowsnest::app::{Action, App, DEFAULT_READ_OVERDUE_SECS, visible_rows};
+use crowsnest::app::{Action, App, DEFAULT_READ_OVERDUE_SECS, runner_keys, visible_rows};
 use crowsnest::collector::{self, Config};
-use crowsnest::model::Thresholds;
+use crowsnest::model::{RunnerThresholds, Thresholds};
 use crowsnest::timefmt::now_epoch;
 use crowsnest::ui::{self, View, theme::Theme};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -53,12 +53,39 @@ struct Args {
     #[arg(long = "runner-root", value_name = "DIR")]
     runner_roots: Vec<PathBuf>,
 
+    /// The systemd unit that runs a runner directory, for the runner detail's
+    /// service line (repeatable; default: the unit `svc.sh install` recorded).
+    #[arg(long = "runner-unit", value_name = "DIR=UNIT", value_parser = parse_runner_unit)]
+    runner_units: Vec<(PathBuf, String)>,
+
+    /// Minutes a busy runner's step output (or, without it, its worker log)
+    /// may stay still before the runner is shown as STALLED.
+    #[arg(long, default_value_t = 10, value_name = "MIN")]
+    runner_silent_minutes: u64,
+
+    /// A job running longer than this many times its typical duration is
+    /// shown as SLOW.
+    #[arg(long, default_value_t = 2.0, value_name = "FACTOR", value_parser = parse_factor)]
+    runner_overdue_factor: f64,
+
+    /// CPU-seconds a silent job's processes may use over the silent window
+    /// and still count as idle (STALLED); more means the job is busy but
+    /// quiet, and it is not flagged.
+    #[arg(long, default_value_t = 2.0, value_name = "SECS")]
+    runner_idle_cpu_seconds: f64,
+
+    /// Minutes a job may stay queued while its runner is idle before the
+    /// runner is shown as NOT PICKING UP.
+    #[arg(long, default_value_t = 5, value_name = "MIN")]
+    runner_pickup_minutes: u64,
+
     /// Path whose filesystem use is shown (repeatable; default: / and your
     /// home directory).
     #[arg(long = "disk", value_name = "PATH")]
     disks: Vec<PathBuf>,
 
-    /// Do not call GitHub (no PR checks, no runner queue).
+    /// Do not call GitHub (no PR checks, no runner queue, history or
+    /// registration).
     #[arg(long)]
     no_github: bool,
 
@@ -81,6 +108,23 @@ struct Args {
     /// Crowsnest's own cache directory (default: $XDG_CACHE_HOME/crowsnest).
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
+}
+
+fn parse_runner_unit(s: &str) -> Result<(PathBuf, String), String> {
+    let (dir, unit) = s
+        .rsplit_once('=')
+        .ok_or("expected DIR=UNIT, e.g. ~/actions-runner-app=actions-runner-app.service")?;
+    if dir.is_empty() || !crowsnest::exec::valid_unit(unit) {
+        return Err(format!("not a runner directory and systemd unit: {s}"));
+    }
+    Ok((PathBuf::from(dir), unit.to_string()))
+}
+
+fn parse_factor(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(f) if f.is_finite() && f >= 1.0 => Ok(f),
+        _ => Err(format!("expected a factor of at least 1, got {s}")),
+    }
 }
 
 fn home() -> Option<PathBuf> {
@@ -121,6 +165,7 @@ fn config(args: &Args) -> Result<Config, String> {
         fm_home,
         cache_dir,
         runner_roots,
+        runner_units: args.runner_units.clone(),
         disk_paths,
         fleet_interval: Duration::from_secs(args.fleet_interval.max(10)),
         fleet_min_gap: Duration::from_secs(20),
@@ -144,6 +189,7 @@ fn key_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('p') => Action::Pause,
         KeyCode::Char('?') => Action::Help,
+        KeyCode::Tab | KeyCode::BackTab => Action::Focus,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
     })
@@ -163,6 +209,12 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
     let (tx, rx) = mpsc::channel();
     let (shared, handle) = collector::start(cfg, tx);
     let mut app = App::new(thresholds);
+    app.runner_thresholds = RunnerThresholds {
+        silent_secs: (args.runner_silent_minutes * 60) as i64,
+        overdue_factor: args.runner_overdue_factor,
+        pickup_secs: (args.runner_pickup_minutes * 60) as i64,
+        idle_cpu_ms: (args.runner_idle_cpu_seconds.max(0.0) * 1000.0) as u64,
+    };
     // Three missed fleet reads, and never sooner than the default.
     app.read_overdue_secs = (args.fleet_interval.max(10) as i64 * 3).max(DEFAULT_READ_OVERDUE_SECS);
     let mut terminal = ratatui::init();
@@ -206,8 +258,9 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
                         let mut snap = shared.lock().unwrap().clone();
                         snap.now = now_epoch();
                         let rows = visible_rows(&snap, &app);
+                        let runners = runner_keys(&snap);
                         let was_paused = app.paused;
-                        if app.apply(action, &rows) {
+                        if app.apply(action, &rows, &runners) {
                             handle.refresh();
                         }
                         if app.paused != was_paused {

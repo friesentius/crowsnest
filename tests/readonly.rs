@@ -113,6 +113,7 @@ fn once_reads_everything_and_writes_nothing() {
         home.join("state"),
         shims.clone(),
         runners.join("actions-runner-pantry"),
+        runners.join("actions-runner-bookshop"),
     ] {
         fs::create_dir_all(d).unwrap();
     }
@@ -131,6 +132,14 @@ fn once_reads_everything_and_writes_nothing() {
     fs::copy(
         format!("{FIXTURES}/runner/.runner"),
         runners.join("actions-runner-pantry/.runner"),
+    )
+    .unwrap();
+    // A second runner whose repository's runner list the token may not read.
+    fs::write(
+        runners.join("actions-runner-bookshop/.runner"),
+        fs::read_to_string(format!("{FIXTURES}/runner/.runner"))
+            .unwrap()
+            .replace("pantry", "bookshop"),
     )
     .unwrap();
 
@@ -158,11 +167,23 @@ esac
         &format!(
             r#"{logger}case "$*" in
   "api graphql"*) cat "$CN_FIXTURES/gh-checks.json" ;;
-  *"/jobs"*) cat "$CN_FIXTURES/gh-jobs.json" ;;
+  *"repos/acme/bookshop/actions/runners"*) echo "gh: Must have admin rights to Repository. (HTTP 403)" >&2; exit 1 ;;
+  *"repos/acme/bookshop/"*) echo '{{"total_count": 0, "workflow_runs": []}}' ;;
+  *"/actions/runners"*) cat "$CN_FIXTURES/gh-runners.json" ;;
+  *"status=completed"*) cat "$CN_FIXTURES/gh-runs-completed.json" ;;
+  *"/jobs"*)
+    id=$(printf '%s' "$*" | sed -n 's#.*/runs/\([0-9]*\)/jobs.*#\1#p')
+    if [ -f "$CN_FIXTURES/gh-jobs-$id.json" ]; then cat "$CN_FIXTURES/gh-jobs-$id.json"; else cat "$CN_FIXTURES/gh-jobs.json"; fi ;;
   *"/actions/runs?"*) cat "$CN_FIXTURES/gh-runs.json" ;;
   *) echo "unexpected" >&2; exit 1 ;;
 esac
 "#
+        ),
+    );
+    write_exec(
+        &shims.join("systemctl"),
+        &format!(
+            "{logger}printf 'LoadState=loaded\\nActiveState=active\\nSubState=running\\nNRestarts=2\\n'\n"
         ),
     );
     write_exec(
@@ -183,6 +204,11 @@ esac
         .arg(&cache)
         .arg("--runner-root")
         .arg(&runners)
+        .arg("--runner-unit")
+        .arg(format!(
+            "{}=actions-runner-pantry.service",
+            runners.join("actions-runner-pantry").display()
+        ))
         .args(["--disk", "/"])
         .env("PATH", path)
         .env("HOME", &root)
@@ -213,8 +239,33 @@ esac
             .len(),
         4
     );
-    assert_eq!(snap["runners"][0]["repo"], "acme/pantry");
+    assert_eq!(snap["runners"][0]["repo"], "acme/bookshop");
+    assert_eq!(snap["runners"][1]["repo"], "acme/pantry");
     assert_eq!(snap["jobs"][0]["name"], "Unit + e2e tests");
+    assert_eq!(snap["jobs"][0]["run"]["pr"], 122);
+    assert_eq!(snap["jobs"][0]["steps"].as_array().unwrap().len(), 9);
+    // The runner list is read where the token may, and denied (not an
+    // error) where it may not.
+    assert_eq!(
+        snap["gh_runners"]["acme/pantry"]["runners"][0]["version"],
+        "2.338.2"
+    );
+    assert_eq!(snap["gh_runners"]["acme/bookshop"]["denied"], true);
+    assert!(snap["gh_runners"]["acme/bookshop"]["error"].is_null());
+    // History: the finished runs, and the jobs already done in the live one.
+    let h = &snap["history"]["acme/pantry"];
+    assert!(h["error"].is_null(), "{}", h["error"]);
+    assert_eq!(h["jobs"].as_array().unwrap().len(), 19);
+    assert!(
+        h["typical"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["job"] == "Unit + e2e tests" && t["step"].is_null() && t["secs"] == 2400)
+    );
+    assert_eq!(snap["runners"][1]["unit"], "actions-runner-pantry.service");
+    assert_eq!(snap["runners"][1]["service"]["active"], "active");
+    assert_eq!(snap["runners"][1]["service"]["restarts"], 2);
     assert_eq!(snap["quota"].as_array().unwrap().len(), 6);
 
     // Nothing under the firstmate home changed, and nothing was added.
@@ -227,7 +278,13 @@ esac
     // Every command was a read.
     let calls = calls(&log);
     let programs: Vec<&str> = calls.iter().map(|c| c.program.as_str()).collect();
-    for p in ["fm-fleet-snapshot.sh", "no-mistakes", "gh", "quota-axi"] {
+    for p in [
+        "fm-fleet-snapshot.sh",
+        "no-mistakes",
+        "gh",
+        "quota-axi",
+        "systemctl",
+    ] {
         assert!(programs.contains(&p), "{p} was called: {programs:?}");
     }
     for c in &calls {
@@ -259,10 +316,25 @@ esac
                     )
                 }
                 ["api", "--method", "GET", p] => {
-                    assert!(p.starts_with("repos/acme/pantry/actions/runs"))
+                    assert!(
+                        ["repos/acme/pantry/actions/", "repos/acme/bookshop/actions/"]
+                            .iter()
+                            .any(|r| p.starts_with(r)),
+                        "{p}"
+                    )
                 }
                 other => panic!("unexpected gh call {other:?}"),
             },
+            "systemctl" => assert_eq!(
+                args,
+                [
+                    "--user",
+                    "show",
+                    "--property=LoadState,ActiveState,SubState,NRestarts",
+                    "--",
+                    "actions-runner-pantry.service"
+                ]
+            ),
             "quota-axi" => assert_eq!(args, ["--no-credential-refresh", "--json"]),
             other => panic!("unexpected program {other}"),
         }
@@ -288,6 +360,10 @@ fn the_allowlist_refuses_writes() {
     assert!(refused(ReadCommand::QuotaAxi {
         providers: vec!["claude --login".into()]
     }));
+    assert!(refused(ReadCommand::SystemctlShow {
+        unit: "--now".into(),
+        user: true
+    }));
     // Every allowed invocation is free of mutating words.
     let all = [
         ReadCommand::FleetSnapshot {
@@ -305,6 +381,10 @@ fn the_allowlist_refuses_writes() {
         },
         ReadCommand::QuotaAxi {
             providers: vec!["claude".into()],
+        },
+        ReadCommand::SystemctlShow {
+            unit: "actions-runner-pantry.service".into(),
+            user: true,
         },
     ];
     for c in all {

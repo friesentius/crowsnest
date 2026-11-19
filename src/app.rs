@@ -1,7 +1,8 @@
 //! UI state and key handling. Pure: no I/O, so it is unit-testable.
 
 use crate::model::{
-    CheckState, Pipeline, PrChecks, Snapshot, Stale, Thresholds, Worker, WorkerState, classify,
+    CheckState, Pipeline, PrChecks, RunnerThresholds, Snapshot, Stale, Thresholds, Worker,
+    WorkerState, classify,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +43,15 @@ pub enum Action {
     Pause,
     Help,
     Quit,
+    /// Move the keys between the roster and the runner panel (Tab).
+    Focus,
+}
+
+/// Which part of the screen the arrow keys move in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Roster,
+    Runners,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +63,12 @@ pub struct App {
     pub quit: bool,
     pub paused: bool,
     pub thresholds: Thresholds,
+    pub runner_thresholds: RunnerThresholds,
+    pub focus: Focus,
+    /// The selected runner, by its directory ([`runner_keys`]).
+    pub runner: Option<String>,
+    /// The selected runner's detail view is open.
+    pub runner_detail: bool,
     /// A fleet read this old is overdue, unless refresh is paused.
     pub read_overdue_secs: i64,
     changes: BTreeMap<String, Seen>,
@@ -82,6 +98,10 @@ impl App {
             quit: false,
             paused: false,
             thresholds,
+            runner_thresholds: RunnerThresholds::default(),
+            focus: Focus::Roster,
+            runner: None,
+            runner_detail: false,
             read_overdue_secs: DEFAULT_READ_OVERDUE_SECS,
             changes: BTreeMap::new(),
             seeded: false,
@@ -142,13 +162,38 @@ impl App {
             .map(|at| (now - at).max(0))
     }
 
-    /// Apply a key action against the rows currently on screen. Returns true
-    /// when the action asks the collector to refresh.
-    pub fn apply(&mut self, action: Action, rows: &[Row]) -> bool {
+    /// Apply a key action against the rows and runners currently on screen
+    /// (`runners` as [`runner_keys`] gives them). Returns true when the
+    /// action asks the collector to refresh.
+    pub fn apply(&mut self, action: Action, rows: &[Row], runners: &[String]) -> bool {
         if self.help && !matches!(action, Action::Quit) {
             self.help = false;
             return false;
         }
+        match action {
+            Action::Filter => self.filter = self.filter.next(),
+            Action::Refresh => return true,
+            Action::Pause => self.paused = !self.paused,
+            Action::Help => self.help = true,
+            Action::Quit => self.quit = true,
+            Action::Focus => {
+                self.runner_detail = false;
+                self.focus = match self.focus {
+                    Focus::Roster if !runners.is_empty() => {
+                        let i = self.runner_index(runners).unwrap_or(0);
+                        self.runner = runners.get(i).cloned();
+                        Focus::Runners
+                    }
+                    _ => Focus::Roster,
+                };
+            }
+            _ if self.focus == Focus::Runners => self.move_runner(action, runners),
+            _ => self.move_row(action, rows),
+        }
+        false
+    }
+
+    fn move_row(&mut self, action: Action, rows: &[Row]) {
         let idx = self.selected_index(rows);
         let pick = |i: usize| rows.get(i).map(|r| r.worker.id.clone());
         match action {
@@ -172,13 +217,57 @@ impl App {
                     self.expanded.remove(id);
                 }
             }
-            Action::Filter => self.filter = self.filter.next(),
-            Action::Refresh => return true,
-            Action::Pause => self.paused = !self.paused,
-            Action::Help => self.help = true,
-            Action::Quit => self.quit = true,
+            _ => {}
         }
-        false
+    }
+
+    fn move_runner(&mut self, action: Action, runners: &[String]) {
+        if runners.is_empty() {
+            self.focus = Focus::Roster;
+            self.runner_detail = false;
+            return;
+        }
+        let idx = self.runner_index(runners).unwrap_or(0);
+        let last = runners.len() - 1;
+        let to = match action {
+            Action::Up => idx.saturating_sub(1),
+            Action::Down => (idx + 1).min(last),
+            Action::Top => 0,
+            Action::Bottom => last,
+            Action::Toggle => {
+                self.runner_detail = !self.runner_detail;
+                idx
+            }
+            Action::Collapse => {
+                // Esc closes the detail first, then leaves the panel.
+                if self.runner_detail {
+                    self.runner_detail = false;
+                } else {
+                    self.focus = Focus::Roster;
+                }
+                idx
+            }
+            _ => idx,
+        };
+        self.runner = runners.get(to).cloned();
+    }
+
+    /// Index of the selected runner, defaulting to the first.
+    pub fn runner_index(&self, runners: &[String]) -> Option<usize> {
+        if runners.is_empty() {
+            return None;
+        }
+        Some(
+            self.runner
+                .as_ref()
+                .and_then(|k| runners.iter().position(|r| r == k))
+                .unwrap_or(0),
+        )
+    }
+
+    /// The runner panel has the keys, and there is a runner to select.
+    pub fn runners_focused(&self, snap: &Snapshot) -> bool {
+        self.focus == Focus::Runners && !snap.runners.is_empty()
     }
 
     /// Index of the selected row, defaulting to the first row.
@@ -355,6 +444,14 @@ pub fn all_rows<'a>(snap: &'a Snapshot, th: &Thresholds) -> Vec<Row<'a>> {
     rows
 }
 
+/// Each runner's key for [`App::apply`]: its directory.
+pub fn runner_keys(snap: &Snapshot) -> Vec<String> {
+    snap.runners
+        .iter()
+        .map(|r| r.dir.display().to_string())
+        .collect()
+}
+
 pub fn visible_rows<'a>(snap: &'a Snapshot, app: &App) -> Vec<Row<'a>> {
     all_rows(snap, &app.thresholds)
         .into_iter()
@@ -480,24 +577,66 @@ mod tests {
         let s = snap();
         let mut app = App::new(Thresholds::new(1800));
         let rows = visible_rows(&s, &app);
-        app.apply(Action::Down, &rows);
+        let none: &[String] = &[];
+        app.apply(Action::Down, &rows, none);
         assert_eq!(app.selected.as_deref(), Some("b-work"));
-        app.apply(Action::Toggle, &rows);
+        app.apply(Action::Toggle, &rows, none);
         assert!(app.expanded.contains("b-work"));
-        app.apply(Action::Toggle, &rows);
+        app.apply(Action::Toggle, &rows, none);
         assert!(!app.expanded.contains("b-work"));
-        app.apply(Action::Bottom, &rows);
+        app.apply(Action::Bottom, &rows, none);
         assert_eq!(app.selected.as_deref(), Some("idle"));
-        app.apply(Action::Filter, &rows);
+        app.apply(Action::Filter, &rows, none);
         assert_eq!(visible_rows(&s, &app).len(), 2);
-        app.apply(Action::Filter, &rows);
+        app.apply(Action::Filter, &rows, none);
         assert_eq!(visible_rows(&s, &app).len(), 1);
-        assert!(app.apply(Action::Refresh, &rows));
-        app.apply(Action::Help, &rows);
+        assert!(app.apply(Action::Refresh, &rows, none));
+        app.apply(Action::Help, &rows, none);
         assert!(app.help);
-        app.apply(Action::Down, &rows);
+        app.apply(Action::Down, &rows, none);
         assert!(!app.help, "any key closes help");
-        app.apply(Action::Quit, &rows);
+        // With no runners, Tab keeps the keys on the roster.
+        app.apply(Action::Focus, &rows, none);
+        assert_eq!(app.focus, Focus::Roster);
+        app.apply(Action::Quit, &rows, none);
         assert!(app.quit);
+    }
+
+    #[test]
+    fn tab_moves_the_keys_to_the_runners_and_enter_opens_one() {
+        let s = snap();
+        let mut app = App::new(Thresholds::new(1800));
+        let rows = visible_rows(&s, &app);
+        let runners = ["/srv/a".to_string(), "/srv/b".into(), "/srv/c".into()];
+        app.apply(Action::Focus, &rows, &runners);
+        assert_eq!(app.focus, Focus::Runners);
+        assert_eq!(app.runner.as_deref(), Some("/srv/a"));
+        app.apply(Action::Down, &rows, &runners);
+        app.apply(Action::Down, &rows, &runners);
+        app.apply(Action::Down, &rows, &runners);
+        assert_eq!(app.runner.as_deref(), Some("/srv/c"));
+        assert_eq!(app.selected, None, "the roster selection stays put");
+        app.apply(Action::Up, &rows, &runners);
+        app.apply(Action::Toggle, &rows, &runners);
+        assert!(app.runner_detail);
+        // Arrows switch runners inside the detail.
+        app.apply(Action::Top, &rows, &runners);
+        assert_eq!(app.runner.as_deref(), Some("/srv/a"));
+        assert!(app.runner_detail);
+        // Esc goes back to the panel, then to the roster.
+        app.apply(Action::Collapse, &rows, &runners);
+        assert!(!app.runner_detail);
+        assert_eq!(app.focus, Focus::Runners);
+        app.apply(Action::Collapse, &rows, &runners);
+        assert_eq!(app.focus, Focus::Roster);
+        // Tab back in remembers the runner; Tab out closes the detail.
+        app.apply(Action::Focus, &rows, &runners);
+        assert_eq!(app.runner.as_deref(), Some("/srv/a"));
+        app.apply(Action::Toggle, &rows, &runners);
+        app.apply(Action::Focus, &rows, &runners);
+        assert!(!app.runner_detail);
+        assert_eq!(app.focus, Focus::Roster);
+        app.apply(Action::Down, &rows, &runners);
+        assert_eq!(app.selected.as_deref(), Some("b-work"));
     }
 }
