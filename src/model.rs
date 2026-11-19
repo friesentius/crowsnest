@@ -274,19 +274,255 @@ pub struct Runner {
     pub dir: PathBuf,
     /// `owner/repo` when the runner is registered to one repository.
     pub repo: Option<String>,
+    /// A `Runner.Worker` process runs from the runner's directory.
     pub busy: bool,
+    /// How long that `Runner.Worker` has run, when the scan was taken.
     pub busy_secs: Option<i64>,
+    /// Unix time of the last process scan, or `None` when the process table
+    /// could not be read (then `busy` and `listener_secs` say nothing).
+    pub scanned_at: Option<i64>,
+    /// How long the runner's `Runner.Listener` has run, when one runs.
+    pub listener_secs: Option<i64>,
+    /// When crowsnest first saw the runner without a `Runner.Worker` in its
+    /// current idle stretch.
+    pub idle_since: Option<i64>,
+    /// Modification times of the newest `_diag/Runner_*.log`,
+    /// `_diag/Worker_*.log` and `_diag/pages/*.log` (the running step's
+    /// output; best effort, the pages are not a documented interface).
+    pub runner_log_at: Option<i64>,
+    pub worker_log_at: Option<i64>,
+    pub step_output_at: Option<i64>,
+    /// The systemd unit that runs it, from `--runner-unit` or the `.service`
+    /// file `svc.sh install` writes.
+    pub unit: Option<String>,
+    pub service: Option<Service>,
+}
+
+impl Runner {
+    /// The repository's short name, or the runner's own name.
+    pub fn label(&self) -> &str {
+        self.repo
+            .as_deref()
+            .and_then(|r| r.rsplit('/').next())
+            .unwrap_or(&self.name)
+    }
+
+    /// Unix time its `Runner.Worker` started, when one runs.
+    pub fn busy_since(&self) -> Option<i64> {
+        self.busy.then_some(self.scanned_at? - self.busy_secs?)
+    }
+}
+
+/// `systemctl show` of a runner's unit.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Service {
+    /// `ActiveState`, e.g. `active` or `failed`.
+    pub active: String,
+    /// `SubState`, e.g. `running`.
+    pub sub: String,
+    pub restarts: Option<u32>,
+    /// Why it could not be read, or `not-found` when systemd has no such unit.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct JobStep {
+    pub number: u32,
+    pub name: String,
+    /// `queued`, `in_progress` or `completed`.
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+/// What a workflow run is for, from the runs list.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RunInfo {
+    pub id: u64,
+    pub attempt: u32,
+    pub workflow: String,
+    pub number: u64,
+    /// `pull_request`, `push`, `workflow_dispatch`, ...
+    pub event: String,
+    /// The PR title for a pull request, the commit message for a push.
+    pub title: String,
+    pub branch: String,
+    pub sha: String,
+    /// The pull request, only for pull request events: push runs on a
+    /// release branch list the open PR too, but are not for it.
+    pub pr: Option<u64>,
+    pub base: Option<String>,
+    pub created_at: Option<i64>,
+}
+
+impl RunInfo {
+    /// `#123`, or `dev push`, or the branch.
+    pub fn label(&self) -> String {
+        match self.pr {
+            Some(n) => format!("#{n}"),
+            None if self.event == "push" => format!("{} push", self.branch),
+            None => self.branch.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Job {
     pub repo: String,
     pub name: String,
-    /// `queued` or `in_progress`.
+    /// `queued`, `in_progress`, `waiting` (on an approval or concurrency
+    /// group) or `completed`.
     pub status: String,
     pub runner: Option<String>,
     pub started_at: Option<i64>,
     pub branch: String,
+    pub id: u64,
+    pub run_id: u64,
+    pub workflow: String,
+    pub created_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub conclusion: Option<String>,
+    pub labels: Vec<String>,
+    pub steps: Vec<JobStep>,
+    /// The run it belongs to, when the runs list was read with it.
+    pub run: Option<RunInfo>,
+}
+
+impl Job {
+    pub fn is_queued(&self) -> bool {
+        self.status == "queued" || self.status == "waiting"
+    }
+
+    /// Runs on a self-hosted runner: the only jobs a local runner can take.
+    /// Jobs read without labels are given the benefit of the doubt.
+    pub fn is_self_hosted(&self) -> bool {
+        self.labels.is_empty()
+            || self
+                .labels
+                .iter()
+                .any(|l| l.eq_ignore_ascii_case("self-hosted"))
+    }
+
+    /// `#123`, or `dev push`, or the branch.
+    pub fn label(&self) -> String {
+        self.run
+            .as_ref()
+            .map_or_else(|| self.branch.clone(), RunInfo::label)
+    }
+
+    /// The number of the last step. Step numbers can skip (post steps of
+    /// actions that did not run are left out), so this is not the count.
+    pub fn step_total(&self) -> u32 {
+        self.steps.iter().map(|s| s.number).max().unwrap_or(0)
+    }
+
+    /// The step running now, or the last one that ran.
+    pub fn current_step(&self) -> Option<&JobStep> {
+        self.steps
+            .iter()
+            .find(|s| s.status == "in_progress")
+            .or_else(|| self.steps.iter().rev().find(|s| s.started_at.is_some()))
+    }
+}
+
+/// One registered runner as GitHub reports it
+/// (`repos/<r>/actions/runners`, which needs repository admin read).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GhRunner {
+    pub name: String,
+    /// `online` or `offline`.
+    pub status: String,
+    pub busy: bool,
+    pub version: String,
+    pub labels: Vec<String>,
+}
+
+/// GitHub's runner list for one repository.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoRunners {
+    pub read_at: Option<i64>,
+    pub runners: Vec<GhRunner>,
+    /// The token may not read runners (403: needs admin read).
+    pub denied: bool,
+    pub error: Option<String>,
+}
+
+/// A finished job, kept small: the history the runner detail shows.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DoneJob {
+    pub runner: String,
+    pub workflow: String,
+    pub name: String,
+    /// `#123`, `dev push`, or the branch.
+    pub label: String,
+    pub conclusion: String,
+    pub created_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+impl DoneJob {
+    pub fn ran_secs(&self) -> Option<i64> {
+        Some(self.completed_at? - self.started_at?).filter(|s| *s >= 0)
+    }
+    pub fn waited_secs(&self) -> Option<i64> {
+        Some(self.started_at? - self.created_at?).filter(|s| *s >= 0)
+    }
+}
+
+/// The typical duration of one job, or one step of it.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct Typical {
+    pub workflow: String,
+    pub job: String,
+    pub step: Option<String>,
+    /// Median of the latest successful samples, in seconds.
+    pub secs: i64,
+    pub samples: usize,
+}
+
+/// What crowsnest knows of one repository's finished jobs.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoHistory {
+    /// Finished jobs on self-hosted runners, newest first.
+    pub jobs: Vec<DoneJob>,
+    pub typical: Vec<Typical>,
+    /// Creation time of the oldest run read: `jobs` holds everything since.
+    pub covered_since: Option<i64>,
+    pub error: Option<String>,
+}
+
+impl RepoHistory {
+    /// The typical duration of a job (`step` None) or one of its steps.
+    pub fn typical(&self, workflow: &str, job: &str, step: Option<&str>) -> Option<&Typical> {
+        self.typical
+            .iter()
+            .find(|t| t.workflow == workflow && t.job == job && t.step.as_deref() == step)
+    }
+}
+
+/// The limits that decide whether a runner looks stuck. Kept apart from
+/// [`Thresholds`] so those stay `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunnerThresholds {
+    /// A busy runner whose step output (or worker log) has not advanced for
+    /// this long is STALLED.
+    pub silent_secs: i64,
+    /// A job running longer than this many times its typical duration is SLOW.
+    pub overdue_factor: f64,
+    /// A job queued this long while its runner is idle is NOT PICKING UP.
+    pub pickup_secs: i64,
+}
+
+impl Default for RunnerThresholds {
+    fn default() -> Self {
+        RunnerThresholds {
+            silent_secs: 10 * 60,
+            overdue_factor: 2.0,
+            pickup_secs: 5 * 60,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -358,7 +594,14 @@ pub struct Snapshot {
     pub pipelines: BTreeMap<String, Pipeline>,
     pub prs: BTreeMap<String, PrChecks>,
     pub runners: Vec<Runner>,
+    /// Queued and running jobs of the repositories with a local runner.
     pub jobs: Vec<Job>,
+    /// Unix time `jobs` was read.
+    pub jobs_read_at: Option<i64>,
+    /// GitHub's view of each repository's runners, keyed by `owner/repo`.
+    pub gh_runners: BTreeMap<String, RepoRunners>,
+    /// Finished jobs and typical durations, keyed by `owner/repo`.
+    pub history: BTreeMap<String, RepoHistory>,
     pub host: Option<Host>,
     pub quota: Vec<QuotaWindow>,
     pub fresh: BTreeMap<String, Freshness>,

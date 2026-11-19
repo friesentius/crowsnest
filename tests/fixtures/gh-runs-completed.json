@@ -1,0 +1,85 @@
+{
+  "total_count": 4,
+  "workflow_runs": [
+    {
+      "id": 44530000308,
+      "name": "CI",
+      "display_title": "Show units next to quantities",
+      "status": "completed",
+      "conclusion": "success",
+      "head_branch": "fm/pantry-units",
+      "head_sha": "4f2c9e1a7b3d5f60817263544b9a0c1d2e3f4a5b",
+      "event": "pull_request",
+      "run_number": 308,
+      "run_attempt": 1,
+      "pull_requests": [
+        {
+          "number": 121,
+          "head": {
+            "ref": "fm/pantry-units"
+          },
+          "base": {
+            "ref": "dev"
+          }
+        }
+      ],
+      "created_at": "2026-11-19T12:52:00Z",
+      "updated_at": "2026-11-19T13:50:30Z"
+    },
+    {
+      "id": 44530000307,
+      "name": "CI",
+      "display_title": "Export a pantry as CSV (#118)",
+      "status": "completed",
+      "conclusion": "success",
+      "head_branch": "dev",
+      "head_sha": "4f2c9e1a7b3d5f60817263544b9a0c1d2e3f4a5b",
+      "event": "push",
+      "run_number": 307,
+      "run_attempt": 1,
+      "pull_requests": [],
+      "created_at": "2026-11-19T11:45:00Z",
+      "updated_at": "2026-11-19T12:51:20Z"
+    },
+    {
+      "id": 44530000306,
+      "name": "CI",
+      "display_title": "Export a pantry as CSV",
+      "status": "completed",
+      "conclusion": "failure",
+      "head_branch": "fm/pantry-export",
+      "head_sha": "4f2c9e1a7b3d5f60817263544b9a0c1d2e3f4a5b",
+      "event": "pull_request",
+      "run_number": 306,
+      "run_attempt": 1,
+      "pull_requests": [
+        {
+          "number": 118,
+          "head": {
+            "ref": "fm/pantry-export"
+          },
+          "base": {
+            "ref": "dev"
+          }
+        }
+      ],
+      "created_at": "2026-11-19T10:30:00Z",
+      "updated_at": "2026-11-19T11:39:03Z"
+    },
+    {
+      "id": 44530000305,
+      "name": "CI",
+      "display_title": "Pantry search keeps the filter",
+      "status": "completed",
+      "conclusion": "success",
+      "head_branch": "dev",
+      "head_sha": "4f2c9e1a7b3d5f60817263544b9a0c1d2e3f4a5b",
+      "event": "push",
+      "run_number": 305,
+      "run_attempt": 1,
+      "pull_requests": [],
+      "created_at": "2026-11-19T09:02:10Z",
+      "updated_at": "2026-11-19T10:09:01Z"
+    }
+  ]
+}

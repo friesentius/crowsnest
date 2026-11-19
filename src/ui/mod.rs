@@ -3,6 +3,7 @@
 //! 140 columns the panels sit under the roster; from 140 columns they move
 //! to a right-hand column and the held captain calls get their own panel.
 
+pub mod runners;
 pub mod theme;
 
 use crate::app::{App, Row, visible_rows};
@@ -994,130 +995,6 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
     );
 }
 
-fn runner_panel(view: &View, buf: &mut Buffer, area: Rect, with_jobs: bool) {
-    let t = &view.theme;
-    let w = area.width.saturating_sub(4) as usize;
-    let snap = view.snap;
-    let queued = |repo: &Option<String>| {
-        snap.jobs
-            .iter()
-            .filter(|j| j.status == "queued" && repo.as_deref() == Some(j.repo.as_str()))
-            .count()
-    };
-    let mut lines: Vec<Content> = Vec::new();
-    if snap.runners.is_empty() {
-        lines.push(Content::Line(Line::from(span(
-            "no self-hosted runners found",
-            t.dim(),
-        ))));
-    }
-    let label = |r: &crate::model::Runner| -> String {
-        r.repo
-            .as_deref()
-            .and_then(|repo| repo.rsplit('/').next())
-            .map(str::to_string)
-            .unwrap_or_else(|| r.name.clone())
-    };
-    let name_w = snap
-        .runners
-        .iter()
-        .map(|r| label(r).width())
-        .max()
-        .unwrap_or(0)
-        .min(w.saturating_sub(14))
-        .max(6);
-    for r in &snap.runners {
-        let q = queued(&r.repo);
-        let mut l = if r.busy {
-            vec![
-                span(
-                    format!("{} ", t.busy()),
-                    t.fg(ratatui::style::Color::Cyan)
-                        .add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-                span(rpad(&label(r), name_w), t.bold()),
-                span(" busy", t.fg(ratatui::style::Color::Cyan)),
-                span(
-                    r.busy_secs
-                        .map(|s| format!(" {}", timefmt::dur(s)))
-                        .unwrap_or_default(),
-                    t.plain(),
-                ),
-            ]
-        } else {
-            vec![
-                span(format!("{} ", t.idle()), t.dim()),
-                span(rpad(&label(r), name_w), t.plain()),
-                span(" idle", t.dim()),
-            ]
-        };
-        if q > 0 {
-            l.push(span(format!(" q{q}"), t.warn()));
-        }
-        lines.push(Content::Line(fit(l, w)));
-    }
-    if with_jobs {
-        // Group by repo (first-seen order), each repo's running jobs before its
-        // queued ones, and name the project on every line so a job can never
-        // read as belonging to the runner row above it.
-        let mut repos: Vec<&str> = Vec::new();
-        for j in &snap.jobs {
-            if !repos.contains(&j.repo.as_str()) {
-                repos.push(&j.repo);
-            }
-        }
-        for repo_full in repos {
-            let repo = repo_full.rsplit('/').next().unwrap_or(repo_full);
-            let running = |running: bool| {
-                snap.jobs
-                    .iter()
-                    .filter(move |j| j.repo == repo_full && (j.status == "in_progress") == running)
-            };
-            for j in running(true).chain(running(false)) {
-                let line = if j.status == "in_progress" {
-                    let d = j
-                        .started_at
-                        .map(|s| format!(" {}", timefmt::dur(snap.now - s)))
-                        .unwrap_or_default();
-                    vec![
-                        span(format!("{repo} "), t.bold()),
-                        span(
-                            format!("{} {}", t.step(StepStatus::Running).0, j.name),
-                            t.fg(ratatui::style::Color::Cyan),
-                        ),
-                        span(d, t.dim()),
-                    ]
-                } else {
-                    vec![
-                        span(format!("{repo} "), t.bold()),
-                        span(
-                            format!("{} queued ", t.idle()),
-                            t.fg(ratatui::style::Color::Yellow),
-                        ),
-                        span(j.name.clone(), t.dim()),
-                    ]
-                };
-                lines.push(Content::Line(fit(line, w)));
-            }
-        }
-    }
-    let total: usize = snap.jobs.iter().filter(|j| j.status == "queued").count();
-    let right = if total > 0 {
-        vec![span(format!("queue {total}"), t.warn())]
-    } else {
-        vec![]
-    };
-    draw_box(
-        buf,
-        area,
-        t,
-        vec![span("RUNNERS", t.bold())],
-        right,
-        t.border(),
-        lines,
-    );
-}
-
 fn host_panel(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
@@ -1321,20 +1198,29 @@ fn held_panel(view: &View, buf: &mut Buffer, area: Rect) {
 
 fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
-    let keys = [
-        (t.g("\u{2191}\u{2193}", "j/k"), "select"),
-        (t.g("\u{23ce}", "ret"), "detail"),
-        ("f", "filter"),
-        ("r", "refresh"),
-        ("p", "pause"),
-        ("?", "help"),
-        ("q", "quit"),
-    ];
-    let mut left = Vec::new();
-    for (k, v) in keys {
-        left.push(span(format!(" {k} "), t.key()));
-        left.push(span(format!(" {v} "), t.dim()));
-    }
+    let keys: Vec<(&str, &str)> = if view.app.runners_focused(view.snap) {
+        vec![
+            (t.g("\u{2191}\u{2193}", "j/k"), "runner"),
+            (t.g("\u{23ce}", "ret"), "detail"),
+            ("esc", "back"),
+            ("tab", "roster"),
+            ("r", "refresh"),
+            ("p", "pause"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    } else {
+        vec![
+            (t.g("\u{2191}\u{2193}", "j/k"), "select"),
+            (t.g("\u{23ce}", "ret"), "detail"),
+            ("tab", "runners"),
+            ("f", "filter"),
+            ("r", "refresh"),
+            ("p", "pause"),
+            ("?", "help"),
+            ("q", "quit"),
+        ]
+    };
     let mut right: Vec<Span<'static>> = Vec::new();
     if view.app.filter != crate::app::Filter::All {
         right.push(span(
@@ -1357,7 +1243,24 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     }
     let rw = width_of(&right);
     let w = area.width as usize;
-    let mut spans = fit(left, w.saturating_sub(rw + 1)).spans;
+    // Keys that do not fit are dropped whole, least needed first (help
+    // lists them all), rather than cut mid-word.
+    let mut keys = keys;
+    let render = |keys: &[(&str, &str)]| {
+        let mut left = Vec::new();
+        for (k, v) in keys {
+            left.push(span(format!(" {k} "), t.key()));
+            left.push(span(format!(" {v} "), t.dim()));
+        }
+        left
+    };
+    for drop in ["pause", "refresh", "filter", "roster", "runners"] {
+        if width_of(&render(&keys)) < w.saturating_sub(rw + 1) {
+            break;
+        }
+        keys.retain(|(_, v)| *v != drop);
+    }
+    let mut spans = fit(render(&keys), w.saturating_sub(rw + 1)).spans;
     let lw = width_of(&spans);
     spans.push(span(" ".repeat(w.saturating_sub(lw + rw)), Style::new()));
     spans.extend(right);
@@ -1376,6 +1279,10 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
     lines.push(key("up/down j/k", "select a worker (g/G: first/last)"));
     lines.push(key("enter / l", "open or close its detail"));
     lines.push(key("esc / h", "close detail"));
+    lines.push(key(
+        "tab",
+        "runner panel: up/down a runner, enter its detail",
+    ));
     lines.push(key("f", "filter: all, active, needs you"));
     lines.push(key("r", "refresh everything now"));
     lines.push(key("p", "pause or resume automatic refresh"));
@@ -1407,6 +1314,19 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
             span(s.1, t.plain()),
         ])));
     }
+    let (x, _) = t.verdict(crate::lanes::Verdict::Stalled);
+    lines.push(Content::Line(Line::from(vec![
+        span(rpad("runners", 14), t.bold()),
+        span(
+            format!(
+                "{x} STALLED / DOWN / NOT PICKING UP  {} SLOW  {} moving  {} idle",
+                t.warn_glyph(),
+                t.verdict(crate::lanes::Verdict::Moving).0,
+                t.idle()
+            ),
+            t.plain(),
+        ),
+    ])));
     lines.push(Content::Sep);
     for text in [
         "Each row ends with when it changed; a block means just now.",
@@ -1456,16 +1376,16 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
         let [left, right] =
             Layout::horizontal([Constraint::Min(60), Constraint::Length(RIGHT_COL)]).areas(main);
         roster(view, buf, left, host);
-        let runner_h = (view.snap.runners.len().max(1) + view.snap.jobs.len() + 2) as u16;
+        let runner_h = runners::wide_height(view, right.width);
         let usage_h = (view.snap.quota.len().max(1) + 2) as u16;
         let [r1, r2, r3, r4] = Layout::vertical([
-            Constraint::Length(runner_h.min(right.height / 3)),
+            Constraint::Length(runner_h.min(right.height / 2).max(3)),
             Constraint::Length(7),
             Constraint::Length(usage_h),
             Constraint::Min(0),
         ])
         .areas(right);
-        runner_panel(view, buf, r1, true);
+        runners::panel(view, buf, r1, true);
         host_panel(view, buf, r2);
         usage_panel(view, buf, r3);
         if r4.height >= 3 {
@@ -1483,10 +1403,13 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
                 Constraint::Ratio(1, 3),
             ])
             .areas(panels);
-            runner_panel(view, buf, a, false);
+            runners::panel(view, buf, a, false);
             host_panel(view, buf, b);
             usage_panel(view, buf, c);
         }
+    }
+    if view.app.runner_detail && view.app.runners_focused(view.snap) {
+        runners::detail(view, buf, main);
     }
     footer(view, buf, foot);
     if view.app.help {
