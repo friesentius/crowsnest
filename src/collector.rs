@@ -216,6 +216,8 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     let (pipe_tx, pipe_rx) = channel();
     let (gh_tx, gh_rx) = channel();
     let (_, quota_rx) = channel();
+    // The PR URLs the gh tier last set out to read.
+    let gh_read: Arc<Mutex<Vec<String>>> = Arc::default();
 
     // Host.
     {
@@ -270,6 +272,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let interval = cfg.fleet_interval;
         let min_gap = cfg.fleet_min_gap;
         let paused2 = paused.clone();
+        let (gh_read, gh_tx) = (gh_read.clone(), gh_tx.clone());
         spawn_tier(
             "fleet",
             shared.clone(),
@@ -294,14 +297,14 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 last_run = Some(Instant::now());
                 match sources::read_fleet(&cfg2.fm_home, &cfg2.cache_dir) {
                     Ok(fleet) => {
-                        let prev = shared.lock().unwrap().fleet.replace(fleet.clone());
+                        let mut s = shared.lock().unwrap();
+                        let prev = s.fleet.replace(fleet);
                         // New tasks or PRs: read them now. Otherwise the
                         // tiers' own timers keep their single cadence.
-                        let (pipes, prs) = fleet_wakes(prev.as_ref(), &fleet);
-                        if pipes {
+                        if pipelines_changed(prev.as_ref(), s.fleet.as_ref()) {
                             let _ = pipe_tx.send(());
                         }
-                        if prs {
+                        if has_new_prs(&s, &gh_read.lock().unwrap()) {
                             let _ = gh_tx.send(());
                         }
                         Read::Ok
@@ -314,7 +317,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
 
     // Pipelines.
     {
-        let shared = shared.clone();
+        let (shared, gh_read) = (shared.clone(), gh_read.clone());
         let interval = cfg.pipeline_interval;
         spawn_tier(
             "nm",
@@ -349,7 +352,11 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                         }
                     }
                 }
-                shared.lock().unwrap().pipelines = found;
+                let mut s = shared.lock().unwrap();
+                s.pipelines = found;
+                if has_new_prs(&s, &gh_read.lock().unwrap()) {
+                    let _ = gh_tx.send(());
+                }
                 nm_read(errors, total)
             },
         );
@@ -359,13 +366,11 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     if cfg.github {
         let (shared, shared2) = (shared.clone(), shared.clone());
         let interval = move || {
-            let s = shared2.lock().unwrap();
-            let active = s.runners.iter().any(|r| r.busy)
-                || s.prs.values().any(|p| p.state == "OPEN")
-                || s.fleet
-                    .as_ref()
-                    .is_some_and(|f| f.workers.iter().any(|w| w.pr_url.is_some()));
-            Duration::from_secs(if active { 60 } else { 300 })
+            Duration::from_secs(if gh_active(&shared2.lock().unwrap()) {
+                60
+            } else {
+                300
+            })
         };
         spawn_tier(
             "gh",
@@ -382,6 +387,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                         s.runners.clone(),
                     )
                 };
+                gh_read.lock().unwrap().clone_from(&urls);
                 let prs = sources::read_pr_checks(&urls);
                 let jobs = sources::read_queue(&runner_list);
                 apply_gh(&mut shared.lock().unwrap(), prs, jobs)
@@ -422,15 +428,24 @@ fn nm_read(errors: Vec<String>, total: usize) -> Read {
     }
 }
 
-/// Whether a new fleet reading changed the pipeline tier's tasks and the gh
-/// tier's PRs, so each is woken only when it has something new to read.
-fn fleet_wakes(before: Option<&Fleet>, after: &Fleet) -> (bool, bool) {
+/// Whether a new fleet reading changed the pipeline tier's tasks, so it is
+/// woken only when it has something new to read.
+fn pipelines_changed(before: Option<&Fleet>, after: Option<&Fleet>) -> bool {
     let targets = |f: Option<&Fleet>| f.map(sources::pipeline_targets).unwrap_or_default();
-    let urls = |f: Option<&Fleet>| sources::pr_urls(f, &Default::default());
-    (
-        targets(before) != targets(Some(after)),
-        urls(before) != urls(Some(after)),
-    )
+    targets(before) != targets(after)
+}
+
+/// Whether `s` shows a PR, from the fleet or a pipeline, that the gh tier
+/// has not set out to read yet (`read`).
+fn has_new_prs(s: &Snapshot, read: &[String]) -> bool {
+    sources::pr_urls(s.fleet.as_ref(), &s.pipelines)
+        .iter()
+        .any(|u| !read.contains(u))
+}
+
+/// Whether gh has anything live to watch: a busy runner or a PR on screen.
+fn gh_active(s: &Snapshot) -> bool {
+    s.runners.iter().any(|r| r.busy) || !sources::pr_urls(s.fleet.as_ref(), &s.pipelines).is_empty()
 }
 
 fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -579,33 +594,83 @@ mod tests {
         assert_eq!(r, Read::Failed("gh: timed out".into()));
     }
 
-    #[test]
-    fn an_unchanged_fleet_wakes_neither_pipelines_nor_gh() {
-        let dir = std::env::temp_dir();
-        let worker = |id: &str, pr: Option<&str>| crate::model::Worker {
+    fn worker(id: &str, pr: Option<&str>) -> crate::model::Worker {
+        crate::model::Worker {
             id: id.into(),
             fm_state: "working".into(),
             mode: "no-mistakes".into(),
-            worktree: Some(dir.clone()),
+            worktree: Some(std::env::temp_dir()),
             pr_url: pr.map(Into::into),
             ..Default::default()
-        };
-        let fleet = |workers| Fleet {
+        }
+    }
+
+    fn fleet(workers: Vec<crate::model::Worker>) -> Fleet {
+        Fleet {
             workers,
             ..Default::default()
-        };
+        }
+    }
+
+    #[test]
+    fn an_unchanged_fleet_does_not_wake_the_pipelines() {
+        let a = fleet(vec![worker("a", None)]);
+        assert!(pipelines_changed(None, Some(&a)));
+        assert!(!pipelines_changed(Some(&a), Some(&a.clone())));
+        let b = fleet(vec![worker("a", None), worker("b", None)]);
+        assert!(pipelines_changed(Some(&a), Some(&b)));
+    }
+
+    #[test]
+    fn gh_is_woken_only_for_prs_it_has_not_read() {
         let pr = "https://github.com/acme/pantry/pull/122";
-        let a = fleet(vec![worker("a", Some(pr))]);
-        // The first reading has new tasks and PRs.
-        assert_eq!(fleet_wakes(None, &a), (true, true));
-        // A routine re-read leaves both tiers on their own timers.
-        assert_eq!(fleet_wakes(Some(&a), &a.clone()), (false, false));
-        // A new task wakes the pipelines; a new PR wakes gh.
-        let b = fleet(vec![worker("a", Some(pr)), worker("b", None)]);
-        assert_eq!(fleet_wakes(Some(&a), &b), (true, false));
         let pr2 = "https://github.com/acme/pantry/pull/123";
-        let c = fleet(vec![worker("a", Some(pr)), worker("b", Some(pr2))]);
-        assert_eq!(fleet_wakes(Some(&b), &c), (false, true));
+        let mut s = Snapshot {
+            fleet: Some(fleet(vec![worker("a", Some(pr))])),
+            ..Default::default()
+        };
+        assert!(has_new_prs(&s, &[]));
+        let mut read = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
+        // A routine re-read leaves gh on its own timer.
+        assert!(!has_new_prs(&s, &read));
+        // The pipeline tier finds a PR that firstmate has not recorded yet.
+        s.fleet = Some(fleet(vec![worker("a", Some(pr)), worker("b", None)]));
+        s.pipelines.insert(
+            "b".into(),
+            crate::model::Pipeline {
+                pr_url: Some(pr2.into()),
+                ..Default::default()
+            },
+        );
+        assert!(has_new_prs(&s, &read));
+        read = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
+        assert!(!has_new_prs(&s, &read));
+        // A PR leaving the screen needs no read.
+        s.pipelines.clear();
+        assert!(!has_new_prs(&s, &read));
+    }
+
+    #[test]
+    fn a_pipeline_pr_keeps_gh_on_its_fast_cadence() {
+        let mut s = Snapshot {
+            fleet: Some(fleet(vec![worker("b", None)])),
+            ..Default::default()
+        };
+        assert!(!gh_active(&s));
+        s.pipelines.insert(
+            "b".into(),
+            crate::model::Pipeline {
+                pr_url: Some("https://github.com/acme/pantry/pull/122".into()),
+                ..Default::default()
+            },
+        );
+        assert!(gh_active(&s));
+        // An idle secondmate's old PR is not read, so it is not activity.
+        s.pipelines.clear();
+        let mut idle = worker("c", Some("https://github.com/acme/pantry/pull/9"));
+        idle.fm_state = "no_active_work".into();
+        s.fleet = Some(fleet(vec![idle]));
+        assert!(!gh_active(&s));
     }
 
     #[test]
