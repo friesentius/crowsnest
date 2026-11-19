@@ -724,3 +724,65 @@ fn stalled_detail_shows_the_parked_gate() {
     assert!(text.contains("parked at review 1h17m"), "{text}");
     assert!(text.contains("declared wait until 13:20"), "{text}");
 }
+
+/// The narrowest width that draws the job list (below it the panel shows counts only).
+const WIDE_MIN: u16 = ui::WIDE;
+
+fn job(repo: &str, name: &str, status: &str) -> crowsnest::model::Job {
+    crowsnest::model::Job {
+        repo: repo.into(),
+        name: name.into(),
+        status: status.into(),
+        started_at: (status == "in_progress").then_some(0),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn every_runner_job_names_its_project_and_is_grouped_by_repo() {
+    utc();
+    let mut s = snapshot();
+    s.now = 120;
+    // Interleaved on purpose: grouping must not depend on arrival order.
+    s.jobs = vec![
+        job("acme/pantry", "Lint & typecheck", "queued"),
+        job("acme/bookshop", "Release build", "queued"),
+        job("acme/pantry", "Fresh-clone setup", "queued"),
+        job("acme/pantry", "Unit tests", "in_progress"),
+    ];
+    for w in [WIDE_MIN, 180] {
+        let term = draw(&s, &app_for(&s), w, 44);
+        let text = term.backend().to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        let pos = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing at {w}:\n{text}"))
+        };
+        let l = |n: &str| lines[pos(n)];
+        for n in ["Unit tests", "Lint & typecheck", "Fresh-clone setup"] {
+            assert!(l(n).contains("pantry"), "{n}: {}", l(n));
+        }
+        assert!(
+            l("Release build").contains("bookshop"),
+            "{}",
+            l("Release build")
+        );
+        assert!(pos("Unit tests") < pos("Lint & typecheck"));
+        assert!(pos("Lint & typecheck") < pos("Fresh-clone setup"));
+        assert!(pos("Fresh-clone setup") < pos("Release build"));
+        assert!(l("Lint & typecheck").contains("queued"));
+        // Truncation eats the job name, never the project label.
+        let mut long_snap = s.clone();
+        long_snap.jobs[0].name = "A very long job name that cannot possibly fit the panel".into();
+        let long = draw(&long_snap, &app_for(&long_snap), w, 44)
+            .backend()
+            .to_string();
+        let row = long
+            .lines()
+            .find(|l| l.contains("pantry ") && l.contains("queued"))
+            .unwrap();
+        assert!(row.contains("pantry"), "{row}");
+    }
+}
