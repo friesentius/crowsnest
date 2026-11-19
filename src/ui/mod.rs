@@ -1319,7 +1319,7 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
         span(rpad("runners", 14), t.bold()),
         span(
             format!(
-                "{x} STALLED / DOWN / NOT PICKING UP  {} SLOW  {} moving  {} idle",
+                "{x} STALLED/DOWN/NOT PICKING UP {} SLOW {} moving {} idle",
                 t.warn_glyph(),
                 t.verdict(crate::lanes::Verdict::Moving).0,
                 t.idle()

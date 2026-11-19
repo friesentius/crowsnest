@@ -25,7 +25,7 @@ expression: term.backend()
 "|             | v DONE        reported done                                          |             |"
 "|             | ~ UNKNOWN     firstmate cannot tell                                  |             |"
 "|             | o IDLE        nothing in flight                                      |             |"
-"+-------------| runners       x STALLED / DOWN / NOT PICKING UP  ^ SLOW  * moving  o |-------------+"
+"+-------------| runners       x STALLED/DOWN/NOT PICKING UP ^ SLOW * moving o idle   |-------------+"
 "| next pantry-+----------------------------------------------------------------------+             |"
 "+-------------| Each row ends with when it changed; a block means just now.          |-------------+"
 "+ RUNNERS v mo| The header: when the fleet was last read, and last changed.          |-------------+"

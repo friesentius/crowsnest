@@ -258,8 +258,14 @@ fn signal_text(t: &Theme, lane: &Lane) -> Option<(String, Style)> {
         return Some((format!("silent {}", dur(s)), t.bad()));
     }
     // Past the silent limit but its processes are working: quiet, not stuck.
-    if lane.job_cpu.is_some() {
-        return Some((format!("quiet {}, cpu busy", dur(age)), t.dim()));
+    match lane.job_cpu {
+        Some(JobCpu::Busy(_)) => {
+            return Some((format!("quiet {}, cpu busy", dur(age)), t.dim()));
+        }
+        Some(JobCpu::Measuring) => {
+            return Some((format!("quiet {}, measuring cpu", dur(age)), t.dim()));
+        }
+        _ => {}
     }
     Some(match lane.signal {
         Signal::StepOutput => (format!("out {} ago", dur(age)), t.dim()),
@@ -808,7 +814,7 @@ fn now_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             ),
             t.plain(),
         )),
-        (_, Some(_), Some(a)) => {
+        (_, Some(JobCpu::Measuring), Some(a)) => {
             bits.push((format!("quiet {}, measuring job CPU", dur(a)), t.plain()))
         }
         _ => {}
