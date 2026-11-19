@@ -337,7 +337,7 @@ fn pct(part: u64, whole: u64) -> f64 {
 pub struct QuotaWindow {
     pub provider: String,
     pub label: String,
-    pub pct_remaining: f64,
+    pub pct_used: f64,
     pub resets_at: Option<i64>,
     pub pace: Option<String>,
 }

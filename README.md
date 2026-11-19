@@ -1,7 +1,7 @@
 # crowsnest
 
 A read-only terminal dashboard for a [firstmate](https://github.com/kunchenguid/firstmate) fleet.
-Run it in a pane beside firstmate to see, at a glance, every crewmate, its no-mistakes pipeline, its pull request's checks, your self-hosted CI runners, the host's health, and how much agent usage is left.
+Run it in a pane beside firstmate to see, at a glance, every crewmate, its no-mistakes pipeline, its pull request's checks, your self-hosted CI runners, the host's health, and how much of each agent usage window is spent.
 It is written in Rust with [ratatui](https://ratatui.rs), and it is a single binary.
 
 ```text
@@ -36,16 +36,17 @@ It is written in Rust with [ratatui](https://ratatui.rs), and it is a single bin
 │ next pantry-release-0-4-0 - Next: pantry release 0 4 0                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ RUNNERS ──────────────────────╮╭ HOST ──────────────────────────╮╭ USAGE ────────────────────────╮
-│ ● pantry   busy 14m           ││ load 3.42 2.95 2.71  16 cpu    ││ copilot premium … ──────   0% │
-│ ○ bookshop idle               ││ mem  ━━━━━━──  72% 9.0G avail  ││ claude session    ━━━━──  59% │
-│                               ││ swap ━━──────  25% 6.0G free   ││ claude week       ━━━━──  65% │
-│                               ││ disk / 61%  /home 78%          ││ claude Fable week ━━━━━─  89% │
+│ ● pantry   busy 14m           ││ load 3.42 2.95 2.71  16 cpu    ││ copilot premium … ━━━━━━ 100% │
+│ ○ bookshop idle               ││ mem  ━━━━━━──  72% 9.0G avail  ││ claude session    ━━────  41% │
+│                               ││ swap ━━──────  25% 6.0G free   ││ claude week       ━━────  35% │
+│                               ││ disk / 61%  /home 78%          ││ claude Fable week ━─────  11% │
 │                               ││ psi  mem 0.4%  cpu 6.1%        ││ +2 more windows               │
 ╰───────────────────────────────╯╰────────────────────────────────╯╰───────────────────────────────╯
  ↑↓  select  ⏎  detail  f  filter  r  refresh  p  pause  ?  help  q  quit     nm 9s gh 25s quota 2m 
 ```
 
 Workers that need you sort to the top and stand out.
+The USAGE panel shows how much of each window is used (quota-axi reports what is left, crowsnest flips it), most-used first, with the reset time beside it.
 Press Enter on a row to open its detail: every pipeline step with its duration, each PR check, the last status line, and the worktree.
 At 140 columns or more the panels move to a right-hand column, and the held captain calls get their own box.
 
