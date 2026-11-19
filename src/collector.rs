@@ -16,7 +16,7 @@
 //! succeeded with errors for some items is shown as an error but keeps the
 //! normal cadence.
 
-use crate::model::{Freshness, Job, PrChecks, Snapshot};
+use crate::model::{Fleet, Freshness, Job, PrChecks, Snapshot};
 use crate::sources::{self, host::HostReader, runners};
 use crate::timefmt::now_epoch;
 use std::path::PathBuf;
@@ -294,10 +294,16 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 last_run = Some(Instant::now());
                 match sources::read_fleet(&cfg2.fm_home, &cfg2.cache_dir) {
                     Ok(fleet) => {
-                        shared.lock().unwrap().fleet = Some(fleet);
-                        // New tasks: read their pipelines and PRs now.
-                        let _ = pipe_tx.send(());
-                        let _ = gh_tx.send(());
+                        let prev = shared.lock().unwrap().fleet.replace(fleet.clone());
+                        // New tasks or PRs: read them now. Otherwise the
+                        // tiers' own timers keep their single cadence.
+                        let (pipes, prs) = fleet_wakes(prev.as_ref(), &fleet);
+                        if pipes {
+                            let _ = pipe_tx.send(());
+                        }
+                        if prs {
+                            let _ = gh_tx.send(());
+                        }
                         Read::Ok
                     }
                     Err(e) => Read::Failed(e),
@@ -414,6 +420,17 @@ fn nm_read(errors: Vec<String>, total: usize) -> Read {
     } else {
         Read::from_errors(Vec::new(), errors)
     }
+}
+
+/// Whether a new fleet reading changed the pipeline tier's tasks and the gh
+/// tier's PRs, so each is woken only when it has something new to read.
+fn fleet_wakes(before: Option<&Fleet>, after: &Fleet) -> (bool, bool) {
+    let targets = |f: Option<&Fleet>| f.map(sources::pipeline_targets).unwrap_or_default();
+    let urls = |f: Option<&Fleet>| sources::pr_urls(f, &Default::default());
+    (
+        targets(before) != targets(Some(after)),
+        urls(before) != urls(Some(after)),
+    )
 }
 
 fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -560,6 +577,35 @@ mod tests {
         // A failed queue read is an outright failure too.
         let r = apply_gh(&mut s, Ok((vec![], vec![])), Err("gh: timed out".into()));
         assert_eq!(r, Read::Failed("gh: timed out".into()));
+    }
+
+    #[test]
+    fn an_unchanged_fleet_wakes_neither_pipelines_nor_gh() {
+        let dir = std::env::temp_dir();
+        let worker = |id: &str, pr: Option<&str>| crate::model::Worker {
+            id: id.into(),
+            fm_state: "working".into(),
+            mode: "no-mistakes".into(),
+            worktree: Some(dir.clone()),
+            pr_url: pr.map(Into::into),
+            ..Default::default()
+        };
+        let fleet = |workers| Fleet {
+            workers,
+            ..Default::default()
+        };
+        let pr = "https://github.com/acme/pantry/pull/122";
+        let a = fleet(vec![worker("a", Some(pr))]);
+        // The first reading has new tasks and PRs.
+        assert_eq!(fleet_wakes(None, &a), (true, true));
+        // A routine re-read leaves both tiers on their own timers.
+        assert_eq!(fleet_wakes(Some(&a), &a.clone()), (false, false));
+        // A new task wakes the pipelines; a new PR wakes gh.
+        let b = fleet(vec![worker("a", Some(pr)), worker("b", None)]);
+        assert_eq!(fleet_wakes(Some(&a), &b), (true, false));
+        let pr2 = "https://github.com/acme/pantry/pull/123";
+        let c = fleet(vec![worker("a", Some(pr)), worker("b", Some(pr2))]);
+        assert_eq!(fleet_wakes(Some(&b), &c), (false, true));
     }
 
     #[test]
