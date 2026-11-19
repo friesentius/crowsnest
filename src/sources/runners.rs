@@ -145,9 +145,38 @@ pub fn parse_unit(text: &str) -> Option<Service> {
     })
 }
 
+/// Samples of a running job's process tree CPU time.
+#[derive(Default)]
+struct JobCpu {
+    worker: Option<sysinfo::Pid>,
+    samples: Vec<(i64, u64)>,
+}
+
+/// Keep a sample at most every this many seconds...
+const CPU_SAMPLE_SECS: i64 = 15;
+/// ...for this long.
+const CPU_KEEP_SECS: i64 = 2 * 3600;
+
+impl JobCpu {
+    fn add(&mut self, now: i64, cpu_ms: u64) {
+        let n = self.samples.len();
+        // Within the spacing, the newest sample just moves forward, so the
+        // latest reading is always kept.
+        if n > 1 && now - self.samples[n - 2].0 < CPU_SAMPLE_SECS {
+            self.samples[n - 1] = (now, cpu_ms);
+        } else {
+            self.samples.push((now, cpu_ms));
+        }
+        let cut = now - CPU_KEEP_SECS;
+        let old = self.samples.iter().take_while(|(t, _)| *t < cut).count();
+        self.samples.drain(..old.saturating_sub(1));
+    }
+}
+
 /// Mark runners up and busy from the process table.
 pub struct ProcessScan {
     sys: Option<System>,
+    jobs: BTreeMap<PathBuf, JobCpu>,
     /// When each runner directory was first seen without a worker, in its
     /// current idle stretch. Kept here so it survives re-discovery.
     idle_since: BTreeMap<PathBuf, i64>,
@@ -169,6 +198,7 @@ impl ProcessScan {
     pub fn new() -> Self {
         ProcessScan {
             sys: System::new().ok(),
+            jobs: BTreeMap::new(),
             idle_since: BTreeMap::new(),
         }
     }
@@ -189,7 +219,8 @@ impl ProcessScan {
             true,
             ProcessRefreshKind::nothing()
                 .with_exe(UpdateKind::OnlyIfNotSet)
-                .with_cmd(UpdateKind::OnlyIfNotSet),
+                .with_cmd(UpdateKind::OnlyIfNotSet)
+                .with_cpu(),
         );
         for r in runners.iter_mut() {
             r.busy = false;
@@ -209,7 +240,8 @@ impl ProcessScan {
                 v
             })
             .collect();
-        for p in sys.processes().values() {
+        let mut workers: Vec<(usize, sysinfo::Pid)> = Vec::new();
+        for (pid, p) in sys.processes() {
             let name = p.name().to_string_lossy();
             let worker = name == "Runner.Worker";
             if !worker && name != "Runner.Listener" {
@@ -227,11 +259,51 @@ impl ProcessScan {
             if worker {
                 r.busy = true;
                 r.busy_secs = Some(r.busy_secs.map_or(secs, |s| s.max(secs)));
+                workers.push((i, *pid));
             } else {
                 r.listener_secs = Some(r.listener_secs.map_or(secs, |s| s.max(secs)));
             }
         }
+        // The CPU the running job's processes have used: everything under
+        // its Runner.Worker. A job run with `docker` executes in a container,
+        // outside this tree, so its CPU cannot be seen here.
+        let mut children: BTreeMap<sysinfo::Pid, Vec<sysinfo::Pid>> = BTreeMap::new();
+        for (pid, p) in sys.processes() {
+            if let Some(parent) = p.parent() {
+                children.entry(parent).or_default().push(*pid);
+            }
+        }
+        let mut seen_jobs = Vec::new();
+        for (i, worker) in workers {
+            let (mut cpu_ms, mut container) = (0u64, false);
+            let mut stack = vec![worker];
+            while let Some(pid) = stack.pop() {
+                if let Some(p) = sys.process(pid) {
+                    cpu_ms += p.accumulated_cpu_time();
+                    let n = p.name().to_string_lossy();
+                    container |= n == "docker" || n == "podman";
+                }
+                stack.extend(children.get(&pid).into_iter().flatten().copied());
+            }
+            let r = &mut runners[i];
+            let job = self.jobs.entry(r.dir.clone()).or_default();
+            if job.worker != Some(worker) {
+                *job = JobCpu {
+                    worker: Some(worker),
+                    ..Default::default()
+                };
+            }
+            job.add(now, cpu_ms);
+            r.job_cpu = job.samples.clone();
+            r.job_in_container = container;
+            seen_jobs.push(r.dir.clone());
+        }
+        self.jobs.retain(|d, _| seen_jobs.contains(d));
         for r in runners.iter_mut() {
+            if !r.busy {
+                r.job_cpu.clear();
+                r.job_in_container = false;
+            }
             if r.busy {
                 self.idle_since.remove(&r.dir);
             } else {

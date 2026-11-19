@@ -388,6 +388,8 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let mut services = Services::default();
         let mut list = Vec::new();
         let mut listed: Option<Instant> = None;
+        let gh_wake = gh_tx.clone();
+        let mut repos_seen: Vec<String> = Vec::new();
         spawn_tier(
             "runners",
             shared.clone(),
@@ -406,6 +408,13 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 }
                 services.update(&mut list);
                 shared.lock().unwrap().runners = list.clone();
+                // Runners (or their repositories) turned up: read their queue
+                // now, not at the gh tier's next turn a minute away.
+                let repos = sources::runner_repos(&list);
+                if repos != repos_seen {
+                    repos_seen = repos;
+                    let _ = gh_wake.send(());
+                }
                 Read::Ok
             },
         );

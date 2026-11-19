@@ -905,10 +905,46 @@ fn stalled_runner() -> Snapshot {
     r.busy_secs = Some(24 * 60 - 3);
     r.step_output_at = Some(now - 14 * 60);
     r.worker_log_at = Some(now - 6);
+    // Its processes have used under a CPU-second since the output stopped:
+    // a hung download, not a quiet test.
+    r.job_cpu = vec![
+        (now - 20 * 60, 41_000),
+        (now - 10 * 60, 41_300),
+        (now, 41_700),
+    ];
     let unit = &mut s.jobs[0];
     unit.started_at = Some(now - 24 * 60);
     unit.steps[3].started_at = Some(now - 23 * 60);
     s
+}
+
+/// The same silence, but the job's processes are busy: a quiet test suite.
+fn quiet_runner() -> Snapshot {
+    let mut s = stalled_runner();
+    let now = s.now;
+    s.runners[0].job_cpu = vec![
+        (now - 20 * 60, 41_000),
+        (now - 10 * 60, 201_000),
+        (now, 380_000),
+    ];
+    s
+}
+
+#[test]
+fn a_quiet_job_whose_processes_work_is_not_stalled() {
+    utc();
+    let s = quiet_runner();
+    let text = draw_light(&s, &app_for(&s), 180, 44);
+    assert!(text.contains("RUNNERS \u{2713} all moving"), "{text}");
+    assert!(text.contains("quiet 14m, cpu busy"), "{text}");
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let text = draw_light(&s, &app, 180, 44);
+    assert!(
+        text.contains("quiet 14m, job processes busy (2m59s CPU in 10m)"),
+        "{text}"
+    );
+    assert!(text.contains("quiet, not hung"), "{text}");
 }
 
 fn draw_light(snap: &Snapshot, app: &App, w: u16, h: u16) -> String {
@@ -990,6 +1026,13 @@ fn a_silent_runner_is_stalled_in_the_panel_title() {
         assert!(head.contains("STALLED"), "{head}");
         assert!(text.contains("silent 14m"), "{w}:\n{text}");
     }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let detail = draw_light(&s, &app, 180, 44);
+    assert!(
+        detail.contains("silent 14m (limit 10m), job processes idle (400ms CPU in 10m)"),
+        "{detail}"
+    );
     let wide = draw_light(&s, &app_for(&s), 180, 44);
     assert!(wide.contains("wait 6m blocked"), "{wide}");
     // Stalled runners do not count in the roster's stale count yet.

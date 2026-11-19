@@ -3,8 +3,8 @@
 
 use super::{Content, View, draw_box, fit, rpad, span, width_of};
 use crate::lanes::{
-    self, Current, Fleet, Lane, Online, QueueState, Queued, Signal, Verdict, Why, short_name,
-    step_name, tiny_name,
+    self, Current, Fleet, JobCpu, Lane, Online, QueueState, Queued, Signal, Verdict, Why,
+    short_name, step_name, tiny_name,
 };
 use crate::model::{Job, RunnerThresholds};
 use crate::timefmt::{self, dur};
@@ -256,6 +256,10 @@ fn signal_text(t: &Theme, lane: &Lane) -> Option<(String, Style)> {
     let age = lane.signal_age?;
     if let Why::Silent(s) = lane.why {
         return Some((format!("silent {}", dur(s)), t.bad()));
+    }
+    // Past the silent limit but its processes are working: quiet, not stuck.
+    if lane.job_cpu.is_some() {
+        return Some((format!("quiet {}, cpu busy", dur(age)), t.dim()));
     }
     Some(match lane.signal {
         Signal::StepOutput => (format!("out {} ago", dur(age)), t.dim()),
@@ -570,9 +574,16 @@ pub fn verdict_sentence(lane: &Lane, th: &RunnerThresholds, now: i64) -> String 
             queue_note(true)
         ),
         (Verdict::Stalled, Why::Silent(s)) => format!(
-            "{cname} has written nothing for {} (the limit is {}). It is {} into {}.{}",
+            "{cname} has written nothing for {} (the limit is {}){}. It is {} into {}.{}",
             dur(s),
             dur(th.silent_secs),
+            match lane.job_cpu {
+                Some(JobCpu::Idle(_)) => " and its processes are idle",
+                _ if lane.runner.scanned_at.is_none() => {
+                    ", and its processes cannot be seen (process table unreadable)"
+                }
+                _ => ", and it runs in a container whose CPU crowsnest cannot see",
+            },
             current.map_or(String::new(), |c| dur(c.elapsed)),
             current.map_or(String::new(), typ),
             queue_note(true)
@@ -602,9 +613,21 @@ pub fn verdict_sentence(lane: &Lane, th: &RunnerThresholds, now: i64) -> String 
                 Some(c) => format!("{cname} is {} into {}", dur(c.elapsed), typ(c)),
                 None => "Busy".into(),
             };
-            match lane.signal_age {
-                Some(a) => format!("{base}, and {}.{}", signal(a), queue_note(false)),
-                None => format!("{base}.{}", queue_note(false)),
+            match (lane.signal_age, lane.job_cpu) {
+                (Some(a), Some(JobCpu::Busy(ms))) => format!(
+                    "{base}. It has written nothing for {}, but its processes are busy ({} of CPU in the last {}): quiet, not hung.{}",
+                    dur(a),
+                    timefmt::dur_ms(ms),
+                    dur(th.silent_secs),
+                    queue_note(false)
+                ),
+                (Some(a), Some(_)) => format!(
+                    "{base}. It has written nothing for {}; its CPU is still being measured.{}",
+                    dur(a),
+                    queue_note(false)
+                ),
+                (Some(a), None) => format!("{base}, and {}.{}", signal(a), queue_note(false)),
+                (None, _) => format!("{base}.{}", queue_note(false)),
             }
         }
         _ => {
@@ -760,21 +783,39 @@ fn now_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
     let mut l = vec![pad()];
     let mut bits: Vec<(String, Style)> = Vec::new();
     let r = lane.runner;
-    let busy_since = r.busy_since();
+    let job_start = j.started_at.or(r.busy_since());
     let age = |at: Option<i64>| at.map(|a| dur((now - a).max(0)));
-    if let Why::Silent(s) = lane.why {
-        bits.push((
+    let limit = dur(view.app.runner_thresholds.silent_secs);
+    match (lane.why, lane.job_cpu, lane.signal_age) {
+        (Why::Silent(s), cpu, _) => {
+            let how = match cpu {
+                Some(JobCpu::Idle(ms)) => {
+                    format!(
+                        "job processes idle ({} CPU in {limit})",
+                        timefmt::dur_ms(ms)
+                    )
+                }
+                _ if r.scanned_at.is_none() => "job processes not visible".into(),
+                _ => "runs in a container, CPU not visible".into(),
+            };
+            bits.push((format!("silent {} (limit {limit}), {how}", dur(s)), t.bad()));
+        }
+        (_, Some(JobCpu::Busy(ms)), Some(a)) => bits.push((
             format!(
-                "silent {} (limit {})",
-                dur(s),
-                dur(view.app.runner_thresholds.silent_secs)
+                "quiet {}, job processes busy ({} CPU in {limit})",
+                dur(a),
+                timefmt::dur_ms(ms)
             ),
-            t.bad(),
-        ));
+            t.plain(),
+        )),
+        (_, Some(_), Some(a)) => {
+            bits.push((format!("quiet {}, measuring job CPU", dur(a)), t.plain()))
+        }
+        _ => {}
     }
     if let Some(a) = age(r
         .step_output_at
-        .filter(|o| busy_since.is_none_or(|b| *o >= b)))
+        .filter(|o| job_start.is_none_or(|b| *o >= b)))
     {
         bits.push((format!("step output {a} ago"), t.dim()));
     }

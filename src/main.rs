@@ -68,6 +68,12 @@ struct Args {
     #[arg(long, default_value_t = 2.0, value_name = "FACTOR", value_parser = parse_factor)]
     runner_overdue_factor: f64,
 
+    /// CPU-seconds a silent job's processes may use over the silent window
+    /// and still count as idle (STALLED); more means the job is busy but
+    /// quiet, and it is not flagged.
+    #[arg(long, default_value_t = 2.0, value_name = "SECS")]
+    runner_idle_cpu_seconds: f64,
+
     /// Minutes a job may stay queued while its runner is idle before the
     /// runner is shown as NOT PICKING UP.
     #[arg(long, default_value_t = 5, value_name = "MIN")]
@@ -206,6 +212,7 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
         silent_secs: (args.runner_silent_minutes * 60) as i64,
         overdue_factor: args.runner_overdue_factor,
         pickup_secs: (args.runner_pickup_minutes * 60) as i64,
+        idle_cpu_ms: (args.runner_idle_cpu_seconds.max(0.0) * 1000.0) as u64,
     };
     // Three missed fleet reads, and never sooner than the default.
     app.read_overdue_secs = (args.fleet_interval.max(10) as i64 * 3).max(DEFAULT_READ_OVERDUE_SECS);

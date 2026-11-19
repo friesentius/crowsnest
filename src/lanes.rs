@@ -6,7 +6,7 @@
 //! | verdict          | rule                                                         |
 //! |------------------|--------------------------------------------------------------|
 //! | `DOWN`           | no `Runner.Listener` for the directory, or GitHub says offline |
-//! | `STALLED`        | busy, but no step output (else worker log) for the silent limit; or GitHub says a job is in progress here and no `Runner.Worker` runs |
+//! | `STALLED`        | busy, no step output (else worker log) for the silent limit, and the job's processes idle on CPU over that window (for a job run in a container, whose CPU is not visible, silence alone); or GitHub says a job is in progress here and no `Runner.Worker` runs |
 //! | `NOT PICKING UP` | a job queued past the pickup limit while the runner is idle  |
 //! | `SLOW`           | still producing output, but past the overdue factor times its typical duration |
 //! | moving           | busy otherwise                                               |
@@ -101,6 +101,23 @@ pub enum Signal {
     None,
 }
 
+/// What the running job's processes did over the silent window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCpu {
+    /// Used less CPU than the idle limit: silence means stuck.
+    Idle(u64),
+    /// Used this many CPU milliseconds: silence only means quiet.
+    Busy(u64),
+    /// The steps run in a container (or the process table is unreadable),
+    /// so their CPU cannot be seen: silence alone decides.
+    Unseen,
+    /// Fewer than a minute of samples so far: no judgement yet.
+    Measuring,
+}
+
+/// Seconds of CPU samples needed before a silent job is judged.
+pub const MIN_CPU_SAMPLE_SECS: i64 = 60;
+
 /// The job a runner is running.
 #[derive(Debug, Clone)]
 pub struct Current<'a> {
@@ -156,6 +173,8 @@ pub struct Lane<'a> {
     /// The job's progress signal and its age in seconds.
     pub signal: Signal,
     pub signal_age: Option<i64>,
+    /// The job's CPU over the silent window, once it has been silent that long.
+    pub job_cpu: Option<JobCpu>,
     /// When the next queued job should start, and the queue drain.
     pub next_start: Option<i64>,
     pub drains_at: Option<i64>,
@@ -300,16 +319,18 @@ fn lane<'a>(
     };
 
     // The newest sign the job is moving, never older than the job itself:
-    // a leftover file from the previous job must not count as silence.
+    // a leftover file from the previous job must not count as silence. The
+    // job starts when GitHub says it did, else when its worker started.
+    let job_start = gh_job.and_then(|j| j.started_at).or(busy_since);
     let (signal, signal_age) = if r.busy {
         let (kind, at) = match (r.step_output_at, r.worker_log_at) {
             (Some(t), _) => (Signal::StepOutput, Some(t)),
             (None, Some(t)) => (Signal::WorkerLog, Some(t)),
             (None, None) => (Signal::None, None),
         };
-        let fresh = at.filter(|t| busy_since.is_none_or(|b| *t >= b));
+        let fresh = at.filter(|t| job_start.is_none_or(|b| *t >= b));
         let kind = if fresh.is_some() { kind } else { Signal::None };
-        let last = fresh.or(busy_since);
+        let last = fresh.or(job_start);
         (kind, last.map(|t| (now - t).max(0)))
     } else {
         (Signal::None, None)
@@ -326,11 +347,33 @@ fn lane<'a>(
         (jobs_read >= since + th.pickup_secs).then(|| now - j.created_at.unwrap_or(since))
     };
 
+    // Silence alone is not stuck: a quiet step (a test suite, a long build)
+    // writes nothing for minutes while its processes work.
+    let silent = r.busy && signal_age.is_some_and(|a| a > th.silent_secs);
+    let job_cpu = silent.then(|| {
+        if r.scanned_at.is_none() || r.job_in_container {
+            return JobCpu::Unseen;
+        }
+        match r.job_cpu_since(now - th.silent_secs) {
+            Some((used, covered)) if covered >= MIN_CPU_SAMPLE_SECS => {
+                // Scale a shorter sample up to the whole window.
+                let over_window =
+                    used as f64 * th.silent_secs as f64 / covered.min(th.silent_secs) as f64;
+                if over_window < th.idle_cpu_ms as f64 {
+                    JobCpu::Idle(used)
+                } else {
+                    JobCpu::Busy(used)
+                }
+            }
+            _ => JobCpu::Measuring,
+        }
+    });
+
     let (verdict, why) = if r.scanned_at.is_some() && r.listener_secs.is_none() {
         (Verdict::Down, Why::NoListener)
     } else if online == Online::No {
         (Verdict::Down, Why::Offline)
-    } else if r.busy && signal_age.is_some_and(|a| a > th.silent_secs) {
+    } else if matches!(job_cpu, Some(JobCpu::Idle(_) | JobCpu::Unseen)) {
         (Verdict::Stalled, Why::Silent(signal_age.unwrap_or(0)))
     } else if !r.busy
         && gh_job.is_some()
@@ -413,6 +456,7 @@ fn lane<'a>(
         queue,
         signal,
         signal_age,
+        job_cpu,
         next_start,
         drains_at,
         last_ran,
@@ -546,6 +590,12 @@ mod tests {
         r.idle_since = None;
         r.worker_log_at = Some(NOW - 4);
         r.step_output_at = Some(NOW - 1);
+        // Half a CPU-second over the last half hour: an idle job.
+        r.job_cpu = vec![
+            (NOW - 30 * MIN, 9_000),
+            (NOW - 15 * MIN, 9_200),
+            (NOW, 9_500),
+        ];
     }
 
     fn job(name: &str, status: &str, created_ago: i64) -> Job {
@@ -705,6 +755,7 @@ mod tests {
         let mut s = snap();
         s.jobs[0].started_at = Some(NOW - 24 * MIN);
         s.runners[0].busy_secs = Some(24 * MIN);
+        s.jobs[0].started_at = Some(NOW - 24 * MIN);
         s.runners[0].step_output_at = Some(NOW - 14 * MIN);
         let l = one(&s);
         assert_eq!(
@@ -726,6 +777,80 @@ mod tests {
     }
 
     #[test]
+    fn a_silent_job_whose_processes_work_is_quiet_not_stalled() {
+        let mut s = snap();
+        s.jobs[0].started_at = Some(NOW - 24 * MIN);
+        s.runners[0].busy_secs = Some(24 * MIN);
+        s.jobs[0].started_at = Some(NOW - 24 * MIN);
+        s.runners[0].step_output_at = Some(NOW - 14 * MIN);
+        // A browser test suite: minutes of CPU, nothing printed.
+        s.runners[0].job_cpu = vec![
+            (NOW - 20 * MIN, 60_000),
+            (NOW - 5 * MIN, 200_000),
+            (NOW, 260_000),
+        ];
+        let l = one(&s);
+        assert_eq!((l.verdict, l.why), (Verdict::Moving, Why::None));
+        // 200s used since NOW - 10m: the sample at or before the window start
+        // is NOW - 20m, and its increases count.
+        assert_eq!(l.job_cpu, Some(JobCpu::Busy(200_000)));
+        assert_eq!(l.queue[0].state, QueueState::Turn);
+        // The idle limit is configurable.
+        let th = RunnerThresholds {
+            idle_cpu_ms: 500_000,
+            ..Default::default()
+        };
+        assert_eq!(lanes(&s, &th)[0].verdict, Verdict::Stalled);
+    }
+
+    #[test]
+    fn a_container_job_falls_back_to_silence_alone() {
+        let mut s = snap();
+        s.runners[0].busy_secs = Some(24 * MIN);
+        s.jobs[0].started_at = Some(NOW - 24 * MIN);
+        s.runners[0].step_output_at = Some(NOW - 14 * MIN);
+        s.runners[0].job_cpu = vec![(NOW - 20 * MIN, 0), (NOW, 900_000)];
+        s.runners[0].job_in_container = true;
+        let l = one(&s);
+        assert_eq!(
+            (l.verdict, l.job_cpu),
+            (Verdict::Stalled, Some(JobCpu::Unseen))
+        );
+    }
+
+    #[test]
+    fn a_silent_job_is_not_judged_before_a_minute_of_cpu_samples() {
+        let mut s = snap();
+        s.runners[0].busy_secs = Some(24 * MIN);
+        s.jobs[0].started_at = Some(NOW - 24 * MIN);
+        s.runners[0].step_output_at = Some(NOW - 14 * MIN);
+        s.runners[0].job_cpu = vec![(NOW - 30, 100), (NOW, 100)];
+        let l = one(&s);
+        assert_eq!(
+            (l.verdict, l.job_cpu),
+            (Verdict::Moving, Some(JobCpu::Measuring))
+        );
+        // Two idle minutes are scaled to the window: still idle.
+        s.runners[0].job_cpu = vec![(NOW - 2 * MIN, 100), (NOW, 300)];
+        assert_eq!(one(&s).verdict, Verdict::Stalled);
+        // Two minutes at half a core are busy.
+        s.runners[0].job_cpu = vec![(NOW - 2 * MIN, 0), (NOW, 60_000)];
+        assert_eq!(one(&s).verdict, Verdict::Moving);
+    }
+
+    #[test]
+    fn cpu_of_exited_processes_is_not_negative() {
+        let r = Runner {
+            job_cpu: vec![(0, 5_000), (15, 9_000), (30, 2_000), (45, 2_500)],
+            ..Default::default()
+        };
+        // 4s, then a process exited (no change counted), then 0.5s.
+        assert_eq!(r.job_cpu_since(0), Some((4_500, 45)));
+        assert_eq!(r.job_cpu_since(20), Some((500, 25)));
+        assert_eq!(Runner::default().job_cpu_since(0), None);
+    }
+
+    #[test]
     fn a_leftover_page_from_the_last_job_is_not_silence() {
         let mut s = snap();
         // The job started 2m ago; the newest page is from the job before.
@@ -738,6 +863,7 @@ mod tests {
         assert_eq!((l.signal, l.signal_age), (Signal::None, Some(2 * MIN)));
         // Twelve minutes in with nothing written since it started: stalled.
         s.runners[0].busy_secs = Some(12 * MIN);
+        s.jobs[0].started_at = Some(NOW - 12 * MIN);
         assert_eq!(one(&s).verdict, Verdict::Stalled);
     }
 
@@ -750,6 +876,7 @@ mod tests {
         assert_eq!((l.signal, l.signal_age), (Signal::WorkerLog, Some(4)));
         s.runners[0].worker_log_at = Some(NOW - 11 * MIN);
         s.runners[0].busy_secs = Some(20 * MIN);
+        s.jobs[0].started_at = Some(NOW - 20 * MIN);
         assert_eq!(one(&s).verdict, Verdict::Stalled);
     }
 

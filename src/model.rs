@@ -292,6 +292,12 @@ pub struct Runner {
     pub runner_log_at: Option<i64>,
     pub worker_log_at: Option<i64>,
     pub step_output_at: Option<i64>,
+    /// The running job's process tree CPU time: (Unix time, cumulative
+    /// CPU milliseconds) samples, oldest first, at least 15 s apart.
+    pub job_cpu: Vec<(i64, u64)>,
+    /// The running job runs its steps through `docker` or `podman`, whose
+    /// CPU is not in the job's process tree.
+    pub job_in_container: bool,
     /// The systemd unit that runs it, from `--runner-unit` or the `.service`
     /// file `svc.sh install` writes.
     pub unit: Option<String>,
@@ -299,6 +305,24 @@ pub struct Runner {
 }
 
 impl Runner {
+    /// CPU milliseconds the running job's processes used since `since`, and
+    /// the seconds of samples that covers. Processes that exit take their
+    /// time with them, so only increases between samples count.
+    pub fn job_cpu_since(&self, since: i64) -> Option<(u64, i64)> {
+        let start = self
+            .job_cpu
+            .iter()
+            .rposition(|(t, _)| *t <= since)
+            .unwrap_or(0);
+        let window = &self.job_cpu[start..];
+        let (first, last) = (window.first()?, window.last()?);
+        let used = window
+            .windows(2)
+            .map(|w| w[1].1.saturating_sub(w[0].1))
+            .sum();
+        Some((used, last.0 - first.0.max(since)))
+    }
+
     /// The repository's short name, or the runner's own name.
     pub fn label(&self) -> &str {
         self.repo
@@ -513,6 +537,9 @@ pub struct RunnerThresholds {
     pub overdue_factor: f64,
     /// A job queued this long while its runner is idle is NOT PICKING UP.
     pub pickup_secs: i64,
+    /// A silent job whose processes used less CPU than this over the silent
+    /// window is idle, so STALLED; one that used more is only quiet.
+    pub idle_cpu_ms: u64,
 }
 
 impl Default for RunnerThresholds {
@@ -521,6 +548,7 @@ impl Default for RunnerThresholds {
             silent_secs: 10 * 60,
             overdue_factor: 2.0,
             pickup_secs: 5 * 60,
+            idle_cpu_ms: 2000,
         }
     }
 }
