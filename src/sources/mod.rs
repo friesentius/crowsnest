@@ -44,7 +44,10 @@ pub fn read_pipeline(worktree: &Path) -> Result<Option<Pipeline>, String> {
     }
     .run()
     .map_err(|e| format!("no-mistakes: {e}"))?;
-    Ok(nm::parse(&out.stdout))
+    Ok(nm::parse(&out.stdout).map(|mut p| {
+        p.read_at = Some(crate::timefmt::now_epoch());
+        p
+    }))
 }
 
 /// PR URLs shown on screen, from the fleet and from pipelines.

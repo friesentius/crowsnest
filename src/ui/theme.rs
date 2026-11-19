@@ -57,6 +57,11 @@ impl Theme {
     pub fn captain(&self) -> Style {
         self.fg(Color::Magenta)
     }
+    /// A row that changed a moment ago: a block of reverse video.
+    pub fn fresh(&self) -> Style {
+        self.fg(Color::Green)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    }
     pub fn title(&self) -> Style {
         self.fg(Color::Cyan).add_modifier(Modifier::BOLD)
     }

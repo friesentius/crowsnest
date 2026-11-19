@@ -1,0 +1,26 @@
+run:
+  id: "01M7SJ4Q8W3D5K2XH9N6ZB7TRE"
+  branch: fm/bs-p1c-type-pairing
+  status: running
+  awaiting_agent: parked 1h17m
+  head: 7d41c0be
+  head_sha: 7d41c0be93a15f0a4e6b2d8c1f7e0a95b3c4d612
+  findings: 2 awaiting
+  steps[9]{step,status,findings,duration_ms}:
+    intent,completed,0,121
+    rebase,completed,0,1688
+    review,awaiting_approval,2,41873
+    test,pending,0,0
+    document,pending,0,0
+    lint,pending,0,0
+    push,pending,0,0
+    pr,pending,0,0
+    ci,pending,0,0
+gate:
+  step: review
+  status: awaiting_approval
+  summary: Two warnings in the pairing table need a decision from the worker.
+  findings[2]{id,severity,file,action,description}:
+    review-1,warning,src/type.css,auto-fix,fallback stack is missing a generic family
+    review-2,warning,src/pairs.html,auto-fix,third pairing has no small-caps fallback
+help[1]: Run `no-mistakes axi logs --run 01M7SJ4Q8W3D5K2XH9N6ZB7TRE --step review --full` to read the full step log

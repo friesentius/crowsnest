@@ -6,7 +6,9 @@
 pub mod theme;
 
 use crate::app::{App, Row, visible_rows};
-use crate::model::{CheckState, PrChecks, Snapshot, StepStatus, WorkerState};
+use crate::model::{
+    CheckState, PrChecks, Snapshot, StaleKind, StepStatus, Thresholds, WorkerState,
+};
 use crate::timefmt;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -195,19 +197,32 @@ struct Cols {
     kind: Option<usize>,
 }
 
+/// Column widths. Columns that hold a value (a duration, a PR and its checks,
+/// a step with its time) are sized for the longest value they can show, so
+/// they never truncate; only free text (task, project) gives way when the
+/// screen is narrow.
 const PREFIX: usize = 13;
 const PIPE: usize = 9;
-const PRCOL: usize = 11;
-const AGE: usize = 4;
+/// `#1234 ✓ 12/12`, then a space before AGE.
+const PRCOL: usize = 14;
+/// The longest age, `23h59m`.
+const AGE: usize = 6;
+/// The longest step with its time, `document 23h59m`; also `parked 23h59m`.
+const STEP: usize = 15;
+const PROJECT: usize = 14;
+const KIND: usize = 10;
+const TASK_MIN: usize = 14;
+const TASK_MAX: usize = 32;
 
 impl Cols {
+    /// Value columns first, then the project and step when they fit, then
+    /// the task name and kind take what is left.
     fn for_width(w: usize) -> Cols {
         let base = PREFIX + 1 + PIPE + 1 + PRCOL + AGE;
         let mut c = Cols {
-            task: 22,
-            project: Some(17),
-            // Fits the longest step with its time, `document 12m`.
-            step: Some(11),
+            task: TASK_MIN,
+            project: Some(PROJECT),
+            step: Some(STEP),
             kind: None,
         };
         let used = |c: &Cols| {
@@ -216,20 +231,22 @@ impl Cols {
                 + c.step.map_or(0, |s| s + 1)
                 + c.kind.map_or(0, |k| k + 3)
         };
-        if used(&c) + 13 <= w {
-            c.kind = Some(10);
-        }
-        if used(&c) > w {
-            c.step = None;
-        }
         if used(&c) > w {
             c.project = None;
         }
         if used(&c) > w {
-            c.task = (c.task + w).saturating_sub(used(&c)).max(10);
-        } else {
-            c.task += (w - used(&c)).min(8);
+            c.step = None;
         }
+        let mut spare = w.saturating_sub(used(&c));
+        if spare >= KIND + 3 {
+            c.kind = Some(KIND);
+            spare -= KIND + 3;
+        }
+        c.task = if w < used(&c) {
+            (w.saturating_sub(used(&c) - c.task)).max(10)
+        } else {
+            c.task + spare.min(TASK_MAX - TASK_MIN)
+        };
         c
     }
 
@@ -286,7 +303,7 @@ fn pr_summary(theme: &Theme, pr: &PrChecks) -> (&'static str, Style, String) {
     } else if pr.draft {
         return ("-", theme.dim(), "draft".into());
     } else if total == 0 {
-        return ("-", theme.dim(), "no checks".into());
+        return ("-", theme.dim(), "none".into());
     } else if pr.count(CheckState::Fail) > 0 {
         CheckState::Fail
     } else if pass == total {
@@ -298,10 +315,20 @@ fn pr_summary(theme: &Theme, pr: &PrChecks) -> (&'static str, Style, String) {
     (g, s, format!("{pass}/{total}"))
 }
 
-fn step_label(row: &Row) -> String {
+fn step_label(row: &Row, now: i64) -> String {
     if let Some(p) = row.pipeline {
+        if let Some(parked) = p.parked_for(now) {
+            return format!("parked {}", timefmt::dur(parked));
+        }
+        if p.is_parked() {
+            // Older no-mistakes does not say how long: name the gate instead
+            // of the raw status, which is longer than the column.
+            return p
+                .gate_step()
+                .map_or("at a gate".into(), |g| format!("{g} gate"));
+        }
         if let Some(a) = &p.active {
-            return match a.active_secs {
+            return match p.active_for(now) {
                 Some(s) => format!("{} {}", a.step, timefmt::dur(s)),
                 None => a.step.clone(),
             };
@@ -355,7 +382,11 @@ fn now_text(row: &Row, now: i64) -> String {
             }
         }
         WorkerState::Stale => {
-            let reason = row.stale.clone().unwrap_or_default();
+            let reason = row
+                .stale
+                .as_ref()
+                .map(|s| s.reason.clone())
+                .unwrap_or_default();
             match note {
                 Some(n) => format!("{reason}; last: {n}"),
                 None => reason,
@@ -364,15 +395,20 @@ fn now_text(row: &Row, now: i64) -> String {
         _ => {
             if let Some(p) = row.pipeline {
                 if let Some(a) = &p.active {
-                    let ago = a
-                        .last_activity_secs
+                    let ago = p
+                        .quiet_for(now)
                         .map(|s| format!(" ({} ago)", timefmt::dur(s)))
                         .unwrap_or_default();
                     return format!("nm {} {}: {}{ago}", a.step, a.round, a.last_activity)
                         .replace("  ", " ");
                 }
                 if p.is_parked() {
-                    return format!("nm gate: findings {}", p.findings);
+                    let gate = p.gate_step().map(|g| format!("{g} ")).unwrap_or_default();
+                    let parked = p
+                        .parked_for(now)
+                        .map(|s| format!(", parked {}", timefmt::dur(s)))
+                        .unwrap_or_default();
+                    return format!("nm {gate}gate: findings {}{parked}", p.findings);
                 }
                 if let Some(err) = &p.error {
                     return format!("nm {}: {err}", p.status);
@@ -402,6 +438,16 @@ fn now_text(row: &Row, now: i64) -> String {
             }
         }
     }
+}
+
+/// Rows that changed this recently are drawn as a block of reverse video.
+pub const FRESH_SECS: i64 = 10;
+
+/// `changed 3m ago`, highlighted while the change is fresh.
+fn changed_tag(t: &Theme, ago: i64) -> (String, Style) {
+    let text = format!("changed {} ago", timefmt::dur(ago));
+    let style = if ago < FRESH_SECS { t.fresh() } else { t.dim() };
+    (text, style)
 }
 
 fn roster_row(view: &View, row: &Row, cols: &Cols, selected: bool, w: usize) -> Vec<Line<'static>> {
@@ -442,14 +488,21 @@ fn roster_row(view: &View, row: &Row, cols: &Cols, selected: bool, w: usize) -> 
     l1.extend(pipe_cells(t, row));
     l1.push(span(" ", Style::new()));
     if let Some(s) = cols.step {
-        l1.push(span(rpad(&step_label(row), s), t.dim()));
+        let parked_late = row
+            .stale
+            .as_ref()
+            .is_some_and(|s| s.kind == StaleKind::Parked);
+        l1.push(span(
+            rpad(&step_label(row, view.snap.now), s),
+            if parked_late { t.warn() } else { t.dim() },
+        ));
         l1.push(span(" ", Style::new()));
     }
     l1.extend(pr_cell(t, row, PRCOL));
     let age = wk
         .last_event
         .as_ref()
-        .and_then(|e| e.age_secs)
+        .and_then(|e| e.age(view.snap.now))
         .map(timefmt::dur)
         .unwrap_or_else(|| "-".into());
     l1.push(span(lpad(&age, AGE), t.dim()));
@@ -462,10 +515,22 @@ fn roster_row(view: &View, row: &Row, cols: &Cols, selected: bool, w: usize) -> 
         WorkerState::Blocked | WorkerState::Failed => t.fg(ratatui::style::Color::Red),
         _ => t.dim(),
     };
-    let l2 = vec![
+    // The row's "changed Ns ago" sits at the right edge, so a quiet fleet
+    // still shows when each worker last did something.
+    let tag = view
+        .app
+        .changed_ago(&wk.id, view.snap.now)
+        .map(|a| changed_tag(t, a));
+    let tag_w = tag.as_ref().map_or(0, |(text, _)| text.width() + 1);
+    let note_w = w.saturating_sub(PREFIX + tag_w);
+    let mut l2 = vec![
         span(" ".repeat(PREFIX), Style::new()),
-        span(now_text(row, view.snap.now), style),
+        span(rpad(&now_text(row, view.snap.now), note_w), style),
     ];
+    if let Some((text, style)) = tag {
+        l2.push(span(" ", Style::new()));
+        l2.push(span(text, style));
+    }
     let mut out = vec![fit(l1, w), fit(l2, w)];
     if view.app.expanded.contains(&wk.id) {
         out.extend(drawer(view, row, w));
@@ -524,7 +589,7 @@ fn drawer(view: &View, row: &Row, w: usize) -> Vec<Line<'static>> {
                     p.active
                         .as_ref()
                         .filter(|a| a.step == s.name)
-                        .and_then(|a| a.active_secs)
+                        .and_then(|_| p.active_for(now))
                         .map(timefmt::dur)
                         .unwrap_or_default()
                 } else if s.duration_ms > 0 {
@@ -551,6 +616,23 @@ fn drawer(view: &View, row: &Row, w: usize) -> Vec<Line<'static>> {
             t.warn()
         };
         f.push(span(p.findings.clone(), fs));
+        if let Some(parked) = p.parked_for(now) {
+            let late = parked >= view.app.thresholds.parked_secs;
+            f.extend([
+                span("  ", Style::new()),
+                lab("parked"),
+                span(
+                    format!(
+                        "{}{}",
+                        p.gate_step()
+                            .map(|g| format!("at {g} "))
+                            .unwrap_or_default(),
+                        timefmt::dur(parked)
+                    ),
+                    if late { t.warn() } else { t.plain() },
+                ),
+            ]);
+        }
         if let Some(e) = &p.error {
             f.extend([
                 span("  ", Style::new()),
@@ -593,7 +675,7 @@ fn drawer(view: &View, row: &Row, w: usize) -> Vec<Line<'static>> {
     if let Some(e) = &wk.last_event {
         let mut l = prefix.clone();
         let ago = e
-            .age_secs
+            .age(now)
             .map(|a| format!("{} ago", timefmt::dur(a)))
             .unwrap_or_default();
         l.push(lab(&format!("last status {ago}")));
@@ -618,13 +700,17 @@ fn drawer(view: &View, row: &Row, w: usize) -> Vec<Line<'static>> {
     out
 }
 
-fn summary(view: &View, rows: &[Row], short: bool) -> Vec<Span<'static>> {
+/// The header's counts. `level` 0 is the full form; 1 drops the age of the
+/// oldest held call; 2 drops the breakdown of what is stale; 3 also drops an
+/// empty `done` count and tightens the gaps. [`summary`] picks the fullest
+/// level that fits.
+fn summary_at(view: &View, rows: &[Row], level: u8) -> Vec<Span<'static>> {
     let t = &view.theme;
     let count = |s: &[WorkerState]| rows.iter().filter(|r| s.contains(&r.state)).count();
     let mut v: Vec<Span<'static>> = Vec::new();
     let add = |v: &mut Vec<Span<'static>>, text: String, style: Style| {
         if !v.is_empty() {
-            v.push(span("   ", Style::new()));
+            v.push(span(if level >= 3 { "  " } else { "   " }, Style::new()));
         }
         v.push(span(text, style));
     };
@@ -646,7 +732,25 @@ fn summary(view: &View, rows: &[Row], short: bool) -> Vec<Span<'static>> {
     }
     let stale = count(&[WorkerState::Stale]);
     if stale > 0 {
-        add(&mut v, format!("! {stale} stale"), t.warn());
+        let of = |k: StaleKind| {
+            rows.iter()
+                .filter(|r| r.stale.as_ref().is_some_and(|s| s.kind == k))
+                .count()
+        };
+        let mut text = format!("! {stale} stale");
+        let parts: Vec<String> = [
+            (of(StaleKind::Parked), "parked"),
+            (of(StaleKind::WaitPassed), "wait over"),
+            (of(StaleKind::Quiet), "quiet"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+        if level < 2 && !parts.is_empty() {
+            text.push_str(&format!(" ({})", parts.join(", ")));
+        }
+        add(&mut v, text, t.warn());
     }
     let gate = count(&[WorkerState::Gate]);
     if gate > 0 {
@@ -665,15 +769,17 @@ fn summary(view: &View, rows: &[Row], short: bool) -> Vec<Span<'static>> {
         ),
         t.state(WorkerState::Working),
     );
-    add(
-        &mut v,
-        format!(
-            "{} {} done",
-            t.state_glyph(WorkerState::Done),
-            count(&[WorkerState::Done])
-        ),
-        t.good(),
-    );
+    if level < 3 || count(&[WorkerState::Done]) > 0 {
+        add(
+            &mut v,
+            format!(
+                "{} {} done",
+                t.state_glyph(WorkerState::Done),
+                count(&[WorkerState::Done])
+            ),
+            t.good(),
+        );
+    }
     add(
         &mut v,
         format!(
@@ -688,7 +794,7 @@ fn summary(view: &View, rows: &[Row], short: bool) -> Vec<Span<'static>> {
     {
         let oldest = f.held.iter().filter_map(|h| h.age_days).max();
         let mut text = format!("{} {} held calls", t.flag(), f.held.len());
-        if let (Some(d), false) = (oldest, short) {
+        if let (Some(d), true) = (oldest, level < 1) {
             text.push_str(&format!(" (oldest {d}d)"));
         }
         add(&mut v, text, t.captain());
@@ -713,6 +819,17 @@ fn summary(view: &View, rows: &[Row], short: bool) -> Vec<Span<'static>> {
     v
 }
 
+fn summary(view: &View, rows: &[Row], w: usize) -> Vec<Span<'static>> {
+    let mut v = summary_at(view, rows, 0);
+    for level in 1..=3 {
+        if width_of(&v) <= w {
+            break;
+        }
+        v = summary_at(view, rows, level);
+    }
+    v
+}
+
 fn age_of(snap: &Snapshot, tier: &str) -> Option<i64> {
     snap.fresh
         .get(tier)
@@ -720,13 +837,49 @@ fn age_of(snap: &Snapshot, tier: &str) -> Option<i64> {
         .map(|t| snap.now - t)
 }
 
+/// When the fleet was last read and when something last changed in it, so a
+/// quiet fleet reads as up to date rather than frozen:
+/// `↻ read 4s ago · changed 41m ago`.
+fn freshness_cue(view: &View, short: bool) -> (String, Style) {
+    let t = &view.theme;
+    let now = view.snap.now;
+    // The fleet snapshot is what the rows are made of; the footer has the
+    // other tiers. A fleet read that is stuck must not hide behind them.
+    let Some(read) = age_of(view.snap, "fleet") else {
+        return (String::new(), t.dim());
+    };
+    let changed = view.app.last_change_ago(now).map(timefmt::dur);
+    let overdue = read > view.app.read_overdue_secs && !view.app.paused;
+    let mark = if overdue {
+        format!("{} ", t.warn_glyph())
+    } else {
+        String::new()
+    };
+    let text = match (short, changed) {
+        (false, Some(c)) => format!(
+            " {mark}{} read {} ago \u{b7} changed {c} ago",
+            t.refresh(),
+            timefmt::dur(read)
+        ),
+        (false, None) => format!(" {mark}{} read {} ago", t.refresh(), timefmt::dur(read)),
+        (true, Some(c)) => format!(
+            " {mark}{} {} \u{b7} {}{c}",
+            t.refresh(),
+            timefmt::dur(read),
+            t.g("\u{394}", "chg ")
+        ),
+        (true, None) => format!(" {mark}{} {}", t.refresh(), timefmt::dur(read)),
+    };
+    (text, if overdue { t.warn() } else { t.dim() })
+}
+
 fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     let rows = visible_rows(view.snap, view.app);
-    let all = crate::app::all_rows(view.snap, view.app.stale_secs);
-    let mut top: Vec<Content> = vec![Content::Line(fit(summary(view, &all, w < 100), w))];
+    let all = crate::app::all_rows(view.snap, &view.app.thresholds);
+    let mut top: Vec<Content> = vec![Content::Line(fit(summary(view, &all, w), w))];
     if let Some(err) = view.snap.fresh.get("fleet").and_then(|f| f.error.clone()) {
         let shown = if view.snap.fleet.is_some() {
             format!("! fleet: {err} (showing the last good snapshot)")
@@ -816,12 +969,16 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
     content.extend((0..pad).map(|_| Content::Line(Line::default())));
     content.extend(bottom);
 
-    let fleet_age = age_of(view.snap, "fleet")
-        .map(|a| format!(" {} fleet {}", t.refresh(), timefmt::dur(a)))
-        .unwrap_or_default();
     let mut title = vec![span("crowsnest", t.title())];
     if !host.is_empty() {
         title.push(span(format!(" firstmate @ {host}"), t.dim()));
+    }
+    // The long cue when it fits beside the title with room to spare.
+    let room =
+        (area.width as usize).saturating_sub(width_of(&title) + timefmt::clock(0).width() + 12);
+    let (mut cue, mut cue_style) = freshness_cue(view, false);
+    if cue.width() > room {
+        (cue, cue_style) = freshness_cue(view, true);
     }
     draw_box(
         buf,
@@ -830,7 +987,7 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
         title,
         vec![
             span(timefmt::clock(view.snap.now), t.bold()),
-            span(fleet_age, t.dim()),
+            span(cue, cue_style),
         ],
         t.border(),
         content,
@@ -1213,7 +1370,7 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
         (WorkerState::Failed, "it or its pipeline failed"),
         (
             WorkerState::Stale,
-            "no sign of life past the stale threshold",
+            "quiet, parked at a gate, or its wait passed",
         ),
         (WorkerState::Gate, "its no-mistakes run is parked at a gate"),
         (WorkerState::Working, "working"),
@@ -1232,6 +1389,13 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
             ),
             span(s.1, t.plain()),
         ])));
+    }
+    lines.push(Content::Sep);
+    for text in [
+        "Each row ends with when it changed; a block means just now.",
+        "The header: when the fleet was last read, and last changed.",
+    ] {
+        lines.push(Content::Line(Line::from(span(text, t.dim()))));
     }
     lines.push(Content::Sep);
     lines.push(Content::Line(Line::from(span(
@@ -1336,8 +1500,8 @@ fn ascii_fold(buf: &mut Buffer, area: Rect) {
 }
 
 /// Number of workers asking for the captain, for the terminal title.
-pub fn asking(snap: &Snapshot, stale_secs: i64) -> usize {
-    crate::app::all_rows(snap, stale_secs)
+pub fn asking(snap: &Snapshot, th: &Thresholds) -> usize {
+    crate::app::all_rows(snap, th)
         .iter()
         .filter(|r| r.state == WorkerState::Captain)
         .count()
