@@ -84,7 +84,8 @@ struct Args {
     #[arg(long = "disk", value_name = "PATH")]
     disks: Vec<PathBuf>,
 
-    /// Do not call GitHub (no PR checks, no runner queue).
+    /// Do not call GitHub (no PR checks, no runner queue, history or
+    /// registration).
     #[arg(long)]
     no_github: bool,
 
