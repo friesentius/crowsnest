@@ -323,6 +323,9 @@ pub fn derive_state(w: &Worker, pipe: Option<&Pipeline>, now: i64, stale_secs: i
         "no_active_work" | "idle" => return WorkerState::Idle,
         _ => {}
     }
+    if pipe.is_some_and(|p| p.status == "failed") {
+        return WorkerState::Failed;
+    }
     if let Some(p) = pipe
         && p.is_parked()
     {
@@ -416,6 +419,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(derive_state(&w, Some(&live), 0, 1800), WorkerState::Working);
+    }
+
+    #[test]
+    fn failed_pipeline_is_failed() {
+        let failed = Pipeline {
+            status: "failed".into(),
+            ..Default::default()
+        };
+        for state in ["working", "paused"] {
+            let mut w = worker(state);
+            assert_eq!(
+                derive_state(&w, Some(&failed), 0, 1800),
+                WorkerState::Failed
+            );
+            w.last_event.as_mut().unwrap().age_secs = Some(5000);
+            assert_eq!(
+                derive_state(&w, Some(&failed), 0, 1800),
+                WorkerState::Failed
+            );
+        }
+        // A cancelled run was stopped on purpose, not a failure.
+        let cancelled = Pipeline {
+            status: "cancelled".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_state(&worker("working"), Some(&cancelled), 0, 1800),
+            WorkerState::Working
+        );
     }
 
     #[test]

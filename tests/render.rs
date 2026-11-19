@@ -51,7 +51,11 @@ fn snapshot() -> Snapshot {
         s.pipelines
             .insert(id.into(), nm::parse(&fixture(file)).unwrap());
     }
-    for pr in gh::parse_checks(&fixture("gh-checks.json")).unwrap() {
+    let urls = ["https://github.com/acme/pantry/pull/122".to_string()];
+    for pr in gh::parse_checks(&fixture("gh-checks.json"), &urls)
+        .unwrap()
+        .0
+    {
         s.prs.insert(pr.url.clone(), pr);
     }
     let started = parse_iso("2026-11-19T14:12:51Z");
@@ -225,5 +229,24 @@ fn no_colour_keeps_every_word() {
         render(true),
         render(false),
         "colour only ever repeats what the text says"
+    );
+}
+
+#[test]
+fn an_open_drawer_taller_than_the_roster_is_cut_not_dropped() {
+    utc();
+    let s = snapshot();
+    let mut app = App::new(STALE);
+    open(&s, &mut app, "pantry-tour-followups");
+    let text = draw(&s, &app, 100, 24).backend().to_string();
+    let row = text
+        .lines()
+        .position(|l| l.contains("pantry-tour-followups"))
+        .expect("the selected row is drawn");
+    assert!(
+        text.lines()
+            .skip(row)
+            .any(|l| l.contains("branch fm/pantry-tour-followups")),
+        "the drawer starts under its row:\n{text}"
     );
 }

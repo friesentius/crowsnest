@@ -789,6 +789,10 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
         for (i, b) in blocks.iter().enumerate().skip(start) {
             if body.len() + b.len() <= avail {
                 body.extend(b.iter().cloned());
+            } else if body.is_empty() {
+                body.extend(b.iter().take(avail).cloned());
+                hidden_below = blocks.len() - i - 1;
+                break;
             } else {
                 hidden_below = blocks.len() - i;
                 break;

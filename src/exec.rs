@@ -44,7 +44,11 @@ pub enum ExecError {
     NotFound(String),
     Spawn(String),
     TimedOut(Duration),
-    Failed { code: Option<i32>, stderr: String },
+    Failed {
+        code: Option<i32>,
+        stderr: String,
+        stdout: String,
+    },
 }
 
 impl std::fmt::Display for ExecError {
@@ -54,7 +58,7 @@ impl std::fmt::Display for ExecError {
             ExecError::NotFound(prog) => write!(f, "{prog} not found"),
             ExecError::Spawn(e) => write!(f, "could not start: {e}"),
             ExecError::TimedOut(d) => write!(f, "timed out after {}s", d.as_secs()),
-            ExecError::Failed { code, stderr } => {
+            ExecError::Failed { code, stderr, .. } => {
                 let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
                 match code {
                     Some(c) => write!(f, "exit {c}: {first}"),
@@ -237,6 +241,7 @@ fn run_invocation(inv: &Invocation) -> Result<Output, ExecError> {
             } else {
                 stderr
             },
+            stdout,
         });
     }
     Ok(Output {

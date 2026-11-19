@@ -10,7 +10,7 @@ pub mod nm;
 pub mod quota;
 pub mod runners;
 
-use crate::exec::ReadCommand;
+use crate::exec::{ExecError, ReadCommand};
 use crate::model::{Fleet, Job, Pipeline, PrChecks, QuotaWindow, Runner};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -66,14 +66,33 @@ pub fn pr_urls(fleet: Option<&Fleet>, pipelines: &BTreeMap<String, Pipeline>) ->
     urls
 }
 
-pub fn read_pr_checks(urls: &[String]) -> Result<Vec<PrChecks>, String> {
+/// Check rollups of the PRs that resolved, keyed by the input URL, plus one
+/// error per PR GitHub could not resolve. `Err` means nothing resolved.
+pub fn read_pr_checks(urls: &[String]) -> Result<(Vec<PrChecks>, Vec<String>), String> {
     let Some(query) = gh::checks_query(urls) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
-    let out = ReadCommand::GhGraphql { query }
-        .run()
-        .map_err(|e| format!("gh: {e}"))?;
-    gh::parse_checks(&out.stdout)
+    let (stdout, failure) = match (ReadCommand::GhGraphql { query }).run() {
+        Ok(out) => (out.stdout, None),
+        Err(e) => {
+            let msg = format!("gh: {e}");
+            match e {
+                ExecError::Failed { stdout, .. } => (stdout, Some(msg)),
+                _ => return Err(msg),
+            }
+        }
+    };
+    match gh::parse_checks(&stdout, urls) {
+        Ok((prs, mut errors)) => {
+            if let Some(f) = failure
+                && errors.is_empty()
+            {
+                errors.push(f);
+            }
+            Ok((prs, errors))
+        }
+        Err(e) => Err(failure.unwrap_or(e)),
+    }
 }
 
 /// Queued and running jobs for each repository that has a local runner.

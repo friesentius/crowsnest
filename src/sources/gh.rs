@@ -62,15 +62,47 @@ fn status_context_state(state: &str) -> CheckState {
     }
 }
 
-/// Parse the GraphQL response of [`checks_query`].
-pub fn parse_checks(json: &str) -> Result<Vec<PrChecks>, String> {
+/// Parse the GraphQL response of [`checks_query`] for the same `urls`.
+///
+/// Each PR is keyed by the URL it was asked for, so callers can look it up
+/// by the URL they hold. PRs GitHub could not resolve are skipped and come
+/// back as one error each, so one bad PR never hides the others.
+pub fn parse_checks(json: &str, urls: &[String]) -> Result<(Vec<PrChecks>, Vec<String>), String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("invalid GraphQL JSON: {e}"))?;
-    let data = v
-        .get("data")
-        .and_then(Value::as_object)
-        .ok_or("GraphQL response has no data")?;
+    let url_of = |alias: &str| {
+        alias
+            .strip_prefix('p')
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| urls.get(i))
+    };
+    let errors: Vec<String> = v
+        .get("errors")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            let msg = e.get("message").and_then(Value::as_str).unwrap_or("error");
+            match e
+                .pointer("/path/0")
+                .and_then(Value::as_str)
+                .and_then(url_of)
+            {
+                Some(url) => format!("gh: {url}: {msg}"),
+                None => format!("gh: {msg}"),
+            }
+        })
+        .collect();
+    let Some(data) = v.get("data").and_then(Value::as_object) else {
+        return Err(errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "GraphQL response has no data".into()));
+    };
     let mut out = Vec::new();
-    for pr in data.values() {
+    for (alias, pr) in data {
+        let Some(url) = url_of(alias) else {
+            continue;
+        };
         let Some(pr) = pr.get("pullRequest").filter(|p| !p.is_null()) else {
             continue;
         };
@@ -98,11 +130,7 @@ pub fn parse_checks(json: &str) -> Result<Vec<PrChecks>, String> {
             checks.push(check);
         }
         out.push(PrChecks {
-            url: pr
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            url: url.clone(),
             number: pr.get("number").and_then(Value::as_u64).unwrap_or(0),
             draft: pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             state: pr
@@ -113,7 +141,7 @@ pub fn parse_checks(json: &str) -> Result<Vec<PrChecks>, String> {
             checks,
         });
     }
-    Ok(out)
+    Ok((out, errors))
 }
 
 /// Run ids from `repos/<r>/actions/runs?status=...`.
@@ -195,7 +223,10 @@ mod tests {
 
     #[test]
     fn parses_check_rollup() {
-        let prs = parse_checks(include_str!("../../tests/fixtures/gh-checks.json")).unwrap();
+        let urls = ["https://github.com/acme/pantry/pull/122".to_string()];
+        let (prs, errors) =
+            parse_checks(include_str!("../../tests/fixtures/gh-checks.json"), &urls).unwrap();
+        assert!(errors.is_empty());
         assert_eq!(prs.len(), 1);
         let pr = &prs[0];
         assert_eq!(pr.number, 122);
@@ -205,6 +236,68 @@ mod tests {
         assert_eq!(pr.count(CheckState::Running), 1);
         assert_eq!(pr.checks[0].name, "Lint & typecheck");
         assert!(pr.checks[1].started_at.is_some());
+    }
+
+    #[test]
+    fn checks_are_keyed_by_the_url_asked_for() {
+        // GitHub answers with its canonical URL after a rename or with a
+        // trailing path; rows look PRs up by the URL firstmate recorded.
+        let asked = "https://github.com/Acme/Pantry/pull/122/files".to_string();
+        let (prs, _) = parse_checks(
+            include_str!("../../tests/fixtures/gh-checks.json"),
+            std::slice::from_ref(&asked),
+        )
+        .unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].url, asked);
+    }
+
+    #[test]
+    fn one_unresolvable_pr_keeps_the_others() {
+        let urls = [
+            "https://github.com/acme/pantry/pull/122".to_string(),
+            "https://github.com/acme/gone/pull/7".to_string(),
+            "https://github.com/acme/pantry/pull/999".to_string(),
+        ];
+        let ok: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/gh-checks.json")).unwrap();
+        let json = serde_json::json!({
+            "data": {
+                "p0": ok["data"]["p0"],
+                "p1": null,
+                "p2": { "pullRequest": null },
+            },
+            "errors": [
+                {
+                    "type": "NOT_FOUND",
+                    "path": ["p1"],
+                    "message": "Could not resolve to a Repository with the name 'acme/gone'."
+                },
+                {
+                    "type": "NOT_FOUND",
+                    "path": ["p2", "pullRequest"],
+                    "message": "Could not resolve to a PullRequest with the number of 999."
+                }
+            ]
+        })
+        .to_string();
+        let (prs, errors) = parse_checks(&json, &urls).unwrap();
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].url, urls[0]);
+        assert_eq!(prs[0].checks.len(), 4);
+        assert_eq!(
+            errors,
+            [
+                "gh: https://github.com/acme/gone/pull/7: Could not resolve to a Repository with the name 'acme/gone'.",
+                "gh: https://github.com/acme/pantry/pull/999: Could not resolve to a PullRequest with the number of 999.",
+            ]
+        );
+        // Without any data the first error is the failure.
+        let json = r#"{"errors":[{"message":"Bad credentials"}]}"#;
+        assert_eq!(
+            parse_checks(json, &urls).unwrap_err(),
+            "gh: Bad credentials"
+        );
     }
 
     #[test]

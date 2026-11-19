@@ -325,9 +325,10 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 };
                 let mut errors = Vec::new();
                 match sources::read_pr_checks(&urls) {
-                    Ok(prs) => {
+                    Ok((prs, pr_errors)) => {
                         shared.lock().unwrap().prs =
                             prs.into_iter().map(|p| (p.url.clone(), p)).collect();
+                        errors.extend(pr_errors);
                     }
                     Err(e) => errors.push(e),
                 }
@@ -422,11 +423,27 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     );
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
-        let r = sources::read_pr_checks(&urls).map(|prs| {
-            s.prs = prs.into_iter().map(|p| (p.url.clone(), p)).collect();
-        });
-        let q = sources::read_queue(&s.runners).map(|j| s.jobs = j);
-        note(&mut s, "gh", r.and(q));
+        let mut errors = Vec::new();
+        match sources::read_pr_checks(&urls) {
+            Ok((prs, pr_errors)) => {
+                s.prs = prs.into_iter().map(|p| (p.url.clone(), p)).collect();
+                errors.extend(pr_errors);
+            }
+            Err(e) => errors.push(e),
+        }
+        match sources::read_queue(&s.runners) {
+            Ok(j) => s.jobs = j,
+            Err(e) => errors.push(e),
+        }
+        note(
+            &mut s,
+            "gh",
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            },
+        );
     }
     if cfg.quota {
         let r = sources::read_quota(&cfg.quota_providers).map(|q| s.quota = q);
