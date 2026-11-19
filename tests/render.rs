@@ -760,19 +760,11 @@ fn every_runner_job_names_its_project_and_is_grouped_by_repo() {
                 .position(|l| l.contains(needle))
                 .unwrap_or_else(|| panic!("{needle} missing at {w}:\n{text}"))
         };
-        let l = |n: &str| lines[pos(n)];
-        for n in ["Unit tests", "Lint & typecheck", "Fresh-clone setup"] {
-            assert!(l(n).contains("pantry"), "{n}: {}", l(n));
-        }
-        assert!(
-            l("Release build").contains("bookshop"),
-            "{}",
-            l("Release build")
-        );
-        assert!(pos("Unit tests") < pos("Lint & typecheck"));
-        assert!(pos("Lint & typecheck") < pos("Fresh-clone setup"));
-        assert!(pos("Fresh-clone setup") < pos("Release build"));
-        assert!(l("Lint & typecheck").contains("queued"));
+        let unit = pos("pantry \u{25d0} Unit tests");
+        let lint = pos("pantry \u{25cb} queued Lint & typecheck");
+        let fresh = pos("pantry \u{25cb} queued Fresh-clone setup");
+        let release = pos("bookshop \u{25cb} queued Release build");
+        assert!(unit < lint && lint < fresh && fresh < release, "{text}");
         // Truncation eats the job name, never the project label.
         let mut long_snap = s.clone();
         long_snap.jobs[0].name = "A very long job name that cannot possibly fit the panel".into();
@@ -781,8 +773,9 @@ fn every_runner_job_names_its_project_and_is_grouped_by_repo() {
             .to_string();
         let row = long
             .lines()
-            .find(|l| l.contains("pantry ") && l.contains("queued"))
-            .unwrap();
-        assert!(row.contains("pantry"), "{row}");
+            .find(|l| l.contains("A very long"))
+            .unwrap_or_else(|| panic!("long job missing at {w}:\n{long}"));
+        assert!(row.contains("pantry \u{25cb} queued A very long"), "{row}");
+        assert!(!row.contains("fit the panel"), "not truncated: {row}");
     }
 }
