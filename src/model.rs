@@ -54,7 +54,22 @@ impl WorkerState {
 pub struct LastEvent {
     pub state: String,
     pub note: String,
+    /// Age when the fleet snapshot was taken.
     pub age_secs: Option<i64>,
+    /// Unix time of the event, when the snapshot's own time is known. The
+    /// age on screen is measured from this, so it keeps counting between
+    /// snapshots instead of freezing at the last read.
+    pub at: Option<i64>,
+}
+
+impl LastEvent {
+    /// Seconds since the event, as of `now`.
+    pub fn age(&self, now: i64) -> Option<i64> {
+        match self.at {
+            Some(at) => Some((now - at).max(0)),
+            None => self.age_secs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -165,18 +180,59 @@ pub struct Pipeline {
     pub active: Option<ActiveStep>,
     pub outcome: Option<String>,
     pub error: Option<String>,
+    /// The gate step the run is parked at, when no-mistakes names it.
+    pub gate: Option<String>,
+    /// How long the run had been parked waiting on the agent when it was read
+    /// (`awaiting_agent: parked 1h17m`).
+    pub parked_secs: Option<i64>,
+    /// Unix time this status was read. Durations in it count on from here.
+    pub read_at: Option<i64>,
 }
 
 impl Pipeline {
-    /// The run is still moving on its own.
+    /// The run is still moving on its own. no-mistakes leaves a run's status
+    /// at `running` while it waits at a gate, so a parked run is not live.
     pub fn is_live(&self) -> bool {
-        matches!(self.status.as_str(), "running" | "fixing" | "pending")
+        matches!(self.status.as_str(), "running" | "fixing" | "pending") && !self.is_parked()
     }
 
     pub fn is_parked(&self) -> bool {
-        self.status.starts_with("awaiting")
+        self.parked_secs.is_some()
+            || self.status.starts_with("awaiting")
             || self.status == "fix_review"
             || self.steps.iter().any(|s| s.status == StepStatus::Awaiting)
+    }
+
+    /// Seconds between reading this status and `now`.
+    fn since_read(&self, now: i64) -> i64 {
+        self.read_at.map_or(0, |at| (now - at).max(0))
+    }
+
+    /// The name of the gate the run is parked at.
+    pub fn gate_step(&self) -> Option<&str> {
+        self.gate.as_deref().filter(|g| !g.is_empty()).or_else(|| {
+            self.steps
+                .iter()
+                .find(|s| s.status == StepStatus::Awaiting)
+                .map(|s| s.name.as_str())
+        })
+    }
+
+    /// How long the run has been parked waiting on the agent, as of `now`.
+    pub fn parked_for(&self, now: i64) -> Option<i64> {
+        self.parked_secs.map(|s| s + self.since_read(now))
+    }
+
+    /// How long the active step has been running, as of `now`.
+    pub fn active_for(&self, now: i64) -> Option<i64> {
+        let a = self.active.as_ref()?;
+        a.active_secs.map(|s| s + self.since_read(now))
+    }
+
+    /// How long ago the active step last reported activity, as of `now`.
+    pub fn quiet_for(&self, now: i64) -> Option<i64> {
+        let a = self.active.as_ref()?;
+        a.last_activity_secs.map(|s| s + self.since_read(now))
     }
 }
 
@@ -308,55 +364,132 @@ pub struct Snapshot {
     pub fresh: BTreeMap<String, Freshness>,
 }
 
-/// Decide a row's state from firstmate's state, its pipeline, and time.
-pub fn derive_state(w: &Worker, pipe: Option<&Pipeline>, now: i64, stale_secs: i64) -> WorkerState {
-    if !w.open_decisions.is_empty() {
-        return WorkerState::Captain;
-    }
-    if w.blocked_event || w.fm_state == "blocked" {
-        return WorkerState::Blocked;
-    }
-    match w.fm_state.as_str() {
-        "failed" => return WorkerState::Failed,
-        "parked" => return WorkerState::Gate,
-        "done" => return WorkerState::Done,
-        "no_active_work" | "idle" => return WorkerState::Idle,
-        _ => {}
-    }
-    if pipe.is_some_and(|p| p.status == "failed") {
-        return WorkerState::Failed;
-    }
-    if let Some(p) = pipe
-        && p.is_parked()
-    {
-        return WorkerState::Gate;
-    }
-    let active = matches!(w.fm_state.as_str(), "working" | "paused");
-    if !active {
-        return WorkerState::Unknown;
-    }
-    if stale_reason(w, pipe, now, stale_secs).is_some() {
-        return WorkerState::Stale;
-    }
-    if w.fm_state == "paused" {
-        WorkerState::Paused
-    } else {
-        WorkerState::Working
+/// The limits that turn a quiet row into one that needs attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thresholds {
+    /// A working task with no status line or pipeline activity this long is stale.
+    pub stale_secs: i64,
+    /// A pipeline gate parked on the agent this long needs attention.
+    pub parked_secs: i64,
+    /// How long after a declared wait ends before the worker is flagged.
+    pub wait_grace_secs: i64,
+}
+
+impl Thresholds {
+    pub const DEFAULT_PARKED_SECS: i64 = 10 * 60;
+    pub const DEFAULT_WAIT_GRACE_SECS: i64 = 5 * 60;
+
+    pub fn new(stale_secs: i64) -> Self {
+        Thresholds {
+            stale_secs,
+            parked_secs: Self::DEFAULT_PARKED_SECS,
+            wait_grace_secs: Self::DEFAULT_WAIT_GRACE_SECS,
+        }
     }
 }
 
-/// Why an active worker looks stuck, if it does.
-///
-/// A worker is alive when firstmate sees its harness busy, when its
-/// no-mistakes run is moving, or when it declared a wait that has not passed.
-/// Otherwise it is stale once its last status line is older than the threshold
-/// or its declared wait passed more than five minutes ago.
-pub fn stale_reason(
+/// Why a row needs attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleKind {
+    /// No sign of life past the stale threshold.
+    Quiet,
+    /// A pipeline gate has waited on the worker past the parked threshold.
+    Parked,
+    /// The worker's declared wait ended and nothing followed.
+    WaitPassed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stale {
+    pub kind: StaleKind,
+    pub reason: String,
+}
+
+/// Decide a row's state from firstmate's state, its pipeline, and time.
+pub fn derive_state(w: &Worker, pipe: Option<&Pipeline>, now: i64, th: &Thresholds) -> WorkerState {
+    classify(w, pipe, now, th).0
+}
+
+/// A row's state, and why it needs attention when that state is `Stale`.
+pub fn classify(
     w: &Worker,
     pipe: Option<&Pipeline>,
     now: i64,
-    stale_secs: i64,
-) -> Option<String> {
+    th: &Thresholds,
+) -> (WorkerState, Option<Stale>) {
+    // A parked gate stays a quiet GATE row until it has waited too long, or
+    // its worker's declared wait has passed.
+    let gate = || match stale_for(w, pipe, now, th, false) {
+        Some(s) => (WorkerState::Stale, Some(s)),
+        None => (WorkerState::Gate, None),
+    };
+    if !w.open_decisions.is_empty() {
+        return (WorkerState::Captain, None);
+    }
+    if w.blocked_event || w.fm_state == "blocked" {
+        return (WorkerState::Blocked, None);
+    }
+    match w.fm_state.as_str() {
+        "failed" => return (WorkerState::Failed, None),
+        "parked" => return gate(),
+        "done" => return (WorkerState::Done, None),
+        "no_active_work" | "idle" => return (WorkerState::Idle, None),
+        _ => {}
+    }
+    if pipe.is_some_and(|p| p.status == "failed") {
+        return (WorkerState::Failed, None);
+    }
+    if pipe.is_some_and(Pipeline::is_parked) {
+        return gate();
+    }
+    let active = matches!(w.fm_state.as_str(), "working" | "paused");
+    if !active {
+        return (WorkerState::Unknown, None);
+    }
+    if let Some(s) = stale_for(w, pipe, now, th, true) {
+        return (WorkerState::Stale, Some(s));
+    }
+    if w.fm_state == "paused" {
+        (WorkerState::Paused, None)
+    } else {
+        (WorkerState::Working, None)
+    }
+}
+
+/// Why a worker looks stuck, if it does.
+///
+/// A run parked at a gate waiting on the worker needs attention once it has
+/// waited past the parked threshold, whatever else the worker looks like: the
+/// gate is waiting for an answer whether or not the harness is busy.
+/// Otherwise a worker is alive when firstmate sees its harness busy, or when
+/// its no-mistakes run is moving. A live run keeps the worker alive even past
+/// its declared wait, since the pipeline is the work. Otherwise a worker is
+/// stuck when its declared wait passed more than the grace period ago, or,
+/// with `quiet` and no declared wait, when its last status line is older than
+/// the stale threshold.
+pub fn stale_for(
+    w: &Worker,
+    pipe: Option<&Pipeline>,
+    now: i64,
+    th: &Thresholds,
+    quiet: bool,
+) -> Option<Stale> {
+    use crate::timefmt::dur;
+    if let Some(p) = pipe
+        && let Some(parked) = p.parked_for(now)
+        && parked >= th.parked_secs
+    {
+        let gate = p
+            .gate_step()
+            .map_or("gate".to_string(), |g| format!("{g} gate"));
+        return Some(Stale {
+            kind: StaleKind::Parked,
+            reason: format!(
+                "parked at {gate} for {}, waiting on the worker",
+                dur(parked)
+            ),
+        });
+    }
     if w.source == "pane" && w.detail.contains("busy") {
         return None;
     }
@@ -364,28 +497,31 @@ pub fn stale_reason(
         return None;
     }
     if let Some(until) = w.wait_until {
-        if now < until + 300 {
+        if now < until + th.wait_grace_secs {
             return None;
         }
-        return Some(format!(
-            "declared wait ended {} ago",
-            crate::timefmt::dur(now - until)
-        ));
+        return Some(Stale {
+            kind: StaleKind::WaitPassed,
+            reason: format!("declared wait ended {} ago", dur(now - until)),
+        });
     }
-    let age = w.last_event.as_ref().and_then(|e| e.age_secs)?;
-    if age > stale_secs {
-        Some(format!(
-            "no status line or pipeline activity for {}",
-            crate::timefmt::dur(age)
-        ))
-    } else {
-        None
+    if !quiet {
+        return None;
     }
+    let age = w.last_event.as_ref().and_then(|e| e.age(now))?;
+    (age > th.stale_secs).then(|| Stale {
+        kind: StaleKind::Quiet,
+        reason: format!("no status line or pipeline activity for {}", dur(age)),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn th() -> Thresholds {
+        Thresholds::new(1800)
+    }
 
     fn worker(state: &str) -> Worker {
         Worker {
@@ -396,6 +532,7 @@ mod tests {
                 state: "working".into(),
                 note: String::new(),
                 age_secs: Some(60),
+                at: None,
             }),
             ..Default::default()
         }
@@ -405,20 +542,23 @@ mod tests {
     fn captain_beats_everything() {
         let mut w = worker("working");
         w.open_decisions = vec!["board-review".into()];
-        assert_eq!(derive_state(&w, None, 0, 1800), WorkerState::Captain);
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Captain);
     }
 
     #[test]
     fn stale_after_threshold_without_pipeline() {
         let mut w = worker("working");
-        assert_eq!(derive_state(&w, None, 0, 1800), WorkerState::Working);
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Working);
         w.last_event.as_mut().unwrap().age_secs = Some(2900);
-        assert_eq!(derive_state(&w, None, 0, 1800), WorkerState::Stale);
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Stale);
         let live = Pipeline {
             status: "running".into(),
             ..Default::default()
         };
-        assert_eq!(derive_state(&w, Some(&live), 0, 1800), WorkerState::Working);
+        assert_eq!(
+            derive_state(&w, Some(&live), 0, &th()),
+            WorkerState::Working
+        );
     }
 
     #[test]
@@ -430,12 +570,12 @@ mod tests {
         for state in ["working", "paused"] {
             let mut w = worker(state);
             assert_eq!(
-                derive_state(&w, Some(&failed), 0, 1800),
+                derive_state(&w, Some(&failed), 0, &th()),
                 WorkerState::Failed
             );
             w.last_event.as_mut().unwrap().age_secs = Some(5000);
             assert_eq!(
-                derive_state(&w, Some(&failed), 0, 1800),
+                derive_state(&w, Some(&failed), 0, &th()),
                 WorkerState::Failed
             );
         }
@@ -445,7 +585,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            derive_state(&worker("working"), Some(&cancelled), 0, 1800),
+            derive_state(&worker("working"), Some(&cancelled), 0, &th()),
             WorkerState::Working
         );
     }
@@ -455,9 +595,9 @@ mod tests {
         let mut w = worker("paused");
         w.last_event.as_mut().unwrap().age_secs = Some(5000);
         w.wait_until = Some(1000);
-        assert_eq!(derive_state(&w, None, 900, 1800), WorkerState::Paused);
-        assert_eq!(derive_state(&w, None, 1200, 1800), WorkerState::Paused);
-        assert_eq!(derive_state(&w, None, 1400, 1800), WorkerState::Stale);
+        assert_eq!(derive_state(&w, None, 900, &th()), WorkerState::Paused);
+        assert_eq!(derive_state(&w, None, 1200, &th()), WorkerState::Paused);
+        assert_eq!(derive_state(&w, None, 1400, &th()), WorkerState::Stale);
     }
 
     #[test]
@@ -466,27 +606,176 @@ mod tests {
         w.source = "pane".into();
         w.detail = "harness busy (claude-hook)".into();
         w.last_event.as_mut().unwrap().age_secs = Some(99_999);
-        assert_eq!(derive_state(&w, None, 0, 1800), WorkerState::Working);
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Working);
     }
 
     #[test]
     fn simple_mappings() {
-        assert_eq!(derive_state(&worker("done"), None, 0, 1), WorkerState::Done);
         assert_eq!(
-            derive_state(&worker("parked"), None, 0, 1),
+            derive_state(&worker("done"), None, 0, &Thresholds::new(1)),
+            WorkerState::Done
+        );
+        assert_eq!(
+            derive_state(&worker("parked"), None, 0, &Thresholds::new(1)),
             WorkerState::Gate
         );
         assert_eq!(
-            derive_state(&worker("blocked"), None, 0, 1),
+            derive_state(&worker("blocked"), None, 0, &Thresholds::new(1)),
             WorkerState::Blocked
         );
         assert_eq!(
-            derive_state(&worker("no_active_work"), None, 0, 1),
+            derive_state(&worker("no_active_work"), None, 0, &Thresholds::new(1)),
             WorkerState::Idle
         );
         assert_eq!(
-            derive_state(&worker("unknown"), None, 0, 1),
+            derive_state(&worker("unknown"), None, 0, &Thresholds::new(1)),
             WorkerState::Unknown
         );
+    }
+
+    /// A run no-mistakes reports as `running` while it waits at its review gate.
+    fn parked(secs: i64) -> Pipeline {
+        Pipeline {
+            status: "running".into(),
+            gate: Some("review".into()),
+            parked_secs: Some(secs),
+            read_at: Some(1000),
+            steps: vec![Step {
+                name: "review".into(),
+                status: StepStatus::Awaiting,
+                findings: 1,
+                duration_ms: 0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_parked_run_is_not_live() {
+        assert!(!parked(5).is_live());
+        assert!(parked(5).is_parked());
+    }
+
+    #[test]
+    fn a_gate_parked_past_the_threshold_needs_attention() {
+        let w = worker("working");
+        let t = Thresholds::new(1800);
+        // Under the threshold it stays a quiet GATE row.
+        let (state, why) = classify(&w, Some(&parked(120)), 1000, &t);
+        assert_eq!((state, why), (WorkerState::Gate, None));
+        // Parked time keeps counting after the read: 120s + 500s is past 10m.
+        let (state, why) = classify(&w, Some(&parked(120)), 1500, &t);
+        assert_eq!(state, WorkerState::Stale);
+        let why = why.unwrap();
+        assert_eq!(why.kind, StaleKind::Parked);
+        assert_eq!(
+            why.reason,
+            "parked at review gate for 10m, waiting on the worker"
+        );
+        // The threshold is configurable.
+        let patient = Thresholds {
+            parked_secs: 3600,
+            ..t
+        };
+        assert_eq!(
+            derive_state(&w, Some(&parked(4000 - 1000)), 1000, &patient),
+            WorkerState::Gate
+        );
+        assert_eq!(
+            derive_state(&w, Some(&parked(4600 - 1000)), 1000 + 1000, &patient),
+            WorkerState::Stale
+        );
+    }
+
+    #[test]
+    fn firstmate_parking_the_worker_does_not_hide_a_stalled_gate() {
+        let w = worker("parked");
+        assert_eq!(
+            derive_state(&w, Some(&parked(4620)), 1000, &th()),
+            WorkerState::Stale
+        );
+        // Parked with no pipeline reading is the worker waiting on someone else.
+        assert_eq!(derive_state(&w, None, 1000, &th()), WorkerState::Gate);
+    }
+
+    #[test]
+    fn a_busy_pane_does_not_hide_a_stalled_gate() {
+        let mut w = worker("working");
+        w.source = "pane".into();
+        w.detail = "harness busy (claude-hook)".into();
+        assert_eq!(
+            derive_state(&w, Some(&parked(4620)), 1000, &th()),
+            WorkerState::Stale
+        );
+        // Under the threshold it is just a gate, and with no gate it is working.
+        assert_eq!(
+            derive_state(&w, Some(&parked(60)), 1000, &th()),
+            WorkerState::Gate
+        );
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Working);
+    }
+
+    #[test]
+    fn a_live_pipeline_keeps_a_worker_alive_past_its_declared_wait() {
+        let mut w = worker("working");
+        w.wait_until = Some(1000);
+        let live = Pipeline {
+            status: "running".into(),
+            ..Default::default()
+        };
+        // Twelve minutes past the wait, but the pipeline is still moving.
+        assert_eq!(
+            derive_state(&w, Some(&live), 1000 + 720, &th()),
+            WorkerState::Working
+        );
+        // Once it stops moving, the passed wait counts.
+        assert_eq!(
+            derive_state(&w, None, 1000 + 720, &th()),
+            WorkerState::Stale
+        );
+    }
+
+    #[test]
+    fn a_passed_declared_wait_is_flagged_on_a_gate_row_too() {
+        let mut w = worker("parked");
+        w.wait_until = Some(1000);
+        let t = Thresholds::new(1800);
+        assert_eq!(
+            derive_state(&w, Some(&parked(30)), 1200, &t),
+            WorkerState::Gate
+        );
+        let (state, why) = classify(&w, Some(&parked(30)), 1000 + 301, &t);
+        assert_eq!(state, WorkerState::Stale);
+        assert_eq!(why.unwrap().kind, StaleKind::WaitPassed);
+        // Without a gate the same wait flags a paused worker.
+        let mut p = worker("paused");
+        p.wait_until = Some(1000);
+        let (state, why) = classify(&p, None, 1000 + 301, &t);
+        assert_eq!(state, WorkerState::Stale);
+        assert_eq!(why.unwrap().reason, "declared wait ended 5m ago");
+        let lenient = Thresholds {
+            wait_grace_secs: 3600,
+            ..t
+        };
+        assert_eq!(
+            derive_state(&p, None, 1000 + 301, &lenient),
+            WorkerState::Paused
+        );
+    }
+
+    #[test]
+    fn event_age_keeps_counting_after_the_snapshot() {
+        let e = LastEvent {
+            age_secs: Some(60),
+            at: Some(940),
+            ..Default::default()
+        };
+        assert_eq!(e.age(1000), Some(60));
+        assert_eq!(e.age(1100), Some(160));
+        let legacy = LastEvent {
+            age_secs: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(legacy.age(5000), Some(60));
     }
 }

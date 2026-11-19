@@ -165,7 +165,8 @@ pub fn dur_ms(ms: u64) -> String {
     }
 }
 
-/// Parse a Go-style duration such as `7m19s`, `35m1s`, `1h2m3s` or `6s`.
+/// Parse a Go-style duration such as `7m19s`, `35m1s`, `1h2m3s` or `6s`, or
+/// no-mistakes' day form such as `2d14h`.
 pub fn parse_go_dur(s: &str) -> Option<i64> {
     let mut total = 0i64;
     let mut num = String::new();
@@ -181,6 +182,7 @@ pub fn parse_go_dur(s: &str) -> Option<i64> {
             0.001
         } else {
             match c {
+                'd' => 86_400.0,
                 'h' => 3600.0,
                 'm' => 60.0,
                 's' => 1.0,
@@ -241,6 +243,8 @@ mod tests {
         assert_eq!(parse_go_dur("7m19s"), Some(439));
         assert_eq!(parse_go_dur("1h2m3s"), Some(3723));
         assert_eq!(parse_go_dur("250ms"), Some(0));
+        assert_eq!(parse_go_dur("1h17m"), Some(4620));
+        assert_eq!(parse_go_dur("2d14h"), Some(2 * 86_400 + 14 * 3600));
         assert_eq!(parse_go_dur("starting"), None);
     }
 }

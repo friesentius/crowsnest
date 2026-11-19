@@ -1,7 +1,9 @@
 //! UI state and key handling. Pure: no I/O, so it is unit-testable.
 
-use crate::model::{Pipeline, PrChecks, Snapshot, Worker, WorkerState, derive_state, stale_reason};
-use std::collections::BTreeSet;
+use crate::model::{
+    CheckState, Pipeline, PrChecks, Snapshot, Stale, Thresholds, Worker, WorkerState, classify,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
@@ -50,11 +52,28 @@ pub struct App {
     pub help: bool,
     pub quit: bool,
     pub paused: bool,
-    pub stale_secs: i64,
+    pub thresholds: Thresholds,
+    /// A fleet read this old is overdue, unless refresh is paused.
+    pub read_overdue_secs: i64,
+    changes: BTreeMap<String, Seen>,
+    /// A fleet reading has been observed: later new rows are changes.
+    seeded: bool,
+}
+
+/// A fleet read older than this is overdue, at the default fleet interval.
+pub const DEFAULT_READ_OVERDUE_SECS: i64 = 180;
+
+/// What [`App::observe`] last saw of one worker.
+#[derive(Debug, Clone)]
+struct Seen {
+    fingerprint: Fingerprint,
+    /// When the row last changed: the time crowsnest watched it change, or,
+    /// for a row it has only just met, its last status line.
+    changed_at: Option<i64>,
 }
 
 impl App {
-    pub fn new(stale_secs: i64) -> Self {
+    pub fn new(thresholds: Thresholds) -> Self {
         App {
             selected: None,
             expanded: BTreeSet::new(),
@@ -62,8 +81,65 @@ impl App {
             help: false,
             quit: false,
             paused: false,
-            stale_secs,
+            thresholds,
+            read_overdue_secs: DEFAULT_READ_OVERDUE_SECS,
+            changes: BTreeMap::new(),
+            seeded: false,
         }
+    }
+
+    /// Note which rows changed since the last call. Call it with every
+    /// snapshot that is about to be drawn, so each change is dated by the
+    /// moment it was first on screen.
+    pub fn observe(&mut self, snap: &Snapshot) {
+        // A failed fleet reading leaves the rows as they were.
+        if snap.fleet.is_none() {
+            return;
+        }
+        let rows = all_rows(snap, &self.thresholds);
+        // On the first reading rows are only being met, not changing.
+        let known = self.seeded;
+        let mut seen = BTreeMap::new();
+        for r in &rows {
+            let fingerprint = fingerprint(r);
+            let id = &r.worker.id;
+            let entry = match self.changes.remove(id) {
+                Some(mut s) => {
+                    match s.fingerprint.update(fingerprint) {
+                        Update::Same => {}
+                        Update::Met => s.changed_at = s.changed_at.max(met_at(r, snap.now)),
+                        Update::Changed => s.changed_at = Some(snap.now),
+                    }
+                    s
+                }
+                None => Seen {
+                    fingerprint,
+                    changed_at: if known {
+                        Some(snap.now)
+                    } else {
+                        met_at(r, snap.now)
+                    },
+                },
+            };
+            seen.insert(id.clone(), entry);
+        }
+        self.changes = seen;
+        self.seeded = true;
+    }
+
+    /// Seconds since this worker's row last changed, as of `now`.
+    pub fn changed_ago(&self, id: &str, now: i64) -> Option<i64> {
+        let at = self.changes.get(id)?.changed_at?;
+        Some((now - at).max(0))
+    }
+
+    /// Seconds since any row last changed, as of `now`.
+    pub fn last_change_ago(&self, now: i64) -> Option<i64> {
+        self.changes
+            .values()
+            .filter_map(|s| s.changed_at)
+            .max()
+            .map(|at| (now - at).max(0))
     }
 
     /// Apply a key action against the rows currently on screen. Returns true
@@ -126,7 +202,7 @@ pub struct Row<'a> {
     pub state: WorkerState,
     pub pipeline: Option<&'a Pipeline>,
     pub pr: Option<&'a PrChecks>,
-    pub stale: Option<String>,
+    pub stale: Option<Stale>,
 }
 
 impl Row<'_> {
@@ -138,8 +214,121 @@ impl Row<'_> {
     }
 }
 
+/// When a row crowsnest has only just met last did something: its last status
+/// line, the moment its pipeline's active step started, or the moment it
+/// parked at a gate, whichever is latest.
+fn met_at(r: &Row, now: i64) -> Option<i64> {
+    let status = r
+        .worker
+        .last_event
+        .as_ref()
+        .and_then(|e| e.age(now))
+        .map(|a| now - a);
+    let since = |d: Option<i64>| d.map(|a| now - a);
+    let (active, parked) = r.pipeline.map_or((None, None), |p| {
+        (since(p.active_for(now)), since(p.parked_for(now)))
+    });
+    status.max(active).max(parked)
+}
+
+/// Everything the readings say about a row that, when it differs between two
+/// of them, means the row changed. Durations are left out: they change on
+/// every reading. The pipeline and PR come from their own sources, which may
+/// not have read them yet, so each is only compared between readings that
+/// have it.
+#[derive(Debug, Clone)]
+struct Fingerprint {
+    worker: String,
+    pipeline: Option<String>,
+    pr: Option<String>,
+}
+
+enum Update {
+    Same,
+    /// Only a part not read before turned up.
+    Met,
+    Changed,
+}
+
+impl Fingerprint {
+    /// Take in a newer reading of the same row and say how it differs.
+    fn update(&mut self, new: Fingerprint) -> Update {
+        let mut update = Update::Same;
+        if self.worker != new.worker {
+            self.worker = new.worker;
+            update = Update::Changed;
+        }
+        // The pipeline tier keeps a task's last reading when a read fails, so
+        // a pipeline that goes is gone; a PR whose read failed just drops out.
+        for (old, new, gone_is_change) in [
+            (&mut self.pipeline, new.pipeline, true),
+            (&mut self.pr, new.pr, false),
+        ] {
+            match (old.as_ref(), new) {
+                (Some(_), None) if gone_is_change => {
+                    *old = None;
+                    update = Update::Changed;
+                }
+                (_, None) => {}
+                (Some(o), Some(n)) if *o == n => {}
+                (Some(_), Some(n)) => {
+                    *old = Some(n);
+                    update = Update::Changed;
+                }
+                (None, Some(n)) => {
+                    *old = Some(n);
+                    if matches!(update, Update::Same) {
+                        update = Update::Met;
+                    }
+                }
+            }
+        }
+        update
+    }
+}
+
+fn fingerprint(r: &Row) -> Fingerprint {
+    use std::fmt::Write;
+    let w = r.worker;
+    // The derived state is left out too: a row crossing a time threshold is
+    // not new data, and its own tag says how long it has been so.
+    let mut worker = format!("{}|{}|{:?}", w.fm_state, w.blocked_event, w.open_decisions);
+    if let Some(e) = &w.last_event {
+        let _ = write!(worker, "|{}:{}", e.state, e.note);
+    }
+    let _ = write!(worker, "|{:?}", w.wait_until);
+    let pipeline = r.pipeline.map(|p| {
+        let mut f = format!("{}|{}|{:?}|{}", p.status, p.findings, p.gate, p.is_parked());
+        for s in &p.steps {
+            let _ = write!(f, "|{}{:?}{}", s.name, s.status, s.findings);
+        }
+        if let Some(a) = &p.active {
+            let _ = write!(f, "|{}{}{}", a.step, a.status, a.round);
+        }
+        f
+    });
+    let pr = r.pr.map(|pr| {
+        let mut f = format!("{}{}", pr.state, pr.draft);
+        for state in [
+            CheckState::Pass,
+            CheckState::Fail,
+            CheckState::Running,
+            CheckState::Queued,
+            CheckState::Skipped,
+        ] {
+            let _ = write!(f, "{}", pr.count(state));
+        }
+        f
+    });
+    Fingerprint {
+        worker,
+        pipeline,
+        pr,
+    }
+}
+
 /// Every worker with its derived state, most urgent first.
-pub fn all_rows<'a>(snap: &'a Snapshot, stale_secs: i64) -> Vec<Row<'a>> {
+pub fn all_rows<'a>(snap: &'a Snapshot, th: &Thresholds) -> Vec<Row<'a>> {
     let Some(fleet) = &snap.fleet else {
         return Vec::new();
     };
@@ -148,7 +337,7 @@ pub fn all_rows<'a>(snap: &'a Snapshot, stale_secs: i64) -> Vec<Row<'a>> {
         .iter()
         .map(|w| {
             let pipeline = snap.pipelines.get(&w.id);
-            let state = derive_state(w, pipeline, snap.now, stale_secs);
+            let (state, stale) = classify(w, pipeline, snap.now, th);
             let pr_url = w
                 .pr_url
                 .as_deref()
@@ -158,11 +347,7 @@ pub fn all_rows<'a>(snap: &'a Snapshot, stale_secs: i64) -> Vec<Row<'a>> {
                 state,
                 pipeline,
                 pr: pr_url.and_then(|u| snap.prs.get(u)),
-                stale: if state == WorkerState::Stale {
-                    stale_reason(w, pipeline, snap.now, stale_secs)
-                } else {
-                    None
-                },
+                stale,
             }
         })
         .collect();
@@ -171,7 +356,7 @@ pub fn all_rows<'a>(snap: &'a Snapshot, stale_secs: i64) -> Vec<Row<'a>> {
 }
 
 pub fn visible_rows<'a>(snap: &'a Snapshot, app: &App) -> Vec<Row<'a>> {
-    all_rows(snap, app.stale_secs)
+    all_rows(snap, &app.thresholds)
         .into_iter()
         .filter(|r| match app.filter {
             Filter::All => true,
@@ -211,7 +396,7 @@ mod tests {
     #[test]
     fn captain_rows_sort_first() {
         let s = snap();
-        let ids: Vec<&str> = all_rows(&s, 1800)
+        let ids: Vec<&str> = all_rows(&s, &Thresholds::new(1800))
             .iter()
             .map(|r| r.worker.id.as_str())
             .collect();
@@ -219,9 +404,81 @@ mod tests {
     }
 
     #[test]
+    fn crossing_a_time_threshold_is_not_a_change() {
+        let mut s = snap();
+        s.now = 1_000_000;
+        // A parked run, read just now: 9m on the gate, the threshold is 10m.
+        s.pipelines.insert(
+            "b-work".into(),
+            Pipeline {
+                status: "running".into(),
+                parked_secs: Some(9 * 60),
+                read_at: Some(s.now),
+                ..Default::default()
+            },
+        );
+        let mut app = App::new(Thresholds::new(1800));
+        app.observe(&s);
+        let state = |s: &Snapshot| {
+            all_rows(s, &Thresholds::new(1800))
+                .iter()
+                .find(|r| r.worker.id == "b-work")
+                .unwrap()
+                .state
+        };
+        assert_eq!(state(&s), WorkerState::Gate);
+        let met = app.changed_ago("b-work", s.now);
+        // Two minutes on, with no new reading, the gate is parked past 10m.
+        s.now += 120;
+        app.observe(&s);
+        assert_eq!(state(&s), WorkerState::Stale);
+        assert_eq!(
+            app.changed_ago("b-work", s.now),
+            met.map(|m| m + 120),
+            "the row's clock keeps counting"
+        );
+        // A real change, the gate answered, does reset it.
+        s.pipelines.get_mut("b-work").unwrap().parked_secs = None;
+        s.pipelines.get_mut("b-work").unwrap().status = "completed".into();
+        app.observe(&s);
+        assert_eq!(app.changed_ago("b-work", s.now), Some(0));
+    }
+
+    #[test]
+    fn a_pipeline_read_after_the_fleet_is_met_not_changed() {
+        let mut s = snap();
+        s.now = 1_000_000;
+        let mut app = App::new(Thresholds::new(1800));
+        // The fleet is read first; the pipeline tier has not read yet.
+        app.observe(&s);
+        // Five seconds on it reads a run parked at its gate for 1h17m.
+        s.now += 5;
+        s.pipelines.insert(
+            "b-work".into(),
+            Pipeline {
+                status: "running".into(),
+                parked_secs: Some(77 * 60),
+                read_at: Some(s.now),
+                ..Default::default()
+            },
+        );
+        app.observe(&s);
+        assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60));
+        assert_eq!(app.changed_ago("a-done", s.now), None);
+        // A later read that finds the same run is no change.
+        s.now += 15;
+        app.observe(&s);
+        assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60 + 15));
+        // The run going away is.
+        s.pipelines.remove("b-work");
+        app.observe(&s);
+        assert_eq!(app.changed_ago("b-work", s.now), Some(0));
+    }
+
+    #[test]
     fn navigation_filter_and_expand() {
         let s = snap();
-        let mut app = App::new(1800);
+        let mut app = App::new(Thresholds::new(1800));
         let rows = visible_rows(&s, &app);
         app.apply(Action::Down, &rows);
         assert_eq!(app.selected.as_deref(), Some("b-work"));

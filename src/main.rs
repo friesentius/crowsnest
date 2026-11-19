@@ -1,8 +1,9 @@
 //! `crowsnest`: run it in a pane beside firstmate. It only reads.
 
 use clap::Parser;
-use crowsnest::app::{Action, App, visible_rows};
+use crowsnest::app::{Action, App, DEFAULT_READ_OVERDUE_SECS, visible_rows};
 use crowsnest::collector::{self, Config};
+use crowsnest::model::Thresholds;
 use crowsnest::timefmt::now_epoch;
 use crowsnest::ui::{self, View, theme::Theme};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -28,6 +29,16 @@ struct Args {
     /// task is shown as stale.
     #[arg(long, default_value_t = 30, value_name = "MIN")]
     stale_minutes: u64,
+
+    /// Minutes a no-mistakes gate may wait on its worker before the row is
+    /// flagged and counted as needing attention.
+    #[arg(long, default_value_t = 10, value_name = "MIN")]
+    parked_minutes: u64,
+
+    /// Minutes after a worker's declared "until" time before the row is
+    /// flagged because nothing followed it.
+    #[arg(long, default_value_t = 5, value_name = "MIN")]
+    wait_grace_minutes: u64,
 
     /// Seconds between fleet snapshots (each one costs a few CPU-seconds).
     #[arg(long, default_value_t = 60, value_name = "SECS")]
@@ -143,11 +154,17 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
         std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
         args.ascii,
     );
-    let stale_secs = (args.stale_minutes * 60) as i64;
+    let thresholds = Thresholds {
+        stale_secs: (args.stale_minutes * 60) as i64,
+        parked_secs: (args.parked_minutes * 60) as i64,
+        wait_grace_secs: (args.wait_grace_minutes * 60) as i64,
+    };
     let host = sysinfo::System::host_name().unwrap_or_default();
     let (tx, rx) = mpsc::channel();
     let (shared, handle) = collector::start(cfg, tx);
-    let mut app = App::new(stale_secs);
+    let mut app = App::new(thresholds);
+    // Three missed fleet reads, and never sooner than the default.
+    app.read_overdue_secs = (args.fleet_interval.max(10) as i64 * 3).max(DEFAULT_READ_OVERDUE_SECS);
     let mut terminal = ratatui::init();
     let mut last_title = usize::MAX;
     let mut last_draw = Instant::now() - Duration::from_secs(10);
@@ -160,7 +177,8 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
             let mut snap = shared.lock().unwrap().clone();
             snap.now = now_epoch();
             app.paused = handle.paused();
-            let asking = ui::asking(&snap, stale_secs);
+            app.observe(&snap);
+            let asking = ui::asking(&snap, &thresholds);
             if asking != last_title {
                 let title = if asking > 0 {
                     format!("crowsnest ({asking})")

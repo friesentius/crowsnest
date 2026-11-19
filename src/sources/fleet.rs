@@ -208,6 +208,7 @@ pub fn parse(json: &str) -> Result<Fleet, String> {
         .map(|r| (r.id.as_str(), r))
         .collect();
 
+    let generated = timefmt::parse_iso(&snap.generated);
     let mut workers = Vec::new();
     for t in &snap.tasks {
         let last = t
@@ -245,6 +246,7 @@ pub fn parse(json: &str) -> Result<Fleet, String> {
                 state: e.state.clone(),
                 note: e.note.clone(),
                 age_secs: e.age_seconds,
+                at: generated.zip(e.age_seconds).map(|(g, a)| g - a),
             }),
             wait_until: last.and_then(|e| timefmt::find_until(&e.raw)),
             parent: None,
@@ -315,7 +317,7 @@ pub fn parse(json: &str) -> Result<Fleet, String> {
         });
 
     Ok(Fleet {
-        generated: timefmt::parse_iso(&snap.generated),
+        generated,
         workers,
         held,
         next,

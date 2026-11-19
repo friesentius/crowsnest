@@ -3,7 +3,7 @@
 
 use crate::model::{ActiveStep, Pipeline, Step, StepStatus};
 use crate::timefmt;
-use crate::toon::{self, col};
+use crate::toon::{self, Toon, col};
 
 /// Parse `no-mistakes axi status`. Returns `None` when the worktree has no run.
 pub fn parse(text: &str) -> Option<Pipeline> {
@@ -33,6 +33,12 @@ pub fn parse(text: &str) -> Option<Pipeline> {
         }
     });
     let nonempty = |s: Option<&str>| s.filter(|v| !v.is_empty()).map(str::to_string);
+    // `gate:` is an object with the step's name, or just the name.
+    let gate = match doc.get("gate") {
+        Some(Toon::Scalar(name)) => nonempty(Some(name)),
+        Some(g) => nonempty(g.str("step")),
+        None => None,
+    };
     Some(Pipeline {
         run_id: run.str("id").unwrap_or_default().to_string(),
         branch: run.str("branch").unwrap_or_default().to_string(),
@@ -44,6 +50,13 @@ pub fn parse(text: &str) -> Option<Pipeline> {
         active,
         outcome: nonempty(doc.str("outcome")),
         error: nonempty(doc.str("error")),
+        gate,
+        // `awaiting_agent: parked 1h17m`: how long the run has waited on the agent.
+        parked_secs: run
+            .str("awaiting_agent")
+            .and_then(|a| a.strip_prefix("parked "))
+            .and_then(timefmt::parse_go_dur),
+        read_at: None,
     })
 }
 
@@ -94,6 +107,29 @@ mod tests {
         assert_eq!(p.steps[4].status, StepStatus::Pending);
         assert_eq!(p.pr_url, None);
         assert_eq!(p.active.unwrap().last_activity_secs, Some(6));
+    }
+
+    #[test]
+    fn a_run_parked_at_its_gate() {
+        let p = parse(include_str!("../../tests/fixtures/nm-status-parked.toon")).unwrap();
+        // no-mistakes leaves the run's status at `running` while it waits.
+        assert_eq!(p.status, "running");
+        assert_eq!(p.gate.as_deref(), Some("review"));
+        assert_eq!(p.parked_secs, Some(77 * 60));
+        assert_eq!(p.gate_step(), Some("review"));
+        assert_eq!(p.findings, "2 awaiting");
+        assert!(p.is_parked());
+        assert!(!p.is_live());
+        assert!(p.active.is_none());
+        // A gate named by a bare scalar, and a run parked for days.
+        let bare =
+            parse("run:\n  id: x\n  status: running\n  awaiting_agent: parked 2d14h\ngate: test\n")
+                .unwrap();
+        assert_eq!(bare.gate.as_deref(), Some("test"));
+        assert_eq!(bare.parked_secs, Some(2 * 86_400 + 14 * 3600));
+        // A gate that is not waiting on the agent has no parked time.
+        let p = parse(include_str!("../../tests/fixtures/nm-status-ci.toon")).unwrap();
+        assert_eq!((p.gate, p.parked_secs), (None, None));
     }
 
     #[test]
