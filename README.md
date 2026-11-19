@@ -175,8 +175,6 @@ There is no telemetry, and crowsnest makes no network calls of its own.
 cargo test                  # unit, render snapshot and read-only tests
 cargo clippy --all-targets -- -D warnings
 cargo insta review          # after an intentional UI change
-CROWSNEST_EVIDENCE_DIR=/tmp/shots cargo test --test render capture_evidence -- --ignored
-                            # write the stalled roster and a row changing state as ANSI frames
 ```
 
 The code is split so the data layer can be reused without the UI:

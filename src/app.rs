@@ -66,7 +66,7 @@ pub const DEFAULT_READ_OVERDUE_SECS: i64 = 180;
 /// What [`App::observe`] last saw of one worker.
 #[derive(Debug, Clone)]
 struct Seen {
-    fingerprint: String,
+    fingerprint: Fingerprint,
     /// When the row last changed: the time crowsnest watched it change, or,
     /// for a row it has only just met, its last status line.
     changed_at: Option<i64>,
@@ -105,9 +105,10 @@ impl App {
             let id = &r.worker.id;
             let entry = match self.changes.remove(id) {
                 Some(mut s) => {
-                    if s.fingerprint != fingerprint {
-                        s.fingerprint = fingerprint;
-                        s.changed_at = Some(snap.now);
+                    match s.fingerprint.update(fingerprint) {
+                        Update::Same => {}
+                        Update::Met => s.changed_at = s.changed_at.max(met_at(r, snap.now)),
+                        Update::Changed => s.changed_at = Some(snap.now),
                     }
                     s
                 }
@@ -214,7 +215,8 @@ impl Row<'_> {
 }
 
 /// When a row crowsnest has only just met last did something: its last status
-/// line, or the moment its pipeline parked at a gate, whichever is later.
+/// line, the moment its pipeline's active step started, or the moment it
+/// parked at a gate, whichever is latest.
 fn met_at(r: &Row, now: i64) -> Option<i64> {
     let status = r
         .worker
@@ -222,41 +224,82 @@ fn met_at(r: &Row, now: i64) -> Option<i64> {
         .as_ref()
         .and_then(|e| e.age(now))
         .map(|a| now - a);
-    let parked = r.pipeline.and_then(|p| p.parked_for(now)).map(|a| now - a);
-    status.max(parked)
+    let since = |d: Option<i64>| d.map(|a| now - a);
+    let (active, parked) = r.pipeline.map_or((None, None), |p| {
+        (since(p.active_for(now)), since(p.parked_for(now)))
+    });
+    status.max(active).max(parked)
 }
 
 /// Everything the readings say about a row that, when it differs between two
 /// of them, means the row changed. Durations are left out: they change on
-/// every reading.
-fn fingerprint(r: &Row) -> String {
+/// every reading. The pipeline and PR come from their own sources, which may
+/// not have read them yet, so each is only compared between readings that
+/// have it.
+#[derive(Debug, Clone)]
+struct Fingerprint {
+    worker: String,
+    pipeline: Option<String>,
+    pr: Option<String>,
+}
+
+enum Update {
+    Same,
+    /// Only a part not read before turned up.
+    Met,
+    Changed,
+}
+
+impl Fingerprint {
+    /// Take in a newer reading of the same row and say how it differs.
+    fn update(&mut self, new: Fingerprint) -> Update {
+        let mut update = Update::Same;
+        if self.worker != new.worker {
+            self.worker = new.worker;
+            update = Update::Changed;
+        }
+        for (old, new) in [(&mut self.pipeline, new.pipeline), (&mut self.pr, new.pr)] {
+            match (old.as_ref(), new) {
+                (_, None) => {}
+                (Some(o), Some(n)) if *o == n => {}
+                (Some(_), Some(n)) => {
+                    *old = Some(n);
+                    update = Update::Changed;
+                }
+                (None, Some(n)) => {
+                    *old = Some(n);
+                    if matches!(update, Update::Same) {
+                        update = Update::Met;
+                    }
+                }
+            }
+        }
+        update
+    }
+}
+
+fn fingerprint(r: &Row) -> Fingerprint {
     use std::fmt::Write;
     let w = r.worker;
     // The derived state is left out too: a row crossing a time threshold is
     // not new data, and its own tag says how long it has been so.
-    let mut f = format!("{}|{}|{:?}", w.fm_state, w.blocked_event, w.open_decisions);
+    let mut worker = format!("{}|{}|{:?}", w.fm_state, w.blocked_event, w.open_decisions);
     if let Some(e) = &w.last_event {
-        let _ = write!(f, "|{}:{}", e.state, e.note);
+        let _ = write!(worker, "|{}:{}", e.state, e.note);
     }
-    let _ = write!(f, "|{:?}", w.wait_until);
-    if let Some(p) = r.pipeline {
-        let _ = write!(
-            f,
-            "|{}|{}|{:?}|{}",
-            p.status,
-            p.findings,
-            p.gate,
-            p.is_parked()
-        );
+    let _ = write!(worker, "|{:?}", w.wait_until);
+    let pipeline = r.pipeline.map(|p| {
+        let mut f = format!("{}|{}|{:?}|{}", p.status, p.findings, p.gate, p.is_parked());
         for s in &p.steps {
             let _ = write!(f, "|{}{:?}{}", s.name, s.status, s.findings);
         }
         if let Some(a) = &p.active {
             let _ = write!(f, "|{}{}{}", a.step, a.status, a.round);
         }
-    }
-    if let Some(pr) = r.pr {
-        let _ = write!(f, "|{}{}", pr.state, pr.draft);
+        f
+    });
+    let pr = r.pr.map(|pr| {
+        let mut f = format!("{}{}", pr.state, pr.draft);
         for state in [
             CheckState::Pass,
             CheckState::Fail,
@@ -266,8 +309,13 @@ fn fingerprint(r: &Row) -> String {
         ] {
             let _ = write!(f, "{}", pr.count(state));
         }
+        f
+    });
+    Fingerprint {
+        worker,
+        pipeline,
+        pr,
     }
-    f
 }
 
 /// Every worker with its derived state, most urgent first.
@@ -385,6 +433,37 @@ mod tests {
         s.pipelines.get_mut("b-work").unwrap().status = "completed".into();
         app.observe(&s);
         assert_eq!(app.changed_ago("b-work", s.now), Some(0));
+    }
+
+    #[test]
+    fn a_pipeline_read_after_the_fleet_is_met_not_changed() {
+        let mut s = snap();
+        s.now = 1_000_000;
+        let mut app = App::new(Thresholds::new(1800));
+        // The fleet is read first; the pipeline tier has not read yet.
+        app.observe(&s);
+        // Five seconds on it reads a run parked at its gate for 1h17m.
+        s.now += 5;
+        s.pipelines.insert(
+            "b-work".into(),
+            Pipeline {
+                status: "running".into(),
+                parked_secs: Some(77 * 60),
+                read_at: Some(s.now),
+                ..Default::default()
+            },
+        );
+        app.observe(&s);
+        assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60));
+        assert_eq!(app.changed_ago("a-done", s.now), None);
+        // A failed read drops it and the next one brings it back unchanged.
+        let kept = s.pipelines.remove("b-work").unwrap();
+        s.now += 15;
+        app.observe(&s);
+        s.pipelines.insert("b-work".into(), kept);
+        s.now += 15;
+        app.observe(&s);
+        assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60 + 30));
     }
 
     #[test]
