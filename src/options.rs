@@ -106,6 +106,10 @@ pub fn items(
             Setting::StaleMinutes,
             Setting::ParkedMinutes,
             Setting::WaitGraceMinutes,
+            Setting::RunnerSilentMinutes,
+            Setting::RunnerOverdueFactor,
+            Setting::RunnerPickupMinutes,
+            Setting::RunnerIdleCpuSeconds,
         ]
         .into_iter()
         .map(|s| setting_item(s, file, overrides))
@@ -197,9 +201,13 @@ fn usage_items(file: &Settings, quota: &[QuotaWindow]) -> Vec<Item> {
 
 fn value_text(s: Setting, v: u64) -> String {
     match s {
-        Setting::StaleMinutes | Setting::ParkedMinutes | Setting::WaitGraceMinutes => {
-            format!("{v} min")
-        }
+        Setting::StaleMinutes
+        | Setting::ParkedMinutes
+        | Setting::WaitGraceMinutes
+        | Setting::RunnerSilentMinutes
+        | Setting::RunnerPickupMinutes => format!("{v} min"),
+        Setting::RunnerOverdueFactor => format!("{}x", s.show(v)),
+        Setting::RunnerIdleCpuSeconds => format!("{} s", s.show(v)),
         Setting::FleetSeconds | Setting::PipelineSeconds => format!("{v} s"),
         Setting::Ascii => if v != 0 { "ascii" } else { "unicode" }.into(),
     }
@@ -218,6 +226,22 @@ fn setting_item(s: Setting, file: &Settings, overrides: &Overrides) -> Item {
         Setting::WaitGraceMinutes => (
             "wait grace",
             "How long after a worker's declared wait ends before its row is flagged.",
+        ),
+        Setting::RunnerSilentMinutes => (
+            "runner stalled after",
+            "A busy runner whose step output (or worker log) has not moved this long is shown as STALLED.",
+        ),
+        Setting::RunnerOverdueFactor => (
+            "runner slow at",
+            "A job running longer than this many times its typical duration is shown as SLOW.",
+        ),
+        Setting::RunnerPickupMinutes => (
+            "runner pickup within",
+            "A job queued this long while its runner is idle shows the runner as NOT PICKING UP.",
+        ),
+        Setting::RunnerIdleCpuSeconds => (
+            "runner idle CPU",
+            "CPU-seconds a silent job may use over the silent window and still count as idle, so STALLED. More means busy but quiet.",
         ),
         Setting::FleetSeconds => (
             "fleet every",

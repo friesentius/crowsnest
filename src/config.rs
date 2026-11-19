@@ -5,7 +5,7 @@
 //! that is not valid TOML is reported and left alone. Saving edits the file in
 //! place, so comments and entries crowsnest does not know survive.
 
-use crate::model::Thresholds;
+use crate::model::{RunnerThresholds, Thresholds};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
@@ -69,16 +69,24 @@ pub enum Setting {
     StaleMinutes,
     ParkedMinutes,
     WaitGraceMinutes,
+    RunnerSilentMinutes,
+    RunnerOverdueFactor,
+    RunnerPickupMinutes,
+    RunnerIdleCpuSeconds,
     FleetSeconds,
     PipelineSeconds,
     Ascii,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 6] = [
+    pub const ALL: [Setting; 10] = [
         Setting::StaleMinutes,
         Setting::ParkedMinutes,
         Setting::WaitGraceMinutes,
+        Setting::RunnerSilentMinutes,
+        Setting::RunnerOverdueFactor,
+        Setting::RunnerPickupMinutes,
+        Setting::RunnerIdleCpuSeconds,
         Setting::FleetSeconds,
         Setting::PipelineSeconds,
         Setting::Ascii,
@@ -86,11 +94,9 @@ impl Setting {
 
     pub fn section(self) -> &'static str {
         match self {
-            Setting::StaleMinutes | Setting::ParkedMinutes | Setting::WaitGraceMinutes => {
-                "thresholds"
-            }
             Setting::FleetSeconds | Setting::PipelineSeconds => "refresh",
             Setting::Ascii => "display",
+            _ => "thresholds",
         }
     }
 
@@ -99,6 +105,10 @@ impl Setting {
             Setting::StaleMinutes => "stale_minutes",
             Setting::ParkedMinutes => "parked_minutes",
             Setting::WaitGraceMinutes => "wait_grace_minutes",
+            Setting::RunnerSilentMinutes => "runner_silent_minutes",
+            Setting::RunnerOverdueFactor => "runner_overdue_factor",
+            Setting::RunnerPickupMinutes => "runner_pickup_minutes",
+            Setting::RunnerIdleCpuSeconds => "runner_idle_cpu_seconds",
             Setting::FleetSeconds => "fleet_seconds",
             Setting::PipelineSeconds => "pipeline_seconds",
             Setting::Ascii => "ascii",
@@ -111,6 +121,10 @@ impl Setting {
             Setting::StaleMinutes => "--stale-minutes",
             Setting::ParkedMinutes => "--parked-minutes",
             Setting::WaitGraceMinutes => "--wait-grace-minutes",
+            Setting::RunnerSilentMinutes => "--runner-silent-minutes",
+            Setting::RunnerOverdueFactor => "--runner-overdue-factor",
+            Setting::RunnerPickupMinutes => "--runner-pickup-minutes",
+            Setting::RunnerIdleCpuSeconds => "--runner-idle-cpu-seconds",
             Setting::FleetSeconds => "--fleet-interval",
             Setting::PipelineSeconds => "--pipeline-interval",
             Setting::Ascii => "--ascii",
@@ -121,27 +135,58 @@ impl Setting {
         self == Setting::Ascii
     }
 
-    /// The values a number may take in the file, inclusive. The lower bounds
-    /// match what the command line clamps to.
+    /// Values are whole numbers in units of `1 / scale()`: decimal settings
+    /// are kept in hundredths, so they compare and save exactly.
+    pub fn scale(self) -> u64 {
+        match self {
+            Setting::RunnerOverdueFactor | Setting::RunnerIdleCpuSeconds => 100,
+            _ => 1,
+        }
+    }
+
+    /// The values a number may take in the file, inclusive, in units of
+    /// `1 / scale()`. The lower bounds match what the command line allows.
     pub fn range(self) -> (u64, u64) {
         match self {
             Setting::StaleMinutes | Setting::ParkedMinutes => (1, 1440),
             Setting::WaitGraceMinutes => (0, 1440),
+            Setting::RunnerSilentMinutes | Setting::RunnerPickupMinutes => (1, 1440),
+            Setting::RunnerOverdueFactor => (100, 10_000),
+            Setting::RunnerIdleCpuSeconds => (0, 360_000),
             Setting::FleetSeconds => (10, 3600),
             Setting::PipelineSeconds => (5, 3600),
             Setting::Ascii => (0, 1),
         }
     }
 
-    /// The values the options menu steps through.
+    /// The values the options menu steps through, in units of `1 / scale()`.
     pub fn steps(self) -> &'static [u64] {
         match self {
             Setting::StaleMinutes => &[5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 480],
             Setting::ParkedMinutes => &[1, 2, 3, 5, 10, 15, 20, 30, 45, 60, 120],
             Setting::WaitGraceMinutes => &[0, 1, 2, 5, 10, 15, 30, 60],
+            Setting::RunnerSilentMinutes => &[2, 3, 5, 10, 15, 20, 30, 60],
+            Setting::RunnerOverdueFactor => &[125, 150, 175, 200, 250, 300, 400, 500],
+            Setting::RunnerPickupMinutes => &[1, 2, 3, 5, 10, 15, 30, 60],
+            Setting::RunnerIdleCpuSeconds => &[0, 50, 100, 200, 500, 1000, 3000],
             Setting::FleetSeconds => &[10, 15, 20, 30, 45, 60, 90, 120, 300, 600],
             Setting::PipelineSeconds => &[5, 10, 15, 20, 30, 60, 120, 300],
             Setting::Ascii => &[0, 1],
+        }
+    }
+
+    /// A value as written: `30`, or `2.5` for a decimal setting.
+    pub fn show(self, v: u64) -> String {
+        if self.scale() == 1 {
+            return v.to_string();
+        }
+        let text = format!("{:.2}", v as f64 / self.scale() as f64);
+        // Keep one decimal: 2.0, 2.5, 1.25.
+        let trimmed = text.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            format!("{trimmed}0")
+        } else {
+            trimmed.into()
         }
     }
 
@@ -160,6 +205,10 @@ impl Setting {
             Setting::StaleMinutes => s.stale_minutes,
             Setting::ParkedMinutes => s.parked_minutes,
             Setting::WaitGraceMinutes => s.wait_grace_minutes,
+            Setting::RunnerSilentMinutes => s.runner_silent_minutes,
+            Setting::RunnerOverdueFactor => s.runner_overdue_hundredths,
+            Setting::RunnerPickupMinutes => s.runner_pickup_minutes,
+            Setting::RunnerIdleCpuSeconds => s.runner_idle_cpu_hundredths,
             Setting::FleetSeconds => s.fleet_seconds,
             Setting::PipelineSeconds => s.pipeline_seconds,
             Setting::Ascii => s.ascii as u64,
@@ -171,6 +220,10 @@ impl Setting {
             Setting::StaleMinutes => s.stale_minutes = v,
             Setting::ParkedMinutes => s.parked_minutes = v,
             Setting::WaitGraceMinutes => s.wait_grace_minutes = v,
+            Setting::RunnerSilentMinutes => s.runner_silent_minutes = v,
+            Setting::RunnerOverdueFactor => s.runner_overdue_hundredths = v,
+            Setting::RunnerPickupMinutes => s.runner_pickup_minutes = v,
+            Setting::RunnerIdleCpuSeconds => s.runner_idle_cpu_hundredths = v,
             Setting::FleetSeconds => s.fleet_seconds = v,
             Setting::PipelineSeconds => s.pipeline_seconds = v,
             Setting::Ascii => s.ascii = v != 0,
@@ -188,6 +241,12 @@ pub struct Settings {
     pub stale_minutes: u64,
     pub parked_minutes: u64,
     pub wait_grace_minutes: u64,
+    pub runner_silent_minutes: u64,
+    /// The runner overdue factor, in hundredths.
+    pub runner_overdue_hundredths: u64,
+    pub runner_pickup_minutes: u64,
+    /// The runner idle CPU allowance in seconds, in hundredths.
+    pub runner_idle_cpu_hundredths: u64,
     pub fleet_seconds: u64,
     pub pipeline_seconds: u64,
     pub ascii: bool,
@@ -195,12 +254,17 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        let runner = RunnerThresholds::default();
         Settings {
             hidden_panels: BTreeSet::new(),
             hidden_usage: BTreeSet::new(),
             stale_minutes: 30,
             parked_minutes: (Thresholds::DEFAULT_PARKED_SECS / 60) as u64,
             wait_grace_minutes: (Thresholds::DEFAULT_WAIT_GRACE_SECS / 60) as u64,
+            runner_silent_minutes: (runner.silent_secs / 60) as u64,
+            runner_overdue_hundredths: (runner.overdue_factor * 100.0).round() as u64,
+            runner_pickup_minutes: (runner.pickup_secs / 60) as u64,
+            runner_idle_cpu_hundredths: runner.idle_cpu_ms / 10,
             fleet_seconds: 60,
             pipeline_seconds: 15,
             ascii: false,
@@ -214,6 +278,15 @@ impl Settings {
             stale_secs: self.stale_minutes as i64 * 60,
             parked_secs: self.parked_minutes as i64 * 60,
             wait_grace_secs: self.wait_grace_minutes as i64 * 60,
+        }
+    }
+
+    pub fn runner_thresholds(&self) -> RunnerThresholds {
+        RunnerThresholds {
+            silent_secs: self.runner_silent_minutes as i64 * 60,
+            overdue_factor: self.runner_overdue_hundredths as f64 / 100.0,
+            pickup_secs: self.runner_pickup_minutes as i64 * 60,
+            idle_cpu_ms: self.runner_idle_cpu_hundredths * 10,
         }
     }
 
@@ -414,9 +487,24 @@ fn scalars(section: &str, table: &dyn TableLike, s: &mut Settings, problems: &mu
             continue;
         }
         let (lo, hi) = setting.range();
-        match item.as_integer() {
-            Some(n) if n >= lo as i64 && n <= hi as i64 => setting.set(s, n as u64),
-            _ => problems.push(format!("{name} must be a whole number from {lo} to {hi}")),
+        let scale = setting.scale();
+        // A decimal setting takes a whole number too; a whole one does not
+        // take a decimal.
+        let value = match (item.as_integer(), item.as_float()) {
+            (Some(n), _) => Some(n as f64 * scale as f64),
+            (None, Some(f)) if scale > 1 => Some((f * scale as f64).round()),
+            _ => None,
+        };
+        match value {
+            Some(v) if v.is_finite() && v >= lo as f64 && v <= hi as f64 => {
+                setting.set(s, v as u64)
+            }
+            _ => problems.push(format!(
+                "{name} must be a {} from {} to {}",
+                if scale > 1 { "number" } else { "whole number" },
+                setting.show(lo),
+                setting.show(hi)
+            )),
         }
     }
 }
@@ -453,6 +541,8 @@ pub fn render(existing: Option<&str>, s: &Settings) -> Result<String, String> {
     for setting in Setting::ALL {
         let v = if setting.is_bool() {
             Value::from(setting.get(s) != 0)
+        } else if setting.scale() > 1 {
+            Value::from(setting.get(s) as f64 / setting.scale() as f64)
         } else {
             Value::from(setting.get(s) as i64)
         };
@@ -693,6 +783,37 @@ accent = \"cyan\"
         let bad = parse("[usage]\nhidden = [\"copilot/\", \"\", \"claude/five_hour\"]\n");
         assert_eq!(bad.problems.len(), 2);
         assert!(bad.settings.usage_hidden("claude", "five_hour"));
+    }
+
+    #[test]
+    fn runner_thresholds_take_decimals() {
+        let l = parse(
+            "[thresholds]\nrunner_silent_minutes = 15\nrunner_overdue_factor = 2.5\nrunner_idle_cpu_seconds = 3\nrunner_pickup_minutes = 1.5\n",
+        );
+        assert_eq!(
+            l.problems,
+            ["thresholds.runner_pickup_minutes must be a whole number from 1 to 1440"]
+        );
+        let r = l.settings.runner_thresholds();
+        assert_eq!(r.silent_secs, 15 * 60);
+        assert_eq!(r.overdue_factor, 2.5);
+        assert_eq!(r.idle_cpu_ms, 3000);
+        assert_eq!(r.pickup_secs, 5 * 60, "the bad value is ignored");
+        assert_eq!(
+            Settings::default().runner_thresholds(),
+            RunnerThresholds::default()
+        );
+        let text = render(None, &l.settings).unwrap();
+        assert!(text.contains("runner_overdue_factor = 2.5\n"), "{text}");
+        assert!(text.contains("runner_idle_cpu_seconds = 3.0\n"), "{text}");
+        assert_eq!(parse(&text).settings, l.settings);
+        let low = parse("[thresholds]\nrunner_overdue_factor = 0.5\n");
+        assert_eq!(
+            low.problems,
+            ["thresholds.runner_overdue_factor must be a number from 1.0 to 100.0"]
+        );
+        assert_eq!(Setting::RunnerOverdueFactor.show(125), "1.25");
+        assert_eq!(Setting::RunnerOverdueFactor.step(200, true), Some(250));
     }
 
     #[test]

@@ -107,6 +107,12 @@ pub fn local(epoch: i64) -> LocalTime {
     }
 }
 
+/// Unix time of the local midnight that starts the day of `epoch`.
+pub fn start_of_day(epoch: i64) -> i64 {
+    let t = local(epoch);
+    epoch - (t.hour * 3600 + t.min * 60 + t.sec) as i64
+}
+
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 /// `HH:MM:SS` in local time.

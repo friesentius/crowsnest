@@ -29,6 +29,7 @@ pub fn action(code: KeyCode, mods: KeyModifiers, menu: bool) -> Option<Action> {
         KeyCode::Char('r') => Action::Refresh,
         KeyCode::Char('p') => Action::Pause,
         KeyCode::Char('?') => Action::Help,
+        KeyCode::Tab | KeyCode::BackTab => Action::Focus,
         KeyCode::Char('q') => Action::Quit,
         _ => return None,
     })
@@ -70,7 +71,7 @@ mod tests {
         assert_eq!(key(KeyCode::F(2), false), Some(Action::Options));
         assert_eq!(key(KeyCode::Left, false), Some(Action::Collapse));
         assert_eq!(key(KeyCode::Char('q'), false), Some(Action::Quit));
-        assert_eq!(key(KeyCode::Tab, false), None);
+        assert_eq!(key(KeyCode::Tab, false), Some(Action::Focus));
     }
 
     #[test]

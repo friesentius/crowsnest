@@ -5,6 +5,7 @@
 //! never a grey that may vanish on a light background. Every colour is paired
 //! with a glyph and a word, so `NO_COLOR` loses no information.
 
+use crate::lanes::Verdict;
 use crate::model::{CheckState, StepStatus, WorkerState};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
@@ -127,6 +128,28 @@ impl Theme {
             CheckState::Queued => (if a { "o" } else { "\u{25cb}" }, self.fg(Color::Yellow)),
             CheckState::Skipped => ("-", self.dim()),
         }
+    }
+
+    /// A runner verdict's glyph and colour.
+    pub fn verdict(&self, v: Verdict) -> (&'static str, Style) {
+        match v {
+            Verdict::Down | Verdict::Stalled | Verdict::NotPickingUp => {
+                (self.g("\u{2717}", "x"), self.bad())
+            }
+            Verdict::Slow => (self.warn_glyph(), self.warn()),
+            Verdict::Moving => (self.g("\u{25d0}", "*"), self.fg(Color::Cyan)),
+            Verdict::Idle => (self.idle(), self.dim()),
+        }
+    }
+
+    pub fn arrow(&self) -> &'static str {
+        self.g("\u{2192}", "->")
+    }
+    pub fn corner(&self) -> &'static str {
+        self.g("\u{2514}", "`")
+    }
+    pub fn ok_glyph(&self) -> &'static str {
+        self.g("\u{2713}", "v")
     }
 
     pub fn g(&self, unicode: &'static str, ascii: &'static str) -> &'static str {

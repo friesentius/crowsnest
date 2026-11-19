@@ -1,12 +1,15 @@
 ---
 source: tests/render.rs
-assertion_line: 920
+assertion_line: 1308
 expression: term.backend()
 ---
-"╭ ²RUNNERS ────────────────────────────────────────────────────────────────────────────────────────╮"
-"│ ● pantry   busy 14m                                                                              │"
-"│ ○ bookshop idle                                                                                  │"
-"│ pantry ◐ Unit + e2e tests 8m                                                                     │"
+"╭ ²RUNNERS ✓ all moving ────────────────────────────────────────────────────────────────── queue 1 ╮"
+"│ ◐ pantry    ✓ moving · online                                                              q1 6m │"
+"│   ◐ Unit + e2e tests #122                                                     8m ━━──────── ~40m │"
+"│     step 4/9 setup-node 8m · out 1s ago                                                          │"
+"│   ○ Lint & typecheck #124                                                        wait 6m → 14:58 │"
+"│ ○ bookshop  idle · online ?                                                                      │"
+"│     Tab focus · ↑↓ runner · Enter detail                                                         │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
 "╭ ³HOST ───────────────────────────────────────────────────────────────────────────────────────────╮"
 "│ load 3.42 2.95 2.71  16 cpu                                                                      │"
@@ -30,10 +33,7 @@ expression: term.backend()
 "│ ⚑ bookshop-vps-shared-deploy                                                                  4d │"
 "│ ⚑ pantry-storage-r2                                                                           4d │"
 "│ ⚑ brand-direction-later                                                                       3d │"
-"│ ⚑ notes-macros-later                                                                          1d │"
-"│ ⚑ pantry-sitemap-cache                                                                        1d │"
+"│ +2 more                                                                                          │"
 "│ answer these in chat with firstmate                                                              │"
-"│                                                                                                  │"
-"│                                                                                                  │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
-" ↑↓  select  f  filter  o  options  ?  help  q  quit          hidden ¹roster  nm 9s gh 25s quota 2m "
+" ↑↓  select  ⏎  detail  tab  runners  ?  help  q  quit        hidden ¹roster  nm 9s gh 25s quota 2m "

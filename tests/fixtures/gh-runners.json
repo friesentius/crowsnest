@@ -1,0 +1,19 @@
+{
+  "total_count": 1,
+  "runners": [
+    {
+      "id": 21,
+      "name": "pantry-local-runner",
+      "os": "Linux",
+      "status": "online",
+      "busy": true,
+      "version": "2.338.2",
+      "labels": [
+        { "id": 0, "name": "self-hosted", "type": "read-only" },
+        { "id": 0, "name": "Linux", "type": "read-only" },
+        { "id": 0, "name": "X64", "type": "read-only" },
+        { "id": 0, "name": "pantry", "type": "custom" }
+      ]
+    }
+  ]
+}

@@ -16,7 +16,10 @@
       "labels": [
         "self-hosted",
         "pantry"
-      ]
+      ],
+      "run_attempt": 1,
+      "head_sha": "80015de3c2b1a09f8e7d6c5b4a39281706f5e4d3",
+      "steps": []
     },
     {
       "id": 135607304433,
@@ -33,7 +36,10 @@
       "labels": [
         "self-hosted",
         "pantry"
-      ]
+      ],
+      "run_attempt": 1,
+      "head_sha": "80015de3c2b1a09f8e7d6c5b4a39281706f5e4d3",
+      "steps": []
     },
     {
       "id": 135607304592,
@@ -50,7 +56,10 @@
       "labels": [
         "self-hosted",
         "pantry"
-      ]
+      ],
+      "run_attempt": 1,
+      "head_sha": "80015de3c2b1a09f8e7d6c5b4a39281706f5e4d3",
+      "steps": []
     },
     {
       "id": 135607304630,
@@ -67,6 +76,82 @@
       "labels": [
         "self-hosted",
         "pantry"
+      ],
+      "run_attempt": 1,
+      "head_sha": "80015de3c2b1a09f8e7d6c5b4a39281706f5e4d3",
+      "steps": [
+        {
+          "name": "Set up job",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 1,
+          "started_at": "2026-11-19T14:18:34Z",
+          "completed_at": "2026-11-19T14:18:36Z"
+        },
+        {
+          "name": "Initialize containers",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 2,
+          "started_at": "2026-11-19T14:18:36Z",
+          "completed_at": "2026-11-19T14:18:44Z"
+        },
+        {
+          "name": "Run actions/checkout@v4",
+          "status": "completed",
+          "conclusion": "success",
+          "number": 3,
+          "started_at": "2026-11-19T14:18:44Z",
+          "completed_at": "2026-11-19T14:18:45Z"
+        },
+        {
+          "name": "Run actions/setup-node@v4",
+          "status": "in_progress",
+          "conclusion": null,
+          "number": 4,
+          "started_at": "2026-11-19T14:18:45Z",
+          "completed_at": null
+        },
+        {
+          "name": "Install dependencies",
+          "status": "queued",
+          "conclusion": null,
+          "number": 5,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Unit tests",
+          "status": "queued",
+          "conclusion": null,
+          "number": 6,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Playwright e2e",
+          "status": "queued",
+          "conclusion": null,
+          "number": 7,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Post Run actions/setup-node@v4",
+          "status": "queued",
+          "conclusion": null,
+          "number": 8,
+          "started_at": null,
+          "completed_at": null
+        },
+        {
+          "name": "Complete job",
+          "status": "queued",
+          "conclusion": null,
+          "number": 9,
+          "started_at": null,
+          "completed_at": null
+        }
       ]
     }
   ]

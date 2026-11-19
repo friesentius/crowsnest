@@ -5,11 +5,11 @@
 use crowsnest::app::{Action, App, all_rows};
 use crowsnest::config::{Overrides, Panel, Setting, Settings};
 use crowsnest::model::{
-    Check, CheckState, Disk, Freshness, Host, LastEvent, PrChecks, QuotaWindow, Runner, Snapshot,
-    StaleKind, Thresholds, Worker, WorkerState,
+    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, PrChecks, QuotaWindow, RepoHistory,
+    RepoRunners, RunInfo, Runner, Service, Snapshot, StaleKind, Thresholds, Worker, WorkerState,
 };
 use crowsnest::options::Category;
-use crowsnest::sources::{fleet, gh, nm, quota};
+use crowsnest::sources::{fleet, gh, history, nm, quota};
 use crowsnest::timefmt::parse_iso;
 use crowsnest::ui::{self, View, theme::Theme};
 use ratatui::Terminal;
@@ -74,23 +74,69 @@ fn snapshot() -> Snapshot {
     {
         s.prs.insert(pr.url.clone(), pr);
     }
-    let started = parse_iso("2026-11-19T14:12:51Z");
     s.runners = vec![
-        Runner {
-            name: "pantry-local-runner".into(),
-            dir: "/srv/actions-runner-pantry".into(),
-            repo: Some("acme/pantry".into()),
-            busy: true,
-            busy_secs: started.map(|t| now - t),
-        },
+        pantry_runner(now),
         Runner {
             name: "bookshop-runner".into(),
             dir: "/srv/actions-runner-bookshop".into(),
             repo: Some("acme/bookshop".into()),
+            scanned_at: Some(now - 3),
+            listener_secs: Some(16 * 86_400),
+            idle_since: Some(now - 3 * 3600),
+            runner_log_at: Some(now - 20),
             ..Default::default()
         },
     ];
-    s.jobs = gh::parse_jobs("acme/pantry", &fixture("gh-jobs.json")).unwrap();
+    let run = gh::parse_runs(&fixture("gh-runs.json")).unwrap().remove(0);
+    let mut jobs = gh::parse_jobs("acme/pantry", &fixture("gh-jobs.json")).unwrap();
+    for j in &mut jobs {
+        j.run = Some(run.clone());
+    }
+    // The release PR's lint waits behind the running unit tests.
+    jobs.push(queued_job(
+        "Lint & typecheck",
+        release_run(),
+        parse_iso("2026-11-19T14:20:10Z"),
+    ));
+    let mut cache = history::RepoCache::default();
+    for run in gh::parse_runs(&fixture("gh-runs-completed.json")).unwrap() {
+        let mut js =
+            gh::parse_jobs("acme/pantry", &fixture(&format!("gh-jobs-{}.json", run.id))).unwrap();
+        for j in &mut js {
+            j.run = Some(run.clone());
+        }
+        cache.insert(run, js);
+    }
+    let finished: Vec<Job> = jobs
+        .iter()
+        .filter(|j| j.status == "completed")
+        .cloned()
+        .collect();
+    s.history
+        .insert("acme/pantry".into(), cache.summary(&finished));
+    s.history
+        .insert("acme/bookshop".into(), RepoHistory::default());
+    s.jobs = jobs
+        .into_iter()
+        .filter(|j| j.status != "completed")
+        .collect();
+    s.jobs_read_at = Some(now - 25);
+    s.gh_runners.insert(
+        "acme/pantry".into(),
+        RepoRunners {
+            read_at: Some(now - 25),
+            runners: gh::parse_runners(&fixture("gh-runners.json")).unwrap(),
+            ..Default::default()
+        },
+    );
+    s.gh_runners.insert(
+        "acme/bookshop".into(),
+        RepoRunners {
+            read_at: Some(now - 25),
+            denied: true,
+            ..Default::default()
+        },
+    );
     s.quota = quota::parse(&fixture("quota.json")).unwrap();
     s.host = Some(Host {
         name: "deckhand".into(),
@@ -130,6 +176,64 @@ fn snapshot() -> Snapshot {
         );
     }
     s
+}
+
+/// The pantry runner, 8m into the unit tests of run #309, writing output.
+fn pantry_runner(now: i64) -> Runner {
+    let started = parse_iso("2026-11-19T14:18:34Z").unwrap();
+    Runner {
+        name: "pantry-local-runner".into(),
+        dir: "/srv/actions-runner-pantry".into(),
+        repo: Some("acme/pantry".into()),
+        busy: true,
+        busy_secs: Some(now - 3 - started),
+        scanned_at: Some(now - 3),
+        listener_secs: Some(16 * 86_400 + 3 * 3600),
+        runner_log_at: Some(now - 32),
+        worker_log_at: Some(now - 4),
+        step_output_at: Some(now - 1),
+        unit: Some("actions-runner-pantry.service".into()),
+        service: Some(Service {
+            active: "active".into(),
+            sub: "running".into(),
+            restarts: Some(2),
+            error: None,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Run #310, the pantry release PR.
+fn release_run() -> RunInfo {
+    RunInfo {
+        id: 44_541_002_310,
+        attempt: 1,
+        workflow: "CI".into(),
+        number: 310,
+        event: "pull_request".into(),
+        title: "Pantry release 0.4.0".into(),
+        branch: "dev".into(),
+        sha: "c41d07be93a8f2e6d5c4b3a291807f6e5d4c3b2a".into(),
+        pr: Some(124),
+        base: Some("main".into()),
+        created_at: parse_iso("2026-11-19T14:20:08Z"),
+    }
+}
+
+fn queued_job(name: &str, run: RunInfo, created: Option<i64>) -> Job {
+    Job {
+        repo: "acme/pantry".into(),
+        name: name.into(),
+        status: "queued".into(),
+        branch: run.branch.clone(),
+        id: 135_700_000_000 + name.len() as u64,
+        run_id: run.id,
+        workflow: run.workflow.clone(),
+        created_at: created,
+        labels: vec!["self-hosted".into(), "pantry".into()],
+        run: Some(run),
+        ..Default::default()
+    }
 }
 
 fn draw(snap: &Snapshot, app: &App, w: u16, h: u16) -> Terminal<TestBackend> {
@@ -726,59 +830,334 @@ fn stalled_detail_shows_the_parked_gate() {
     assert!(text.contains("declared wait until 13:20"), "{text}");
 }
 
-/// The narrowest width that draws the job list (below it the panel shows counts only).
-const WIDE_MIN: u16 = ui::WIDE;
+// ---------------------------------------------------------------------------
+// Runner lanes: one lane per runner, its verdict in the panel title, and the
+// detail view a selected runner opens.
+// ---------------------------------------------------------------------------
 
-fn job(repo: &str, name: &str, status: &str) -> crowsnest::model::Job {
-    crowsnest::model::Job {
-        repo: repo.into(),
-        name: name.into(),
-        status: status.into(),
-        started_at: (status == "in_progress").then_some(0),
+/// Four runners: pantry busy and moving with a queue, bookshop idle,
+/// millwork reported offline by GitHub, and larder past twice its typical
+/// time while still writing output.
+fn fleet_of_runners() -> Snapshot {
+    let mut s = snapshot();
+    let now = s.now;
+    let mut millwork = Runner {
+        name: "millwork-runner".into(),
+        dir: "/srv/actions-runner-millwork".into(),
+        repo: Some("acme/millwork".into()),
+        scanned_at: Some(now - 3),
+        listener_secs: Some(2 * 86_400),
+        idle_since: Some(now - 40 * 60),
         ..Default::default()
-    }
+    };
+    let mut larder = pantry_runner(now);
+    larder.name = "larder-runner".into();
+    larder.dir = "/srv/actions-runner-larder".into();
+    larder.repo = Some("acme/larder".into());
+    larder.busy_secs = Some(52 * 60);
+    larder.unit = None;
+    larder.service = None;
+    let mut slow = queued_job("Build docs site", release_run(), Some(now - 53 * 60));
+    slow.repo = "acme/larder".into();
+    slow.status = "in_progress".into();
+    slow.runner = Some("larder-runner".into());
+    slow.started_at = Some(now - 3 - 52 * 60);
+    slow.run.as_mut().unwrap().title = "Larder docs refresh".into();
+    slow.run.as_mut().unwrap().pr = Some(41);
+    s.jobs.push(slow);
+    s.history.insert(
+        "acme/larder".into(),
+        RepoHistory {
+            typical: vec![crowsnest::model::Typical {
+                workflow: "CI".into(),
+                job: "Build docs site".into(),
+                step: None,
+                secs: 21 * 60,
+                samples: 6,
+            }],
+            ..Default::default()
+        },
+    );
+    s.gh_runners.insert(
+        "acme/millwork".into(),
+        RepoRunners {
+            read_at: Some(now - 25),
+            runners: vec![crowsnest::model::GhRunner {
+                name: "millwork-runner".into(),
+                status: "offline".into(),
+                version: "2.338.2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    millwork.runner_log_at = Some(now - 41 * 60);
+    s.runners.push(millwork);
+    s.runners.push(larder);
+    s
+}
+
+/// The quiet fleet, but pantry is 24m into its unit tests and the
+/// setup-node step has written nothing for 14 minutes.
+fn stalled_runner() -> Snapshot {
+    let mut s = snapshot();
+    let now = s.now;
+    let r = &mut s.runners[0];
+    r.busy_secs = Some(24 * 60 - 3);
+    r.step_output_at = Some(now - 14 * 60);
+    r.worker_log_at = Some(now - 6);
+    // Its processes have used under a CPU-second since the output stopped:
+    // a hung download, not a quiet test.
+    r.job_cpu = vec![
+        (now - 20 * 60, 41_000),
+        (now - 10 * 60, 41_300),
+        (now, 41_700),
+    ];
+    let unit = &mut s.jobs[0];
+    unit.started_at = Some(now - 24 * 60);
+    unit.steps[3].started_at = Some(now - 23 * 60);
+    s
+}
+
+/// The same silence, but the job's processes are busy: a quiet test suite.
+fn quiet_runner() -> Snapshot {
+    let mut s = stalled_runner();
+    let now = s.now;
+    s.runners[0].job_cpu = vec![
+        (now - 20 * 60, 41_000),
+        (now - 10 * 60, 201_000),
+        (now, 380_000),
+    ];
+    s
 }
 
 #[test]
-fn every_runner_job_names_its_project_and_is_grouped_by_repo() {
+fn a_quiet_job_whose_processes_work_is_not_stalled() {
     utc();
-    let mut s = snapshot();
-    s.now = 120;
-    // Interleaved on purpose: grouping must not depend on arrival order.
-    s.jobs = vec![
-        job("acme/pantry", "Lint & typecheck", "queued"),
-        job("acme/bookshop", "Release build", "queued"),
-        job("acme/pantry", "Fresh-clone setup", "queued"),
-        job("acme/pantry", "Unit tests", "in_progress"),
-    ];
-    for w in [WIDE_MIN, 180] {
-        let term = draw(&s, &app_for(&s), w, 44);
-        let text = term.backend().to_string();
-        let lines: Vec<&str> = text.lines().collect();
-        let pos = |needle: &str| {
-            lines
-                .iter()
-                .position(|l| l.contains(needle))
-                .unwrap_or_else(|| panic!("{needle} missing at {w}:\n{text}"))
-        };
-        let unit = pos("pantry \u{25d0} Unit tests");
-        let lint = pos("pantry \u{25cb} queued Lint & typecheck");
-        let fresh = pos("pantry \u{25cb} queued Fresh-clone setup");
-        let release = pos("bookshop \u{25cb} queued Release build");
-        assert!(unit < lint && lint < fresh && fresh < release, "{text}");
-        // Truncation eats the job name, never the project label.
-        let mut long_snap = s.clone();
-        long_snap.jobs[0].name = "A very long job name that cannot possibly fit the panel".into();
-        let long = draw(&long_snap, &app_for(&long_snap), w, 44)
-            .backend()
-            .to_string();
-        let row = long
-            .lines()
-            .find(|l| l.contains("A very long"))
-            .unwrap_or_else(|| panic!("long job missing at {w}:\n{long}"));
-        assert!(row.contains("pantry \u{25cb} queued A very long"), "{row}");
-        assert!(!row.contains("fit the panel"), "not truncated: {row}");
+    let s = quiet_runner();
+    let text = draw_light(&s, &app_for(&s), 180, 44);
+    assert!(text.contains("RUNNERS \u{2713} all moving"), "{text}");
+    assert!(text.contains("quiet 14m, cpu busy"), "{text}");
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let text = draw_light(&s, &app, 180, 44);
+    assert!(
+        text.contains("quiet 14m, job processes busy (2m59s CPU in 10m)"),
+        "{text}"
+    );
+    assert!(text.contains("quiet, not hung"), "{text}");
+}
+
+fn draw_light(snap: &Snapshot, app: &App, w: u16, h: u16) -> String {
+    draw(snap, app, w, h).backend().to_string()
+}
+
+fn lines_with<'a>(text: &'a str, needle: &str) -> Vec<&'a str> {
+    text.lines().filter(|l| l.contains(needle)).collect()
+}
+
+#[test]
+fn a_busy_runner_shows_its_job_progress_and_queue() {
+    utc();
+    let s = snapshot();
+    let text = draw_light(&s, &app_for(&s), 180, 44);
+    assert!(text.contains("RUNNERS \u{2713} all moving"), "{text}");
+    let head = lines_with(&text, "\u{25d0} pantry")[0];
+    assert!(head.contains("\u{2713} moving \u{b7} online"), "{head}");
+    assert!(head.contains("q1 6m"), "{head}");
+    assert!(
+        text.contains("\u{25d0} Unit + e2e tests #122"),
+        "the running job, with its PR:\n{text}"
+    );
+    assert!(
+        text.contains("8m \u{2501}\u{2501}"),
+        "elapsed then a bar:\n{text}"
+    );
+    assert!(text.contains("~40m"), "the typical time:\n{text}");
+    assert!(
+        text.contains("step 4/9 setup-node 8m \u{b7} out 1s ago"),
+        "{text}"
+    );
+    // The release PR's lint waits its turn, with an estimated start: the
+    // unit tests typically end 40m after 14:18:34.
+    assert!(
+        text.contains("\u{25cb} Lint & typecheck #124") && text.contains("wait 6m \u{2192} 14:58"),
+        "{text}"
+    );
+    // The idle runner says when it last ran, and that GitHub would not say
+    // whether it is online.
+    let idle = lines_with(&text, "\u{25cb} bookshop")[0];
+    assert!(idle.contains("idle \u{b7} online ?"), "{idle}");
+}
+
+#[test]
+fn the_narrow_panel_keeps_the_verdict_and_the_next_start() {
+    utc();
+    let s = snapshot();
+    let text = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(text.contains("RUNNERS \u{2713} moving"), "{text}");
+    assert!(text.contains("q1 \u{256e}"), "{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    let pantry = lines
+        .iter()
+        .position(|l| l.contains("\u{25d0} pantry"))
+        .unwrap();
+    assert!(
+        lines[pantry].contains("\u{2713} moving 8m/40m"),
+        "{}",
+        lines[pantry]
+    );
+    // Its queue sits right under it, never under another runner.
+    assert!(
+        lines[pantry + 1].contains("\u{2514} Lint wait 6m \u{2192} 14:58"),
+        "{}",
+        lines[pantry + 1]
+    );
+    assert!(lines[pantry + 2].contains("\u{25cb} bookshop idle"));
+}
+
+#[test]
+fn a_silent_runner_is_stalled_in_the_panel_title() {
+    utc();
+    let s = stalled_runner();
+    for (w, h) in [(100u16, 34u16), (180, 44)] {
+        let text = draw_light(&s, &app_for(&s), w, h);
+        assert!(text.contains("RUNNERS \u{2717} 1 stalled"), "{w}:\n{text}");
+        let head = lines_with(&text, "\u{2717} pantry")[0];
+        assert!(head.contains("STALLED"), "{head}");
+        assert!(text.contains("silent 14m"), "{w}:\n{text}");
     }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let detail = draw_light(&s, &app, 180, 44);
+    assert!(
+        detail.contains("silent 14m (limit 10m), job processes idle (400ms CPU in 10m)"),
+        "{detail}"
+    );
+    let wide = draw_light(&s, &app_for(&s), 180, 44);
+    assert!(wide.contains("wait 6m blocked"), "{wide}");
+    // Stalled runners do not count in the roster's stale count yet.
+    assert!(row_text(&draw(&s, &app_for(&s), 180, 44), "asking you").contains("1 asking you"));
+    assert!(!row_text(&draw(&s, &app_for(&s), 180, 44), "asking you").contains("stale"));
+}
+
+#[test]
+fn offline_and_slow_runners_are_called_out() {
+    utc();
+    let s = fleet_of_runners();
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(text.contains("RUNNERS \u{2717} 1 stalled"), "{text}");
+    let down = lines_with(&text, "millwork")[0];
+    assert!(
+        down.contains("\u{2717} millwork") && down.contains("DOWN \u{b7} offline"),
+        "{down}"
+    );
+    let slow = lines_with(&text, "\u{25b2} larder")[0];
+    assert!(slow.contains("SLOW"), "{slow}");
+    assert!(text.contains("52m \u{2501}"), "{text}");
+    // Without the offline runner the worst is the slow one.
+    let mut s2 = s.clone();
+    s2.gh_runners.remove("acme/millwork");
+    let text = draw_light(&s2, &app_for(&s2), 180, 50);
+    assert!(text.contains("RUNNERS \u{25b2} 1 slow"), "{text}");
+}
+
+/// Tab to the runner panel, down to `name`, and Enter its detail.
+fn open_runner(s: &Snapshot, app: &mut App, name: &str) {
+    let keys = crowsnest::app::runner_keys(s);
+    app.apply(Action::Focus, s);
+    while s.runners[app.runner_index(&keys).unwrap()].name != name {
+        app.apply(Action::Down, s);
+    }
+    app.apply(Action::Toggle, s);
+}
+
+#[test]
+fn enter_on_a_runner_opens_its_detail() {
+    utc();
+    let s = snapshot();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let text = draw_light(&s, &app, 100, 34);
+    for needle in [
+        "RUNNER pantry-local-runner \u{b7} acme/pantry",
+        "Esc back",
+        "VERDICT  \u{2713} moving  Unit is 8m into a job that usually takes 40m",
+        "NOW      CI #309 \u{b7} pull_request \u{b7} #122 fix: per-account",
+        "Unit + e2e tests   8m of ~40m",
+        "\u{25d0} 4 setup-node 8m (typ 10m20s)",
+        "5-9 pending",
+        "QUEUE    \u{25cb} Lint & typecheck",
+        "next to start ~14:58 when Unit ends",
+        "RECENT",
+        "HEALTH   listener \u{25cf} up 16d",
+        "GitHub online   v2.338.2   labels self-hosted Linux X64 pantry",
+        "service actions-runner-pantry.service active, 2 restarts",
+    ] {
+        assert!(text.contains(needle), "{needle:?} missing:\n{text}");
+    }
+    // Esc goes back to the panel.
+    app.apply(Action::Collapse, &s);
+    let text = draw_light(&s, &app, 100, 34);
+    assert!(!text.contains("Esc back"), "{text}");
+    assert!(text.contains("tab  roster"), "{text}");
+}
+
+#[test]
+fn the_detail_degrades_without_admin_read_or_a_unit() {
+    utc();
+    let s = snapshot();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "bookshop-runner");
+    let text = draw_light(&s, &app, 100, 34);
+    assert!(
+        text.contains("VERDICT  \u{25cb} idle  Idle, nothing queued."),
+        "{text}"
+    );
+    assert!(
+        text.contains("GitHub online ? (reading runners needs repo admin)"),
+        "{text}"
+    );
+    assert!(text.contains("service not known"), "{text}");
+}
+
+#[test]
+fn runner_lanes_100() {
+    utc();
+    let s = fleet_of_runners();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn runner_lanes_180() {
+    utc();
+    let s = fleet_of_runners();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
+}
+
+#[test]
+fn runner_stalled_180() {
+    utc();
+    let s = stalled_runner();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 44).backend());
+}
+
+#[test]
+fn runner_detail_100() {
+    utc();
+    let s = snapshot();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    insta::assert_snapshot!(draw(&s, &app, 100, 34).backend());
+}
+
+#[test]
+fn runner_detail_stalled_180() {
+    utc();
+    let s = stalled_runner();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    insta::assert_snapshot!(draw(&s, &app, 180, 44).backend());
 }
 
 /// An app with `settings`, opened on the options menu at `category` when

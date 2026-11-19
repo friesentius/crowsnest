@@ -1,6 +1,6 @@
 ---
 source: tests/render.rs
-assertion_line: 829
+assertion_line: 1208
 expression: "draw(&s, &app, 100, 40).backend()"
 ---
 "╭ ¹crowsnest firstmate @ deckhand ────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮"
@@ -42,4 +42,4 @@ expression: "draw(&s, &app, 100, 40).backend()"
 "│ disk / 61%  /home 78%                          ││ claude Fable week     ━─────  11%  ↻ Sat 01:59 │"
 "│ psi  mem 0.4%  cpu 6.1%                        ││ +2 more windows                                │"
 "╰────────────────────────────────────────────────╯╰────────────────────────────────────────────────╯"
-" ↑↓  select  f  filter  o  options  ?  help  q  quit         hidden ²runners  nm 9s gh 25s quota 2m "
+" ↑↓  select  ⏎  detail  o  options  ?  help  q  quit         hidden ²runners  nm 9s gh 25s quota 2m "
