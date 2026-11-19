@@ -355,7 +355,7 @@ pub fn load(path: &Path) -> Loaded {
         Ok(text) => parse(&text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded::default(),
         Err(e) => Loaded {
-            problems: vec![format!("cannot read {}: {e}", path.display())],
+            problems: vec![format!("cannot read {}: {e}", file_name(path))],
             ..Default::default()
         },
     }
@@ -554,17 +554,49 @@ pub fn render(existing: Option<&str>, s: &Settings) -> Result<String, String> {
     })
 }
 
-/// Set `section.key`, keeping the comments around an existing value.
+/// Set `section.key`. An existing entry that already holds the value is left
+/// exactly as written; a changed one keeps its key, and the comments above
+/// and after it.
 fn set(doc: &mut DocumentMut, section: &str, key: &str, mut value: Value) {
     let entry = doc.entry(section).or_insert_with(toml_edit::table);
     if entry.as_table_like().is_none() {
         *entry = toml_edit::table();
     }
     let table = entry.as_table_like_mut().expect("just made a table");
-    if let Some(old) = table.get(key).and_then(Item::as_value) {
-        *value.decor_mut() = old.decor().clone();
+    match table.get_mut(key) {
+        Some(Item::Value(old)) => {
+            if !same(old, &value) {
+                *value.decor_mut() = old.decor().clone();
+                *old = value;
+            }
+        }
+        Some(item) => *item = Item::Value(value),
+        None => {
+            table.insert(key, Item::Value(value));
+        }
     }
-    table.insert(key, Item::Value(value));
+}
+
+/// Whether two values mean the same, however they are written.
+fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same(p, q))
+        }
+        (Value::String(x), Value::String(y)) => x.value() == y.value(),
+        (Value::Integer(x), Value::Integer(y)) => x.value() == y.value(),
+        (Value::Float(x), Value::Float(y)) => x.value() == y.value(),
+        (Value::Boolean(x), Value::Boolean(y)) => x.value() == y.value(),
+        _ => false,
+    }
+}
+
+/// A path as errors name it: the options menu already shows where it is.
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |n| n.to_string_lossy().into(),
+    )
 }
 
 /// Save `s` to `path`: create the directory and file on first save, keep what
@@ -574,7 +606,7 @@ pub fn save(path: &Path, s: &Settings) -> Result<(), String> {
     let existing = match std::fs::read_to_string(path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        Err(e) => return Err(format!("cannot read {}: {e}", file_name(path))),
     };
     let text = render(existing.as_deref(), s)?;
     if existing.as_deref() == Some(text.as_str()) {
@@ -583,13 +615,14 @@ pub fn save(path: &Path, s: &Settings) -> Result<(), String> {
     let dir = path
         .parent()
         .ok_or_else(|| format!("{} has no directory", path.display()))?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("cannot create the directory for {}: {e}", file_name(path)))?;
     let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)
         .and_then(|()| std::fs::rename(&tmp, path))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("cannot save {}: {e}", path.display())
+            format!("cannot save {}: {e}", file_name(path))
         })
 }
 
@@ -706,6 +739,13 @@ mod tests {
 [thresholds]
 stale_minutes = 20 # quiet fleet
 future_knob = 3
+# a calm gate
+parked_minutes = 15
+
+[usage]
+hidden = [
+  \"copilot/premium_interactions\", # free plan
+]
 
 [display]
 theme = \"amber\"
@@ -727,9 +767,13 @@ theme = \"amber\"
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.starts_with(
-                "# my settings\n[thresholds]\nstale_minutes = 30 # quiet fleet\nfuture_knob = 3\n"
+                "# my settings\n[thresholds]\nstale_minutes = 30 # quiet fleet\nfuture_knob = 3\n# a calm gate\nparked_minutes = 15\n"
             ),
             "{text}"
+        );
+        assert!(
+            text.contains("hidden = [\n  \"copilot/premium_interactions\", # free plan\n]"),
+            "an unchanged list keeps its comments: {text}"
         );
         assert!(text.contains("theme = \"amber\""), "{text}");
         let again = load(&path);

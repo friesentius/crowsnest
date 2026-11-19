@@ -185,9 +185,9 @@ Hiding a usage window is mostly for windows your plan does not have.
 quota-axi reports how much of each window is left, and a window with an allowance of 0 (for example premium interactions on a free plan) is 0 of 0 left, which crowsnest can only show as 100% used.
 
 An unknown key or a value of the wrong type or range is ignored, and the rest of the file still applies.
-The footer says what was ignored (`! config: unknown key display.theme`), and `--once` prints it to stderr.
+The footer says what was ignored (`! config: unknown key display.theme`), help (`?`) lists every ignored entry, and `--once` prints them to stderr.
 A file that is not valid TOML is ignored as a whole and never overwritten; fix it by hand.
-Saving changes only the keys above, so your comments and any other keys stay as they are.
+Saving changes only the keys above that changed, so your comments and any other keys stay as they are; a list crowsnest changes is rewritten, along with any comments inside it.
 
 ## States
 

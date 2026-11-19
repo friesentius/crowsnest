@@ -827,6 +827,12 @@ mod tests {
         app.apply(Action::Change { up: true }, &s);
         assert_eq!(app.settings.parked_minutes, 10);
         assert_eq!(app.thresholds.parked_secs, 180);
+        // Two rows on, the runner stall threshold, also applied at once.
+        app.apply(Action::Down, &s);
+        app.apply(Action::Down, &s);
+        app.apply(Action::Change { up: true }, &s);
+        assert_eq!(app.settings.runner_silent_minutes, 15);
+        assert_eq!(app.runner_thresholds.silent_secs, 15 * 60);
         // Back around to panels, then close.
         app.apply(Action::Category { next: false }, &s);
         app.apply(Action::Category { next: false }, &s);

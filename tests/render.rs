@@ -1361,6 +1361,21 @@ fn config_problems_show_in_the_footer() {
         f.contains("! config: unknown key display.theme (+1 more)"),
         "{f}"
     );
+    let narrow = draw(&s, &app, 100, 34).backend().to_string();
+    let f = narrow.lines().last().unwrap();
+    assert!(
+        f.contains("! config: unknown key display.theme (+1 more)"),
+        "100 columns: {f}"
+    );
+    // Help lists every problem in full.
+    app.help = true;
+    let text = draw(&s, &app, 100, 34).backend().to_string();
+    assert!(text.contains("config.toml entries ignored:"), "{text}");
+    assert!(
+        text.contains("refresh.fleet_seconds must be a whole number from 10 to 3600"),
+        "{text}"
+    );
+    app.help = false;
     app.config.saved = Some((s.now, Some("cannot save /x/config.toml: read-only".into())));
     let f = footer(&app);
     assert!(f.contains("! not saved: cannot save"), "{f}");

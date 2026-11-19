@@ -1272,7 +1272,7 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     let mut right: Vec<Span<'static>> = Vec::new();
     if let Some(note) = config_note(view) {
         right.push(span(
-            format!("{}  ", trunc(&note, (w / 3).max(12))),
+            format!("{}  ", trunc(&note, (w / 2).max(12))),
             t.warn(),
         ));
     }
@@ -1359,6 +1359,19 @@ fn help(view: &View, buf: &mut Buffer, area: Rect) {
             span(v.to_string(), t.plain()),
         ]))
     };
+    // What the config file had wrong comes first: the footer has room for
+    // only one problem.
+    let problems = &view.app.config.problems;
+    if !problems.is_empty() {
+        lines.push(Content::Line(Line::from(span(
+            "config.toml entries ignored:",
+            t.warn(),
+        ))));
+        for p in problems {
+            lines.push(Content::Line(Line::from(span(format!("  {p}"), t.warn()))));
+        }
+        lines.push(Content::Sep);
+    }
     lines.push(key("up/down j/k", "select a worker (g/G: first/last)"));
     lines.push(key("enter / l", "open or close its detail"));
     lines.push(key("esc / h", "close detail"));
