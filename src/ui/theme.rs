@@ -200,15 +200,4 @@ impl Theme {
             self.good()
         }
     }
-
-    /// Bar colour for "remaining" percentages: lower is worse.
-    pub fn remaining(&self, pct: f64) -> Style {
-        if pct < 15.0 {
-            self.bad()
-        } else if pct < 40.0 {
-            self.fg(Color::Yellow)
-        } else {
-            self.good()
-        }
-    }
 }

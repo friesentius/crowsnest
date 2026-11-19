@@ -1204,9 +1204,9 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
         };
         lines.push(Content::Line(Line::from(span(msg, t.dim()))));
     }
-    // Scarcest windows first, so a nearly spent one is never hidden.
+    // Most-used windows first, so a nearly spent one is never hidden.
     let mut q: Vec<&crate::model::QuotaWindow> = q.iter().collect();
-    q.sort_by(|a, b| a.pct_remaining.total_cmp(&b.pct_remaining));
+    q.sort_by(|a, b| b.pct_used.total_cmp(&a.pct_used));
     let n = 6;
     let with_reset = w >= 44;
     let label_w = w
@@ -1227,8 +1227,8 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
             span(rpad(&label, label_w), t.plain()),
             span(" ", Style::new()),
         ];
-        l.extend(bar(t, win.pct_remaining, n, t.remaining(win.pct_remaining)));
-        l.push(span(format!(" {:>3.0}%", win.pct_remaining), t.plain()));
+        l.extend(bar(t, win.pct_used, n, t.used(win.pct_used)));
+        l.push(span(format!(" {:>3.0}%", win.pct_used), t.plain()));
         if let (Some(r), true) = (win.resets_at, with_reset) {
             l.push(span(
                 format!(
