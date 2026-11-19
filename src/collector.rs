@@ -11,10 +11,12 @@
 //! | quota    | 5 min                                                        |
 //!
 //! A tier never overlaps itself, keeps its last good data on failure,
-//! records the failure so the UI can show it, and backs off while it keeps
-//! failing (doubling its interval, up to 5 min).
+//! records the failure so the UI can show it, and backs off while its reads
+//! keep failing outright (doubling its interval, up to 5 min). A read that
+//! succeeded with errors for some items is shown as an error but keeps the
+//! normal cadence.
 
-use crate::model::Snapshot;
+use crate::model::{Freshness, Job, PrChecks, Snapshot};
 use crate::sources::{self, host::HostReader, runners};
 use crate::timefmt::now_epoch;
 use std::path::PathBuf;
@@ -72,16 +74,81 @@ impl Handle {
     }
 }
 
-fn mark(shared: &Shared, tier: &str, result: Result<(), String>) {
-    let mut s = shared.lock().unwrap();
-    let f = s.fresh.entry(tier.to_string()).or_default();
-    match result {
-        Ok(()) => {
-            f.ok_at = Some(now_epoch());
-            f.error = None;
+/// What one attempt of a tier did.
+#[derive(Debug, Clone, PartialEq)]
+enum Read {
+    /// Not due; nothing was read.
+    Skipped,
+    Ok,
+    /// Read, but some items failed. Shown as an error, never backed off.
+    Partial(String),
+    /// Nothing usable was read.
+    Failed(String),
+}
+
+impl Read {
+    /// `Failed` when any outright failure happened, else `Partial` when some
+    /// items failed, else `Ok`.
+    fn from_errors(failed: Vec<String>, partial: Vec<String>) -> Read {
+        if !failed.is_empty() {
+            Read::Failed(
+                failed
+                    .into_iter()
+                    .chain(partial)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        } else if !partial.is_empty() {
+            Read::Partial(partial.join("; "))
+        } else {
+            Read::Ok
         }
-        Err(e) => f.error = Some(e),
     }
+
+    fn record(self, f: &mut Freshness) {
+        match self {
+            Read::Skipped => {}
+            Read::Ok => {
+                f.ok_at = Some(now_epoch());
+                f.error = None;
+            }
+            Read::Partial(e) => {
+                f.ok_at = Some(now_epoch());
+                f.error = Some(e);
+            }
+            Read::Failed(e) => f.error = Some(e),
+        }
+    }
+
+    /// Consecutive outright failures after this attempt.
+    fn failures(&self, before: u32) -> u32 {
+        match self {
+            Read::Skipped => before,
+            Read::Failed(_) => before + 1,
+            Read::Ok | Read::Partial(_) => 0,
+        }
+    }
+}
+
+/// Store a gh read in `s`, keeping the last good data of a part that failed.
+fn apply_gh(
+    s: &mut Snapshot,
+    prs: Result<(Vec<PrChecks>, Vec<String>), String>,
+    jobs: Result<Vec<Job>, String>,
+) -> Read {
+    let (mut failed, mut partial) = (Vec::new(), Vec::new());
+    match prs {
+        Ok((prs, errors)) => {
+            s.prs = prs.into_iter().map(|p| (p.url.clone(), p)).collect();
+            partial = errors;
+        }
+        Err(e) => failed.push(e),
+    }
+    match jobs {
+        Ok(j) => s.jobs = j,
+        Err(e) => failed.push(e),
+    }
+    Read::from_errors(failed, partial)
 }
 
 /// Longest wait between attempts of a failing tier.
@@ -95,17 +162,18 @@ fn backoff(interval: Duration, failures: u32) -> Duration {
 }
 
 /// Run `work` every `interval()`, or at once when woken. Paused tiers only
-/// run when woken explicitly. `work` returns whether it actually read its
-/// source; while the tier's last read failed, the interval backs off.
+/// run when woken explicitly. Each read is recorded and announced on
+/// `changed`; while reads keep failing outright, the interval backs off.
 fn spawn_tier<F, I>(
     tier: &'static str,
     shared: Shared,
+    changed: Sender<()>,
     rx: Receiver<()>,
     paused: Arc<AtomicBool>,
     interval: I,
     mut work: F,
 ) where
-    F: FnMut(bool) -> bool + Send + 'static,
+    F: FnMut(bool) -> Read + Send + 'static,
     I: Fn() -> Duration + Send + 'static,
 {
     thread::spawn(move || {
@@ -115,14 +183,11 @@ fn spawn_tier<F, I>(
         loop {
             let due = last.elapsed() >= backoff(interval(), failures);
             if forced || (!paused.load(Ordering::Relaxed) && due) {
-                if work(forced) {
-                    let failed = shared
-                        .lock()
-                        .unwrap()
-                        .fresh
-                        .get(tier)
-                        .is_some_and(|f| f.error.is_some());
-                    failures = if failed { failures + 1 } else { 0 };
+                let read = work(forced);
+                if read != Read::Skipped {
+                    failures = read.failures(failures);
+                    read.record(shared.lock().unwrap().fresh.entry(tier.into()).or_default());
+                    let _ = changed.send(());
                 }
                 last = Instant::now();
             }
@@ -154,33 +219,33 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
 
     // Host.
     {
-        let (shared, changed) = (shared.clone(), changed.clone());
+        let shared = shared.clone();
         let mut reader = HostReader::new(cfg.disk_paths.clone());
         spawn_tier(
             "host",
             shared.clone(),
+            changed.clone(),
             host_rx,
             paused.clone(),
             || Duration::from_secs(2),
             move |_| {
                 let host = reader.read();
                 shared.lock().unwrap().host = Some(host);
-                mark(&shared, "host", Ok(()));
-                let _ = changed.send(());
-                true
+                Read::Ok
             },
         );
     }
 
     // Runners: directories every minute, processes every 5 s.
     {
-        let (shared, changed, roots) = (shared.clone(), changed.clone(), cfg.runner_roots.clone());
+        let (shared, roots) = (shared.clone(), cfg.runner_roots.clone());
         let mut scan = runners::ProcessScan::new();
         let mut list = Vec::new();
         let mut listed: Option<Instant> = None;
         spawn_tier(
             "runners",
             shared.clone(),
+            changed.clone(),
             runners_rx,
             paused.clone(),
             || Duration::from_secs(5),
@@ -191,16 +256,14 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 }
                 scan.update(&mut list);
                 shared.lock().unwrap().runners = list.clone();
-                mark(&shared, "runners", Ok(()));
-                let _ = changed.send(());
-                true
+                Read::Ok
             },
         );
     }
 
     // Fleet.
     {
-        let (shared, changed, cfg2) = (shared.clone(), changed.clone(), cfg.clone());
+        let (shared, cfg2) = (shared.clone(), cfg.clone());
         let ledger = cfg.ledger();
         let mut last_run: Option<Instant> = None;
         let mut ledger_seen = mtime(&ledger);
@@ -210,6 +273,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         spawn_tier(
             "fleet",
             shared.clone(),
+            changed.clone(),
             fleet_rx,
             paused.clone(),
             || Duration::from_secs(2),
@@ -224,35 +288,32 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     Some(e) => e >= interval || (ledger_moved && e >= min_gap),
                 };
                 if !due {
-                    return false;
+                    return Read::Skipped;
                 }
                 ledger_seen = ledger_now;
                 last_run = Some(Instant::now());
-                let result = sources::read_fleet(&cfg2.fm_home, &cfg2.cache_dir);
-                let ok = match result {
+                match sources::read_fleet(&cfg2.fm_home, &cfg2.cache_dir) {
                     Ok(fleet) => {
                         shared.lock().unwrap().fleet = Some(fleet);
                         // New tasks: read their pipelines and PRs now.
                         let _ = pipe_tx.send(());
                         let _ = gh_tx.send(());
-                        Ok(())
+                        Read::Ok
                     }
-                    Err(e) => Err(e),
-                };
-                mark(&shared, "fleet", ok);
-                let _ = changed.send(());
-                true
+                    Err(e) => Read::Failed(e),
+                }
             },
         );
     }
 
     // Pipelines.
     {
-        let (shared, changed) = (shared.clone(), changed.clone());
+        let shared = shared.clone();
         let interval = cfg.pipeline_interval;
         spawn_tier(
             "nm",
             shared.clone(),
+            changed.clone(),
             pipe_rx,
             paused.clone(),
             move || interval,
@@ -266,6 +327,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 };
                 let mut errors = Vec::new();
                 let mut found = std::collections::BTreeMap::new();
+                let total = targets.len();
                 for (id, dir) in targets {
                     match sources::read_pipeline(&dir) {
                         Ok(Some(p)) => {
@@ -282,24 +344,14 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     }
                 }
                 shared.lock().unwrap().pipelines = found;
-                mark(
-                    &shared,
-                    "nm",
-                    if errors.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(errors.join("; "))
-                    },
-                );
-                let _ = changed.send(());
-                true
+                nm_read(errors, total)
             },
         );
     }
 
     // GitHub.
     if cfg.github {
-        let (shared, changed, shared2) = (shared.clone(), changed.clone(), shared.clone());
+        let (shared, shared2) = (shared.clone(), shared.clone());
         let interval = move || {
             let s = shared2.lock().unwrap();
             let active = s.runners.iter().any(|r| r.busy)
@@ -312,6 +364,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         spawn_tier(
             "gh",
             shared.clone(),
+            changed.clone(),
             gh_rx,
             paused.clone(),
             interval,
@@ -323,56 +376,44 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                         s.runners.clone(),
                     )
                 };
-                let mut errors = Vec::new();
-                match sources::read_pr_checks(&urls) {
-                    Ok((prs, pr_errors)) => {
-                        shared.lock().unwrap().prs =
-                            prs.into_iter().map(|p| (p.url.clone(), p)).collect();
-                        errors.extend(pr_errors);
-                    }
-                    Err(e) => errors.push(e),
-                }
-                match sources::read_queue(&runner_list) {
-                    Ok(jobs) => shared.lock().unwrap().jobs = jobs,
-                    Err(e) => errors.push(e),
-                }
-                mark(
-                    &shared,
-                    "gh",
-                    if errors.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(errors.join("; "))
-                    },
-                );
-                let _ = changed.send(());
-                true
+                let prs = sources::read_pr_checks(&urls);
+                let jobs = sources::read_queue(&runner_list);
+                apply_gh(&mut shared.lock().unwrap(), prs, jobs)
             },
         );
     }
 
     // Agent usage windows.
     if cfg.quota {
-        let (shared, changed, providers) =
-            (shared.clone(), changed.clone(), cfg.quota_providers.clone());
+        let (shared, providers) = (shared.clone(), cfg.quota_providers.clone());
         spawn_tier(
             "quota",
             shared.clone(),
+            changed.clone(),
             quota_rx,
             paused.clone(),
             || Duration::from_secs(300),
-            move |_| {
-                let r = sources::read_quota(&providers).map(|q| {
+            move |_| match sources::read_quota(&providers) {
+                Ok(q) => {
                     shared.lock().unwrap().quota = q;
-                });
-                mark(&shared, "quota", r);
-                let _ = changed.send(());
-                true
+                    Read::Ok
+                }
+                Err(e) => Read::Failed(e),
             },
         );
     }
 
     (shared, Handle { wakers, paused })
+}
+
+/// Pipelines are read one task at a time: the read fails outright only when
+/// every task failed.
+fn nm_read(errors: Vec<String>, total: usize) -> Read {
+    if errors.len() == total {
+        Read::from_errors(errors, Vec::new())
+    } else {
+        Read::from_errors(Vec::new(), errors)
+    }
 }
 
 fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
@@ -385,68 +426,55 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
         now: now_epoch(),
         ..Default::default()
     };
-    let note = |s: &mut Snapshot, tier: &str, r: Result<(), String>| {
-        let f = s.fresh.entry(tier.into()).or_default();
-        match r {
-            Ok(()) => f.ok_at = Some(now_epoch()),
-            Err(e) => f.error = Some(e),
-        }
+    let note = |s: &mut Snapshot, tier: &str, r: Read| {
+        r.record(s.fresh.entry(tier.into()).or_default());
     };
     s.host = Some(HostReader::new(cfg.disk_paths.clone()).read());
-    note(&mut s, "host", Ok(()));
+    note(&mut s, "host", Read::Ok);
     let mut list = runners::discover(&cfg.runner_roots);
     runners::ProcessScan::new().update(&mut list);
     s.runners = list;
-    note(&mut s, "runners", Ok(()));
-    let r = sources::read_fleet(&cfg.fm_home, &cfg.cache_dir).map(|f| s.fleet = Some(f));
+    note(&mut s, "runners", Read::Ok);
+    let r = match sources::read_fleet(&cfg.fm_home, &cfg.cache_dir) {
+        Ok(f) => {
+            s.fleet = Some(f);
+            Read::Ok
+        }
+        Err(e) => Read::Failed(e),
+    };
     note(&mut s, "fleet", r);
     let mut errors = Vec::new();
-    if let Some(f) = s.fleet.clone() {
-        for (id, dir) in sources::pipeline_targets(&f) {
-            match sources::read_pipeline(&dir) {
-                Ok(Some(p)) => {
-                    s.pipelines.insert(id, p);
-                }
-                Ok(None) => {}
-                Err(e) => errors.push(format!("{id}: {e}")),
+    let targets = s
+        .fleet
+        .as_ref()
+        .map(sources::pipeline_targets)
+        .unwrap_or_default();
+    let total = targets.len();
+    for (id, dir) in targets {
+        match sources::read_pipeline(&dir) {
+            Ok(Some(p)) => {
+                s.pipelines.insert(id, p);
             }
+            Ok(None) => {}
+            Err(e) => errors.push(format!("{id}: {e}")),
         }
     }
-    note(
-        &mut s,
-        "nm",
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
-        },
-    );
+    note(&mut s, "nm", nm_read(errors, total));
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
-        let mut errors = Vec::new();
-        match sources::read_pr_checks(&urls) {
-            Ok((prs, pr_errors)) => {
-                s.prs = prs.into_iter().map(|p| (p.url.clone(), p)).collect();
-                errors.extend(pr_errors);
-            }
-            Err(e) => errors.push(e),
-        }
-        match sources::read_queue(&s.runners) {
-            Ok(j) => s.jobs = j,
-            Err(e) => errors.push(e),
-        }
-        note(
-            &mut s,
-            "gh",
-            if errors.is_empty() {
-                Ok(())
-            } else {
-                Err(errors.join("; "))
-            },
-        );
+        let prs = sources::read_pr_checks(&urls);
+        let jobs = sources::read_queue(&s.runners);
+        let r = apply_gh(&mut s, prs, jobs);
+        note(&mut s, "gh", r);
     }
     if cfg.quota {
-        let r = sources::read_quota(&cfg.quota_providers).map(|q| s.quota = q);
+        let r = match sources::read_quota(&cfg.quota_providers) {
+            Ok(q) => {
+                s.quota = q;
+                Read::Ok
+            }
+            Err(e) => Read::Failed(e),
+        };
         note(&mut s, "quota", r);
     }
     s
@@ -466,5 +494,80 @@ mod tests {
         assert_eq!(backoff(s(2), 40), s(300));
         // A slow tier is never sped up by the cap.
         assert_eq!(backoff(s(600), 2), s(600));
+    }
+
+    fn pr(url: &str) -> PrChecks {
+        PrChecks {
+            url: url.into(),
+            number: 122,
+            state: "OPEN".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn partial_gh_errors_are_shown_but_never_back_off() {
+        let url = "https://github.com/acme/pantry/pull/122";
+        let gone = "gh: https://github.com/acme/gone/pull/7: Could not resolve".to_string();
+        let mut s = Snapshot::default();
+        let mut failures = 0;
+        for _ in 0..3 {
+            let r = apply_gh(&mut s, Ok((vec![pr(url)], vec![gone.clone()])), Ok(vec![]));
+            assert_eq!(r, Read::Partial(gone.clone()));
+            failures = r.failures(failures);
+            r.record(s.fresh.entry("gh".into()).or_default());
+        }
+        assert_eq!(failures, 0);
+        assert_eq!(
+            backoff(Duration::from_secs(60), failures),
+            Duration::from_secs(60)
+        );
+        assert!(s.prs.contains_key(url));
+        let f = &s.fresh["gh"];
+        assert_eq!(f.error.as_deref(), Some(gone.as_str()));
+        assert!(f.ok_at.is_some(), "a partial read is still fresh");
+    }
+
+    #[test]
+    fn outright_gh_failures_back_off_and_keep_the_last_reading() {
+        let url = "https://github.com/acme/pantry/pull/122";
+        let mut s = Snapshot::default();
+        assert_eq!(
+            apply_gh(&mut s, Ok((vec![pr(url)], vec![])), Ok(vec![])),
+            Read::Ok
+        );
+        let mut failures = 0;
+        for _ in 0..3 {
+            let r = apply_gh(
+                &mut s,
+                Err("gh: exit 1: bad credentials".into()),
+                Ok(vec![]),
+            );
+            assert!(matches!(r, Read::Failed(_)));
+            failures = r.failures(failures);
+            r.record(s.fresh.entry("gh".into()).or_default());
+        }
+        assert_eq!(failures, 3);
+        assert_eq!(
+            backoff(Duration::from_secs(60), failures),
+            Duration::from_secs(300)
+        );
+        assert!(
+            s.prs.contains_key(url),
+            "the last good checks stay on screen"
+        );
+        assert!(s.fresh["gh"].ok_at.is_none());
+        // A failed queue read is an outright failure too.
+        let r = apply_gh(&mut s, Ok((vec![], vec![])), Err("gh: timed out".into()));
+        assert_eq!(r, Read::Failed("gh: timed out".into()));
+    }
+
+    #[test]
+    fn pipelines_fail_outright_only_when_every_task_failed() {
+        let e = || vec!["a: no-mistakes: timed out".to_string()];
+        assert!(matches!(nm_read(e(), 1), Read::Failed(_)));
+        assert!(matches!(nm_read(e(), 2), Read::Partial(_)));
+        assert_eq!(nm_read(vec![], 2), Read::Ok);
+        assert_eq!(nm_read(vec![], 0), Read::Ok);
     }
 }
