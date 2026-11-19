@@ -18,9 +18,9 @@ It is written in Rust with [ratatui](https://ratatui.rs), and it is a single bin
 │   ◆ GATE     bs-p1d-footer-links   bookshop       ✓✓◆······ parked 4m       #1234 ✓ 12/12  2h20m │
 │              nm review gate: findings 2 awaiting, parked 4m                       changed 4m ago │
 │   ◐ WORKING  pantry-tour-followups pantry         ✓✓✓✓✓✓✓✓◐ ci 35m          #122 ◐ 3/4       41m │
-│              nm ci round 2: CI checks running, waiting for results... (34m ago)  changed 41m ago │
+│              nm ci round 2: CI checks running, waiting for results... (34m ago)  changed 35m ago │
 │   ◐ WORKING  bs-p1a-parity-copy    bookshop       ✓✓✓◐····· test 4m         -                 6m │
-│              nm test starting: claude producing output (6s ago)                   changed 6m ago │
+│              nm test starting: claude producing output (6s ago)                   changed 4m ago │
 │   ◐ WORKING  bs-p1b-headers-hero   bookshop       ········· not run         -                 2m │
 │              no-mistakes fix round, waiting until 14:36                           changed 2m ago │
 │   ◐ WORKING  pantry-rss-feed       pantry         ✓✓✓✓◐···· document 1h05m  -                 1m │
@@ -131,7 +131,7 @@ A quiet fleet should look up to date, not frozen:
 - The top right of the roster reads `↻ read 4s ago · changed 41m ago` (`↻ 4s · Δ41m` when the title has less room): when the fleet snapshot was last read, and when anything in it last changed.
   A fleet read older than three fleet intervals (at least 3 minutes) turns yellow with a `▲`, unless refresh is paused; the footer shows the other sources' ages.
 - Every row ends with `changed 3m ago`: when that row's state, pipeline, PR checks or status line last changed.
-  For a row crowsnest has only just met, that is its last status line or the moment its gate parked.
+  For a row crowsnest has only just met, that is its last status line, the start of its pipeline's active step, or the moment its gate parked, whichever is latest.
   A row that changes while you watch is drawn as a block of reverse video for 10 seconds, then settles.
 - The AGE column and every step time keep counting between reads instead of freezing at the last one.
 

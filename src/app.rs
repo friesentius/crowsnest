@@ -258,8 +258,17 @@ impl Fingerprint {
             self.worker = new.worker;
             update = Update::Changed;
         }
-        for (old, new) in [(&mut self.pipeline, new.pipeline), (&mut self.pr, new.pr)] {
+        // The pipeline tier keeps a task's last reading when a read fails, so
+        // a pipeline that goes is gone; a PR whose read failed just drops out.
+        for (old, new, gone_is_change) in [
+            (&mut self.pipeline, new.pipeline, true),
+            (&mut self.pr, new.pr, false),
+        ] {
             match (old.as_ref(), new) {
+                (Some(_), None) if gone_is_change => {
+                    *old = None;
+                    update = Update::Changed;
+                }
                 (_, None) => {}
                 (Some(o), Some(n)) if *o == n => {}
                 (Some(_), Some(n)) => {
@@ -456,14 +465,14 @@ mod tests {
         app.observe(&s);
         assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60));
         assert_eq!(app.changed_ago("a-done", s.now), None);
-        // A failed read drops it and the next one brings it back unchanged.
-        let kept = s.pipelines.remove("b-work").unwrap();
+        // A later read that finds the same run is no change.
         s.now += 15;
         app.observe(&s);
-        s.pipelines.insert("b-work".into(), kept);
-        s.now += 15;
+        assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60 + 15));
+        // The run going away is.
+        s.pipelines.remove("b-work");
         app.observe(&s);
-        assert_eq!(app.changed_ago("b-work", s.now), Some(77 * 60 + 30));
+        assert_eq!(app.changed_ago("b-work", s.now), Some(0));
     }
 
     #[test]
