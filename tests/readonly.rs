@@ -1,0 +1,317 @@
+//! The read-only guarantee, end to end: run the real binary against a scratch
+//! firstmate home whose every external command is a logging shim, then check
+//! that nothing under the home changed and that every command it ran was a
+//! read.
+
+use crowsnest::exec::ReadCommand;
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+
+/// Words that would change something if they reached a command line.
+const MUTATING: &[&str] = &[
+    "abort",
+    "approve",
+    "cancel",
+    "close",
+    "create",
+    "delete",
+    "edit",
+    "fix",
+    "kill",
+    "merge",
+    "post",
+    "push",
+    "rerun",
+    "respond",
+    "run",
+    "send",
+    "set",
+    "start",
+    "steer",
+    "stop",
+    "update",
+    "write",
+    "-X",
+    "--input",
+    "--field",
+    "-F",
+    "--raw-field",
+    "--yes",
+    "-y",
+];
+
+fn write_exec(path: &Path, body: &str) {
+    fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Every file under `dir` with its size, mtime and content.
+fn fingerprint(dir: &Path) -> BTreeMap<PathBuf, (u64, std::time::SystemTime, Vec<u8>)> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let m = fs::symlink_metadata(&p).unwrap();
+            if m.is_dir() {
+                stack.push(p.clone());
+            }
+            let content = if m.is_file() {
+                fs::read(&p).unwrap()
+            } else {
+                Vec::new()
+            };
+            out.insert(p, (m.len(), m.modified().unwrap(), content));
+        }
+    }
+    out
+}
+
+/// One shim call: program name, arguments, working directory.
+struct Call {
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+    cache: String,
+}
+
+fn calls(log: &Path) -> Vec<Call> {
+    fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| {
+            let mut f = l.split('\u{1e}');
+            let mut argv = f.next().unwrap().split('\u{1f}').map(str::to_string);
+            Call {
+                program: argv.next().unwrap(),
+                args: argv.collect(),
+                cwd: f.next().unwrap_or_default().to_string(),
+                cache: f.next().unwrap_or_default().to_string(),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn once_reads_everything_and_writes_nothing() {
+    let root =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("readonly-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let (home, shims, cache, runners) = (
+        root.join("fm"),
+        root.join("shims"),
+        root.join("cache"),
+        root.join("runners"),
+    );
+    for d in [
+        home.join("bin"),
+        home.join("state"),
+        shims.clone(),
+        runners.join("actions-runner-pantry"),
+    ] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let log = root.join("calls.log");
+    // The worktrees named in the fixture, relocated under the scratch root.
+    let worktrees = root.join("worktrees");
+    for wt in [
+        "pantry-82978c/2/pantry",
+        "bookshop-98774f/2/bookshop",
+        "bookshop-98774f/3/bookshop",
+    ] {
+        fs::create_dir_all(worktrees.join(wt)).unwrap();
+    }
+    fs::write(home.join("state/fleet-ledger.jsonl"), "{}\n").unwrap();
+    fs::write(home.join("state/some-task.status"), "working: example\n").unwrap();
+    fs::copy(
+        format!("{FIXTURES}/runner/.runner"),
+        runners.join("actions-runner-pantry/.runner"),
+    )
+    .unwrap();
+
+    let logger = r#"{ printf '%s' "$(basename "$0")"; for a in "$@"; do printf '\037%s' "$a"; done; printf '\036%s\036%s\n' "$PWD" "$FM_SNAPSHOT_CACHE_DIR"; } >> "$CN_LOG"
+"#;
+    write_exec(
+        &home.join("bin/fm-fleet-snapshot.sh"),
+        &format!(
+            "{logger}sed \"s#/home/captain/.worktrees#$CN_WORKTREES#g\" \"$CN_FIXTURES/fleet-snapshot.json\"\n"
+        ),
+    );
+    write_exec(
+        &shims.join("no-mistakes"),
+        &format!(
+            r#"{logger}case "$PWD" in
+  */pantry-82978c/2/pantry) cat "$CN_FIXTURES/nm-status-ci.toon" ;;
+  */bookshop-98774f/2/bookshop) cat "$CN_FIXTURES/nm-status-test.toon" ;;
+  *) echo "current_branch: main" ;;
+esac
+"#
+        ),
+    );
+    write_exec(
+        &shims.join("gh"),
+        &format!(
+            r#"{logger}case "$*" in
+  "api graphql"*) cat "$CN_FIXTURES/gh-checks.json" ;;
+  *"/jobs"*) cat "$CN_FIXTURES/gh-jobs.json" ;;
+  *"/actions/runs?"*) cat "$CN_FIXTURES/gh-runs.json" ;;
+  *) echo "unexpected" >&2; exit 1 ;;
+esac
+"#
+        ),
+    );
+    write_exec(
+        &shims.join("quota-axi"),
+        &format!("{logger}cat \"$CN_FIXTURES/quota.json\"\n"),
+    );
+
+    let before = fingerprint(&home);
+    let path = format!(
+        "{}:{}",
+        shims.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_crowsnest"))
+        .args(["--once", "--fm-home"])
+        .arg(&home)
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("--runner-root")
+        .arg(&runners)
+        .args(["--disk", "/"])
+        .env("PATH", path)
+        .env("HOME", &root)
+        .env("CN_LOG", &log)
+        .env("CN_FIXTURES", FIXTURES)
+        .env("CN_WORKTREES", &worktrees)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let snap: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    // Everything was read.
+    for tier in ["host", "runners", "fleet", "nm", "gh", "quota"] {
+        let f = &snap["fresh"][tier];
+        assert!(f["error"].is_null(), "{tier}: {}", f["error"]);
+        assert!(f["ok_at"].is_i64(), "{tier} was read");
+    }
+    assert_eq!(snap["fleet"]["workers"].as_array().unwrap().len(), 6);
+    assert_eq!(snap["pipelines"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        snap["prs"]["https://github.com/acme/pantry/pull/122"]["checks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(snap["runners"][0]["repo"], "acme/pantry");
+    assert_eq!(snap["jobs"][0]["name"], "Unit + e2e tests");
+    assert_eq!(snap["quota"].as_array().unwrap().len(), 6);
+
+    // Nothing under the firstmate home changed, and nothing was added.
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        fingerprint(&home).keys().collect::<Vec<_>>()
+    );
+    assert!(before == fingerprint(&home), "a file under FM_HOME changed");
+
+    // Every command was a read.
+    let calls = calls(&log);
+    let programs: Vec<&str> = calls.iter().map(|c| c.program.as_str()).collect();
+    for p in ["fm-fleet-snapshot.sh", "no-mistakes", "gh", "quota-axi"] {
+        assert!(programs.contains(&p), "{p} was called: {programs:?}");
+    }
+    for c in &calls {
+        let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
+        for a in &args {
+            assert!(
+                !MUTATING.contains(a),
+                "{} {args:?} has mutating word {a}",
+                c.program
+            );
+        }
+        match c.program.as_str() {
+            "fm-fleet-snapshot.sh" => {
+                assert_eq!(args, ["--json"]);
+                assert!(
+                    Path::new(&c.cache).starts_with(&cache),
+                    "summary cache is crowsnest's own"
+                );
+            }
+            "no-mistakes" => {
+                assert_eq!(args, ["axi", "status"]);
+                assert!(c.cwd.starts_with(worktrees.to_str().unwrap()));
+            }
+            "gh" => match args.as_slice() {
+                ["api", "graphql", "-f", q] => {
+                    assert!(
+                        q.starts_with("query=query {") && !q.contains("mutation"),
+                        "{q}"
+                    )
+                }
+                ["api", "--method", "GET", p] => {
+                    assert!(p.starts_with("repos/acme/pantry/actions/runs"))
+                }
+                other => panic!("unexpected gh call {other:?}"),
+            },
+            "quota-axi" => assert_eq!(args, ["--no-credential-refresh", "--json"]),
+            other => panic!("unexpected program {other}"),
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_allowlist_refuses_writes() {
+    let refused = |c: ReadCommand| c.invocation().is_err();
+    assert!(refused(ReadCommand::GhGraphql {
+        query: "mutation { closePullRequest }".into()
+    }));
+    assert!(refused(ReadCommand::GhGraphql {
+        query: "query { x } mutation { y }".into()
+    }));
+    assert!(refused(ReadCommand::GhApiGet {
+        path: "user".into()
+    }));
+    assert!(refused(ReadCommand::GhApiGet {
+        path: "repos/a/b/pulls/1 -X DELETE".into()
+    }));
+    assert!(refused(ReadCommand::QuotaAxi {
+        providers: vec!["claude --login".into()]
+    }));
+    // Every allowed invocation is free of mutating words.
+    let all = [
+        ReadCommand::FleetSnapshot {
+            fm_home: "/fm".into(),
+            cache_dir: "/c".into(),
+        },
+        ReadCommand::NoMistakesStatus {
+            worktree: "/w".into(),
+        },
+        ReadCommand::GhGraphql {
+            query: "query { viewer { login } }".into(),
+        },
+        ReadCommand::GhApiGet {
+            path: "repos/a/b/actions/runs?status=queued".into(),
+        },
+        ReadCommand::QuotaAxi {
+            providers: vec!["claude".into()],
+        },
+    ];
+    for c in all {
+        let inv = c.invocation().unwrap();
+        assert!(
+            inv.args.iter().all(|a| !MUTATING.contains(&a.as_str())),
+            "{inv:?}"
+        );
+    }
+}

@@ -1,0 +1,73 @@
+{
+  "total_count": 4,
+  "jobs": [
+    {
+      "id": 135607303882,
+      "run_id": 44537668424,
+      "workflow_name": "CI",
+      "head_branch": "fm/pantry-tour-followups",
+      "name": "Lint & typecheck",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-11-19T13:51:42Z",
+      "started_at": "2026-11-19T13:51:44Z",
+      "completed_at": "2026-11-19T14:05:04Z",
+      "runner_name": "pantry-local-runner",
+      "labels": [
+        "self-hosted",
+        "pantry"
+      ]
+    },
+    {
+      "id": 135607304433,
+      "run_id": 44537668424,
+      "workflow_name": "CI",
+      "head_branch": "fm/pantry-tour-followups",
+      "name": "Fresh-clone setup (README, as written)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-11-19T13:51:42Z",
+      "started_at": "2026-11-19T14:05:06Z",
+      "completed_at": "2026-11-19T14:17:40Z",
+      "runner_name": "pantry-local-runner",
+      "labels": [
+        "self-hosted",
+        "pantry"
+      ]
+    },
+    {
+      "id": 135607304592,
+      "run_id": 44537668424,
+      "workflow_name": "CI",
+      "head_branch": "fm/pantry-tour-followups",
+      "name": "Docker dev workflow (docker compose up, as README's quick start)",
+      "status": "completed",
+      "conclusion": "success",
+      "created_at": "2026-11-19T13:51:42Z",
+      "started_at": "2026-11-19T14:17:42Z",
+      "completed_at": "2026-11-19T14:18:33Z",
+      "runner_name": "pantry-local-runner",
+      "labels": [
+        "self-hosted",
+        "pantry"
+      ]
+    },
+    {
+      "id": 135607304630,
+      "run_id": 44537668424,
+      "workflow_name": "CI",
+      "head_branch": "fm/pantry-tour-followups",
+      "name": "Unit + e2e tests",
+      "status": "in_progress",
+      "conclusion": null,
+      "created_at": "2026-11-19T13:51:42Z",
+      "started_at": "2026-11-19T14:18:34Z",
+      "completed_at": null,
+      "runner_name": "pantry-local-runner",
+      "labels": [
+        "self-hosted",
+        "pantry"
+      ]
+    }
+  ]
+}

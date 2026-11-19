@@ -1,0 +1,160 @@
+{
+  "generatedAt": "2026-11-19T14:40:52.735Z",
+  "schemaVersion": 5,
+  "providers": [
+    {
+      "provider": "claude",
+      "plan": "team",
+      "windows": [
+        {
+          "id": "five_hour",
+          "label": "session",
+          "kind": "session",
+          "resetsAt": "2026-11-19T15:20:00.628777+00:00",
+          "percentRemaining": 59,
+          "pace": {
+            "status": "behind",
+            "reservePercentPoints": 45.9562,
+            "burnMultiple": 0.4715
+          }
+        },
+        {
+          "id": "seven_day",
+          "label": "week",
+          "kind": "weekly",
+          "resetsAt": "2026-11-21T02:00:00.628797+00:00",
+          "percentRemaining": 65,
+          "pace": {
+            "status": "behind",
+            "reservePercentPoints": 43.9769,
+            "burnMultiple": 0.4432
+          }
+        },
+        {
+          "id": "model:fable",
+          "label": "Fable week",
+          "kind": "model",
+          "resetsAt": "2026-11-21T01:59:59.628964+00:00",
+          "percentRemaining": 89,
+          "pace": {
+            "status": "behind",
+            "reservePercentPoints": 67.977,
+            "burnMultiple": 0.1393
+          }
+        }
+      ],
+      "state": {
+        "status": "fresh",
+        "stale": false
+      },
+      "quotaSemantics": {
+        "status": "known",
+        "effectiveAvailability": [
+          {
+            "scope": "all_models",
+            "status": "known",
+            "effectivePercentRemaining": 59,
+            "boundedBy": [
+              "five_hour",
+              "seven_day"
+            ],
+            "limitingWindowIds": [
+              "five_hour"
+            ],
+            "pace": {
+              "status": "behind",
+              "worstReservePercentPoints": 43.9769,
+              "worstReserveWindowId": "seven_day"
+            },
+            "runway": {
+              "status": "through_reset",
+              "projectionConfidence": "established"
+            },
+            "selection": {
+              "status": "known",
+              "spendPriority": 2.6892
+            }
+          },
+          {
+            "scope": "model:fable",
+            "status": "known",
+            "effectivePercentRemaining": 59,
+            "boundedBy": [
+              "five_hour",
+              "seven_day",
+              "model:fable"
+            ],
+            "limitingWindowIds": [
+              "five_hour"
+            ],
+            "pace": {
+              "status": "behind",
+              "worstReservePercentPoints": 43.9769,
+              "worstReserveWindowId": "seven_day"
+            },
+            "runway": {
+              "status": "through_reset",
+              "projectionConfidence": "established"
+            },
+            "selection": {
+              "status": "known",
+              "spendPriority": 3.3814
+            }
+          }
+        ]
+      }
+    },
+    {
+      "provider": "copilot",
+      "plan": "individual",
+      "windows": [
+        {
+          "id": "chat",
+          "label": "chat",
+          "kind": "monthly",
+          "percentRemaining": 100,
+          "resetsAt": "2026-12-01T00:00:00.000Z",
+          "pace": {
+            "status": "unknown",
+            "reason": "missing_cycle"
+          }
+        },
+        {
+          "id": "completions",
+          "label": "completions",
+          "kind": "monthly",
+          "percentRemaining": 91,
+          "resetsAt": "2026-12-01T00:00:00.000Z",
+          "pace": {
+            "status": "unknown",
+            "reason": "missing_cycle"
+          }
+        },
+        {
+          "id": "premium_interactions",
+          "label": "premium interactions",
+          "kind": "monthly",
+          "percentRemaining": 0,
+          "resetsAt": "2026-12-01T00:00:00.000Z",
+          "pace": {
+            "status": "unknown",
+            "reason": "missing_cycle"
+          }
+        }
+      ],
+      "state": {
+        "status": "fresh",
+        "stale": false
+      },
+      "quotaSemantics": {
+        "status": "unknown",
+        "effectiveAvailability": [],
+        "unresolvedWindowIds": [
+          "chat",
+          "completions",
+          "premium_interactions"
+        ]
+      }
+    }
+  ]
+}
