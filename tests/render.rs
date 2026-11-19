@@ -724,3 +724,58 @@ fn stalled_detail_shows_the_parked_gate() {
     assert!(text.contains("parked at review 1h17m"), "{text}");
     assert!(text.contains("declared wait until 13:20"), "{text}");
 }
+
+/// The narrowest width that draws the job list (below it the panel shows counts only).
+const WIDE_MIN: u16 = ui::WIDE;
+
+fn job(repo: &str, name: &str, status: &str) -> crowsnest::model::Job {
+    crowsnest::model::Job {
+        repo: repo.into(),
+        name: name.into(),
+        status: status.into(),
+        started_at: (status == "in_progress").then_some(0),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn every_runner_job_names_its_project_and_is_grouped_by_repo() {
+    utc();
+    let mut s = snapshot();
+    s.now = 120;
+    // Interleaved on purpose: grouping must not depend on arrival order.
+    s.jobs = vec![
+        job("acme/pantry", "Lint & typecheck", "queued"),
+        job("acme/bookshop", "Release build", "queued"),
+        job("acme/pantry", "Fresh-clone setup", "queued"),
+        job("acme/pantry", "Unit tests", "in_progress"),
+    ];
+    for w in [WIDE_MIN, 180] {
+        let term = draw(&s, &app_for(&s), w, 44);
+        let text = term.backend().to_string();
+        let lines: Vec<&str> = text.lines().collect();
+        let pos = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing at {w}:\n{text}"))
+        };
+        let unit = pos("pantry \u{25d0} Unit tests");
+        let lint = pos("pantry \u{25cb} queued Lint & typecheck");
+        let fresh = pos("pantry \u{25cb} queued Fresh-clone setup");
+        let release = pos("bookshop \u{25cb} queued Release build");
+        assert!(unit < lint && lint < fresh && fresh < release, "{text}");
+        // Truncation eats the job name, never the project label.
+        let mut long_snap = s.clone();
+        long_snap.jobs[0].name = "A very long job name that cannot possibly fit the panel".into();
+        let long = draw(&long_snap, &app_for(&long_snap), w, 44)
+            .backend()
+            .to_string();
+        let row = long
+            .lines()
+            .find(|l| l.contains("A very long"))
+            .unwrap_or_else(|| panic!("long job missing at {w}:\n{long}"));
+        assert!(row.contains("pantry \u{25cb} queued A very long"), "{row}");
+        assert!(!row.contains("fit the panel"), "not truncated: {row}");
+    }
+}

@@ -1057,31 +1057,48 @@ fn runner_panel(view: &View, buf: &mut Buffer, area: Rect, with_jobs: bool) {
         lines.push(Content::Line(fit(l, w)));
     }
     if with_jobs {
+        // Group by repo (first-seen order), each repo's running jobs before its
+        // queued ones, and name the project on every line so a job can never
+        // read as belonging to the runner row above it.
+        let mut repos: Vec<&str> = Vec::new();
         for j in &snap.jobs {
-            let repo = j.repo.rsplit('/').next().unwrap_or(&j.repo).to_string();
-            let line = if j.status == "in_progress" {
-                let d = j
-                    .started_at
-                    .map(|s| format!(" {}", timefmt::dur(snap.now - s)))
-                    .unwrap_or_default();
-                vec![
-                    span(format!("{repo} "), t.bold()),
-                    span(
-                        format!("{} {}", t.step(StepStatus::Running).0, j.name),
-                        t.fg(ratatui::style::Color::Cyan),
-                    ),
-                    span(d, t.dim()),
-                ]
-            } else {
-                vec![
-                    span(
-                        format!("  {} queued ", t.idle()),
-                        t.fg(ratatui::style::Color::Yellow),
-                    ),
-                    span(j.name.clone(), t.dim()),
-                ]
+            if !repos.contains(&j.repo.as_str()) {
+                repos.push(&j.repo);
+            }
+        }
+        for repo_full in repos {
+            let repo = repo_full.rsplit('/').next().unwrap_or(repo_full);
+            let running = |running: bool| {
+                snap.jobs
+                    .iter()
+                    .filter(move |j| j.repo == repo_full && (j.status == "in_progress") == running)
             };
-            lines.push(Content::Line(fit(line, w)));
+            for j in running(true).chain(running(false)) {
+                let line = if j.status == "in_progress" {
+                    let d = j
+                        .started_at
+                        .map(|s| format!(" {}", timefmt::dur(snap.now - s)))
+                        .unwrap_or_default();
+                    vec![
+                        span(format!("{repo} "), t.bold()),
+                        span(
+                            format!("{} {}", t.step(StepStatus::Running).0, j.name),
+                            t.fg(ratatui::style::Color::Cyan),
+                        ),
+                        span(d, t.dim()),
+                    ]
+                } else {
+                    vec![
+                        span(format!("{repo} "), t.bold()),
+                        span(
+                            format!("{} queued ", t.idle()),
+                            t.fg(ratatui::style::Color::Yellow),
+                        ),
+                        span(j.name.clone(), t.dim()),
+                    ]
+                };
+                lines.push(Content::Line(fit(line, w)));
+            }
         }
     }
     let total: usize = snap.jobs.iter().filter(|j| j.status == "queued").count();
