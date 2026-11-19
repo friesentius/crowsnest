@@ -266,23 +266,31 @@ impl Services {
                 if self.state.contains_key(&unit) {
                     continue;
                 }
-                // A unit lives in the user's systemd or the system's; once
-                // found in one, only that one is asked.
+                // A unit lives in the user's systemd or the system's; the
+                // scope it was last found in is asked first, and the other
+                // when that one does not have it or cannot be asked.
                 let first = self.user.get(&unit).copied().unwrap_or(true);
-                let found = sources::read_service(&unit, first)
-                    .map(|s| (s, first))
-                    .or_else(|| sources::read_service(&unit, !first).map(|s| (s, !first)));
+                let mut failed = None;
+                let mut found = None;
+                for user in [first, !first] {
+                    match sources::read_service(&unit, user) {
+                        Some(svc) if svc.error.is_none() => {
+                            found = Some((svc, user));
+                            break;
+                        }
+                        Some(svc) => failed = failed.or(Some(svc)),
+                        None => {}
+                    }
+                }
                 let svc = match found {
                     Some((svc, user)) => {
-                        if svc.error.is_none() {
-                            self.user.insert(unit.clone(), user);
-                        }
+                        self.user.insert(unit.clone(), user);
                         svc
                     }
-                    None => Service {
+                    None => failed.unwrap_or_else(|| Service {
                         error: Some("not-found".into()),
                         ..Default::default()
-                    },
+                    }),
                 };
                 self.state.insert(unit, svc);
             }

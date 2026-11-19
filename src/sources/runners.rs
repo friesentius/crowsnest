@@ -264,9 +264,11 @@ impl ProcessScan {
                 r.listener_secs = Some(r.listener_secs.map_or(secs, |s| s.max(secs)));
             }
         }
-        // The CPU the running job's processes have used: everything under
-        // its Runner.Worker. A job run with `docker` executes in a container,
-        // outside this tree, so its CPU cannot be seen here.
+        // The CPU the running job's processes have used: everything below
+        // its Runner.Worker, not the worker itself, whose own heartbeats and
+        // log flushing say nothing about the step. A job run with `docker`
+        // executes in a container, outside this tree, so its CPU cannot be
+        // seen here.
         let mut children: BTreeMap<sysinfo::Pid, Vec<sysinfo::Pid>> = BTreeMap::new();
         for (pid, p) in sys.processes() {
             if let Some(parent) = p.parent() {
@@ -276,7 +278,12 @@ impl ProcessScan {
         let mut seen_jobs = Vec::new();
         for (i, worker) in workers {
             let (mut cpu_ms, mut container) = (0u64, false);
-            let mut stack = vec![worker];
+            let mut stack: Vec<sysinfo::Pid> = children
+                .get(&worker)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
             while let Some(pid) = stack.pop() {
                 if let Some(p) = sys.process(pid) {
                     cpu_ms += p.accumulated_cpu_time();

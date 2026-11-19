@@ -202,7 +202,7 @@ pub fn parse_jobs(repo: &str, json: &str) -> Result<Vec<Job>, String> {
         let status = match text(j, "status").as_str() {
             "in_progress" => "in_progress",
             "completed" => "completed",
-            "waiting" => "waiting",
+            "waiting" | "pending" => "waiting",
             _ => "queued",
         }
         .to_string();

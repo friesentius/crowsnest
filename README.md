@@ -207,7 +207,7 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Roster, held calls | `bin/fm-fleet-snapshot.sh --json`, schema `fm-fleet-snapshot.v1` | 60 s, or 20 s after the opt-in fleet ledger (`state/fleet-ledger.jsonl`) changes |
 | Pipeline strip and steps | `no-mistakes axi status`, inside each no-mistakes task's worktree | 15 s |
 | PR checks | one `gh api graphql` read query for every PR on screen | 60 s while anything is active, otherwise 5 min |
-| Runners | `actions-runner*/.runner` files; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the worker's process tree; the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s |
+| Runners | `actions-runner*/.runner` files; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s |
 | Runner services | `systemctl [--user] show --property=LoadState,ActiveState,SubState,NRestarts` for a runner with a known unit | 30 s |
 | Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress` and each run's `.../jobs` | with PR checks, and every 60 s while a job is queued |
 | Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
