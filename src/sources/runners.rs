@@ -202,8 +202,8 @@ pub struct Found {
 
 /// Find the runners: those under the `roots` whose folder name matches
 /// `names`, those named in `units`, those whose `Runner.Listener` runs (when
-/// `processes` is on), and those `remembered` from an earlier discovery of
-/// this run, in that order and without repeats.
+/// `processes` is on), and, likewise, those `remembered` from an earlier
+/// discovery of this run, in that order and without repeats.
 ///
 /// A runner's unit comes from, in order: `units`; the cgroup of its listener
 /// under `proc_root`; the `.service` file `svc.sh install` wrote in its
@@ -227,6 +227,8 @@ pub fn discover(
         }
     }
     dirs.extend(live.iter().map(|(dir, _)| dir.clone()));
+    // What listeners were seen to run from belongs to finding them.
+    let remembered: &[Remembered] = if d.processes { remembered } else { &[] };
     dirs.extend(remembered.iter().map(|(dir, _)| dir.clone()));
     let mut runners: Vec<Runner> = Vec::new();
     for dir in dirs {
@@ -845,12 +847,13 @@ mod tests {
         let found = discover(&d, &[listener(4244, &dir)], &[], &proc);
         assert_eq!(found.runners[0].unit, None);
 
-        // With processes off, nothing is found from them.
+        // With processes off, nothing is found from them, nor from what
+        // they were remembered to run from.
         let off = Discovery {
             processes: false,
             ..Default::default()
         };
-        let found = discover(&off, &l, &[], &proc);
+        let found = discover(&off, &l, &[(dir.clone(), None)], &proc);
         assert!(found.runners.is_empty());
         assert_eq!((found.search.processes, found.search.listeners), (false, 0));
 

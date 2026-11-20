@@ -341,6 +341,99 @@ impl Services {
     }
 }
 
+/// How often the runner folders are listed again, besides when a listener
+/// starts or stops.
+const RELIST_EVERY: Duration = Duration::from_secs(60);
+
+/// The runner tier's memory between its turns.
+struct RunnerTier {
+    disc: Discovery,
+    scan: runners::ProcessScan,
+    services: Services,
+    /// The runners as last listed, with the process table's state on them.
+    list: Vec<Runner>,
+    search: RunnerSearch,
+    /// What the last listing could not read.
+    errors: Vec<String>,
+    listed: Option<Instant>,
+    /// The runner directories whose listener ran at any time this run, with
+    /// the unit it was in, so one that dies still shows, as DOWN, with its
+    /// unit. Kept only while runners are found from processes.
+    memory: BTreeMap<PathBuf, Option<String>>,
+    listener_pids: Vec<u32>,
+}
+
+impl RunnerTier {
+    fn new(disc: Discovery) -> Self {
+        RunnerTier {
+            disc,
+            scan: runners::ProcessScan::new(),
+            services: Services::default(),
+            list: Vec::new(),
+            search: RunnerSearch::default(),
+            errors: Vec::new(),
+            listed: None,
+            memory: BTreeMap::new(),
+            listener_pids: Vec::new(),
+        }
+    }
+
+    /// One turn: list the runners afresh when that is due, the discovery
+    /// settings changed (`wanted`) or a listener started or stopped; then
+    /// mark each up or busy from the process table, read its logs' times and
+    /// its unit.
+    fn tick(&mut self, wanted: &Discovery, proc_root: &std::path::Path) {
+        let mut relist = self.listed.is_none_or(|t| t.elapsed() > RELIST_EVERY);
+        if *wanted != self.disc {
+            self.disc.clone_from(wanted);
+            relist = true;
+        }
+        if !self.disc.processes {
+            self.memory.clear();
+        }
+        // Reading the process table is the costliest local read: skip it
+        // when there is nothing to find or to match.
+        let mut read = false;
+        let mut listeners = Vec::new();
+        if self.disc.processes || !self.list.is_empty() {
+            self.scan.refresh();
+            read = true;
+            if self.disc.processes {
+                listeners = self.scan.listeners();
+            }
+        }
+        let pids: Vec<u32> = listeners.iter().map(|l| l.pid).collect();
+        if pids != self.listener_pids {
+            self.listener_pids = pids;
+            relist = true;
+        }
+        if relist {
+            let remembered: Vec<_> = self.memory.clone().into_iter().collect();
+            let found = runners::discover(&self.disc, &listeners, &remembered, proc_root);
+            for (dir, unit) in found.seen {
+                let old = self.memory.entry(dir).or_default();
+                if unit.is_some() {
+                    *old = unit;
+                }
+            }
+            self.list = found.runners;
+            self.search = found.search;
+            self.errors = found.errors;
+            self.listed = Some(Instant::now());
+        }
+        // Runners just listed have not been matched against a table read
+        // before the listing: without one they would all read as DOWN.
+        if !read && !self.list.is_empty() {
+            self.scan.refresh();
+        }
+        self.scan.apply(&mut self.list, now_epoch());
+        for r in &mut self.list {
+            runners::read_diag(r);
+        }
+        self.services.update(&mut self.list);
+    }
+}
+
 /// Longest wait between attempts of a failing tier.
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
 
@@ -436,17 +529,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     let discovery = Arc::new(Mutex::new(cfg.runners.clone()));
     {
         let (shared, discovery) = (shared.clone(), discovery.clone());
-        let mut disc = cfg.runners.clone();
-        let mut scan = runners::ProcessScan::new();
-        let mut services = Services::default();
-        let mut list = Vec::new();
-        let mut search = RunnerSearch::default();
-        let mut list_errors: Vec<String> = Vec::new();
-        let mut listed: Option<Instant> = None;
-        // The runner directories whose listener ran at any time this run, so
-        // one that dies still shows, as DOWN, with its unit.
-        let mut memory: BTreeMap<PathBuf, Option<String>> = BTreeMap::new();
-        let mut listener_pids: Vec<u32> = Vec::new();
+        let mut tier = RunnerTier::new(cfg.runners.clone());
         let gh_wake = gh_tx.clone();
         let mut repos_seen: Vec<String> = Vec::new();
         spawn_tier(
@@ -457,62 +540,21 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             paused.clone(),
             || Duration::from_secs(5),
             move |_| {
-                let mut relist = listed.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
                 let wanted = discovery.lock().unwrap().clone();
-                if wanted != disc {
-                    disc = wanted;
-                    relist = true;
-                }
-                // Reading the process table is the costliest local read: skip
-                // it when there is nothing to find or to match.
-                let listeners = if disc.processes || !list.is_empty() {
-                    scan.refresh();
-                    if disc.processes {
-                        scan.listeners()
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
-                let pids: Vec<u32> = listeners.iter().map(|l| l.pid).collect();
-                if pids != listener_pids {
-                    listener_pids = pids;
-                    relist = true;
-                }
-                if relist {
-                    let remembered: Vec<_> = memory.clone().into_iter().collect();
-                    let found =
-                        runners::discover(&disc, &listeners, &remembered, runners::proc_root());
-                    for (dir, unit) in found.seen {
-                        let old = memory.entry(dir).or_default();
-                        if unit.is_some() {
-                            *old = unit;
-                        }
-                    }
-                    list = found.runners;
-                    search = found.search;
-                    list_errors = found.errors;
-                    listed = Some(Instant::now());
-                }
-                scan.apply(&mut list, now_epoch());
-                for r in &mut list {
-                    runners::read_diag(r);
-                }
-                services.update(&mut list);
+                tier.tick(&wanted, runners::proc_root());
                 {
                     let mut s = shared.lock().unwrap();
-                    s.runners = list.clone();
-                    s.runner_search = Some(search.clone());
+                    s.runners = tier.list.clone();
+                    s.runner_search = Some(tier.search.clone());
                 }
                 // Runners (or their repositories) turned up: read their queue
                 // now, not at the gh tier's next turn a minute away.
-                let repos = sources::runner_repos(&list);
+                let repos = sources::runner_repos(&tier.list);
                 if repos != repos_seen {
                     repos_seen = repos;
                     let _ = gh_wake.send(());
                 }
-                runners_read(&list, &list_errors, &scan)
+                runners_read(&tier.list, &tier.errors, &tier.scan)
             },
         );
     }
@@ -1055,5 +1097,125 @@ mod tests {
         Read::Ok.record(&mut f);
         assert_eq!(f.error, None);
         assert!(f.ok_at.is_some());
+    }
+
+    /// A running process that `sysinfo` sees as a `Runner.Listener` from
+    /// `dir/bin`: a copy of `sleep` under that name. Killed on drop.
+    #[cfg(target_os = "linux")]
+    struct FakeListener(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl FakeListener {
+        fn start(dir: &std::path::Path) -> Self {
+            let sleep = ["/bin/sleep", "/usr/bin/sleep"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).is_file())
+                .expect("sleep");
+            let bin = dir.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let exe = bin.join("Runner.Listener");
+            std::fs::copy(sleep, &exe).unwrap();
+            FakeListener(std::process::Command::new(exe).arg("60").spawn().unwrap())
+        }
+
+        fn stop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for FakeListener {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn runner_folder(root: &std::path::Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".runner"),
+            include_str!("../tests/fixtures/runner/.runner"),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("crowsnest-tier-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runners_listed_this_turn_are_matched_against_a_fresh_process_table() {
+        // With processes off the table is not read for finding runners, and
+        // the first turn has none to match yet: the runner found by its
+        // folder must still read as up, not DOWN.
+        let root = scratch("fresh");
+        let dir = runner_folder(&root, "actions-runner-live");
+        let _listener = FakeListener::start(&dir);
+        let disc = Discovery {
+            processes: false,
+            roots: vec![root.clone()],
+            ..Default::default()
+        };
+        let mut tier = RunnerTier::new(disc.clone());
+        tier.tick(&disc, std::path::Path::new("/nonexistent"));
+        assert_eq!(tier.list.len(), 1);
+        assert!(
+            tier.list[0].listener_secs.is_some(),
+            "a running listener is not DOWN"
+        );
+        assert!(!tier.search.processes);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runner_whose_listener_dies_stays_until_processes_are_switched_off() {
+        let root = scratch("memory");
+        // Under no searched folder: found only through its listener.
+        let dir = runner_folder(&root, "somewhere-else");
+        let on = Discovery {
+            processes: true,
+            roots: vec![],
+            ..Default::default()
+        };
+        let mut listener = FakeListener::start(&dir);
+        let mut tier = RunnerTier::new(on.clone());
+        let proc = std::path::Path::new("/nonexistent");
+        tier.tick(&on, proc);
+        let ours = |tier: &RunnerTier| {
+            tier.list
+                .iter()
+                .find(|r| r.dir == dir)
+                .map(|r| r.listener_secs.is_some())
+        };
+        assert_eq!(ours(&tier), Some(true), "found from its listener");
+        assert!(tier.search.listeners >= 1);
+
+        listener.stop();
+        tier.tick(&on, proc);
+        assert_eq!(
+            ours(&tier),
+            Some(false),
+            "still listed after its listener died, now with none running"
+        );
+
+        let off = Discovery {
+            processes: false,
+            ..on
+        };
+        tier.tick(&off, proc);
+        assert_eq!(ours(&tier), None, "gone once processes are switched off");
+        assert!(tier.memory.is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
