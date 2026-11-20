@@ -63,17 +63,17 @@ struct Args {
     #[arg(long, value_name = "SECS")]
     pipeline_interval: Option<u64>,
 
-    /// Directory to search for actions-runner* directories (repeatable;
+    /// Directory to search for runner directories (repeatable;
     /// replaces the config file's [runners] roots; default: your home
     /// directory). Runners whose Runner.Listener is running are found
     /// wherever they are.
     #[arg(long = "runner-root", value_name = "DIR")]
     runner_roots: Vec<PathBuf>,
 
-    /// The systemd unit that runs a runner directory, for the runner detail's
-    /// service line (repeatable; wins over the config file's [runners]
-    /// units; default: the unit of the running listener's cgroup, else the
-    /// one `svc.sh install` recorded).
+    /// The systemd unit that runs a runner directory, for the lane's restart
+    /// count and the detail's service line (repeatable; wins over the config
+    /// file's [runners] units; default: the unit of the running listener's
+    /// cgroup, else the one `svc.sh install` recorded).
     #[arg(long = "runner-unit", value_name = "DIR=UNIT", value_parser = parse_runner_unit)]
     runner_units: Vec<(PathBuf, String)>,
 
