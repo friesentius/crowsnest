@@ -6,7 +6,8 @@ use crowsnest::app::{Action, App, all_rows};
 use crowsnest::config::{Overrides, Panel, Setting, Settings};
 use crowsnest::model::{
     Check, CheckState, Disk, Freshness, Host, Job, LastEvent, PrChecks, QuotaWindow, RepoHistory,
-    RepoRunners, RunInfo, Runner, Service, Snapshot, StaleKind, Thresholds, Worker, WorkerState,
+    RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot, StaleKind, Thresholds, Worker,
+    WorkerState,
 };
 use crowsnest::options::Category;
 use crowsnest::sources::{fleet, gh, history, nm, quota};
@@ -1833,4 +1834,192 @@ fn runner_read_failed_180() {
     utc();
     let s = runner_read_failed();
     insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 44).backend());
+}
+
+/// No runner found, and what discovery looked at.
+fn no_runners(search: RunnerSearch) -> Snapshot {
+    let mut s = snapshot();
+    s.runners.clear();
+    s.jobs.clear();
+    s.gh_runners.clear();
+    s.history.clear();
+    s.runner_search = Some(search);
+    s
+}
+
+fn looked_in_home() -> RunnerSearch {
+    RunnerSearch {
+        processes: true,
+        roots: vec!["/home/crew".into()],
+        names: vec!["actions-runner*".into()],
+        ..Default::default()
+    }
+}
+
+fn crew_app(s: &Snapshot) -> App {
+    let mut app = app_for(s);
+    app.home = Some("/home/crew".into());
+    app
+}
+
+#[test]
+fn an_empty_runner_panel_names_where_it_looked_100() {
+    utc();
+    let s = no_runners(looked_in_home());
+    insta::assert_snapshot!(draw(&s, &crew_app(&s), 100, 34).backend());
+}
+
+#[test]
+fn an_empty_runner_panel_names_where_it_looked_180() {
+    utc();
+    let s = no_runners(RunnerSearch {
+        roots: vec!["/home/crew".into(), "/srv/runners".into()],
+        names: vec!["actions-runner*".into(), "gh-*".into()],
+        pinned: 1,
+        ..looked_in_home()
+    });
+    insta::assert_snapshot!(draw(&s, &crew_app(&s), 180, 50).backend());
+}
+
+#[test]
+fn the_empty_state_says_only_what_discovery_did() {
+    utc();
+    let text = |search: RunnerSearch| {
+        let s = no_runners(search);
+        draw_light(&s, &crew_app(&s), 180, 50)
+    };
+    // Before the first read there is nothing to say yet.
+    let mut s = no_runners(looked_in_home());
+    s.runner_search = None;
+    let t = draw_light(&s, &crew_app(&s), 180, 50);
+    assert!(t.contains("no self-hosted runners found"), "{t}");
+    assert!(!t.contains("looked at"), "{t}");
+
+    let t = text(looked_in_home());
+    for needle in [
+        "no self-hosted runners found",
+        "looked at:",
+        "\u{b7} listeners: none running",
+        "\u{b7} ~ for actions-runner*",
+        "o > runners to change",
+    ] {
+        assert!(t.contains(needle), "{needle:?}:\n{t}");
+    }
+    // Processes switched off: it says so rather than claiming a look.
+    let t = text(RunnerSearch {
+        processes: false,
+        ..looked_in_home()
+    });
+    assert!(t.contains("\u{b7} listeners: off"), "{t}");
+    // Listeners were there but none had a runner folder above it.
+    let t = text(RunnerSearch {
+        listeners: 2,
+        unlocated: 2,
+        ..looked_in_home()
+    });
+    assert!(t.contains("\u{b7} 2 listeners, no .runner"), "{t}");
+    // Folders outside the home keep their path; no folder says so.
+    let t = text(RunnerSearch {
+        roots: vec!["/srv/runners".into()],
+        names: vec!["ci-*".into()],
+        ..looked_in_home()
+    });
+    assert!(t.contains("\u{b7} /srv/runners for ci-*"), "{t}");
+    let t = text(RunnerSearch {
+        roots: vec![],
+        ..looked_in_home()
+    });
+    assert!(t.contains("\u{b7} no folder to search"), "{t}");
+    // With runners, the panel is not the empty state.
+    let s = snapshot();
+    let t = draw_light(&s, &crew_app(&s), 180, 50);
+    assert!(!t.contains("looked at"), "{t}");
+}
+
+/// Settings with every `[runners]` list filled.
+fn runner_settings() -> Settings {
+    let mut s = Settings::default();
+    s.runners.roots = vec!["~/ci".into(), "/srv/runners".into()];
+    s.runners.names = vec!["actions-runner*".into(), "gh-*".into()];
+    s.runners.units.insert(
+        "~/ci/actions-runner-app".into(),
+        "actions-runner-app.service".into(),
+    );
+    s
+}
+
+#[test]
+fn options_menu_runners_100() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        runner_settings(),
+        Overrides::default(),
+        Some((Category::Runners, "from processes")),
+    );
+    insta::assert_snapshot!(draw(&s, &app, 100, 40).backend());
+}
+
+#[test]
+fn options_menu_runners_180() {
+    utc();
+    let s = snapshot();
+    let mut o = Overrides::default();
+    o.runner_roots.push("/flag/runners".into());
+    let app = with_settings(
+        &s,
+        Settings::default(),
+        o,
+        Some((Category::Runners, "add folder")),
+    );
+    insta::assert_snapshot!(draw(&s, &app, 180, 50).backend());
+}
+
+#[test]
+fn typing_a_runner_entry_shows_the_prompt_and_what_is_wrong() {
+    utc();
+    let s = snapshot();
+    let mut app = with_settings(
+        &s,
+        runner_settings(),
+        Overrides::default(),
+        Some((Category::Runners, "add unit")),
+    );
+    app.apply(Action::Change { up: true }, &s);
+    for c in "~/ci/a=".chars() {
+        app.apply(Action::Type(c), &s);
+    }
+    let t = draw_light(&s, &app, 100, 40);
+    for needle in ["DIR=UNIT: ~/ci/a=\u{258f}", "enter  add", "esc  cancel"] {
+        assert!(t.contains(needle), "{needle:?}:\n{t}");
+    }
+    assert!(
+        t.contains("A runner directory and its systemd unit"),
+        "the line under the prompt says what it takes:\n{t}"
+    );
+    assert!(!t.contains("option  \u{2190}\u{2192}"), "{t}");
+    app.apply(Action::Commit, &s);
+    let t = draw_light(&s, &app, 100, 40);
+    assert!(t.contains("that is not a systemd unit name"), "{t}");
+    insta::assert_snapshot!(draw(&s, &app, 100, 40).backend());
+}
+
+#[test]
+fn a_long_entry_keeps_its_end_in_view() {
+    utc();
+    let s = snapshot();
+    let mut app = with_settings(
+        &s,
+        Settings::default(),
+        Overrides::default(),
+        Some((Category::Runners, "add folder")),
+    );
+    app.apply(Action::Change { up: true }, &s);
+    for c in "/srv/a-very-long-folder-name/that/keeps/going/and-going/until/the-end-of-it".chars() {
+        app.apply(Action::Type(c), &s);
+    }
+    let t = draw_light(&s, &app, 100, 40);
+    assert!(t.contains("until/the-end-of-it\u{258f}"), "{t}");
+    assert!(t.contains("\u{2026}"), "{t}");
 }

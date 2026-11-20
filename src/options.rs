@@ -3,6 +3,7 @@
 
 use crate::config::{Overrides, Panel, Setting, Settings, usage_key};
 use crate::model::QuotaWindow;
+use crate::sources::runners::DEFAULT_NAME;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Category {
@@ -10,15 +11,17 @@ pub enum Category {
     Usage,
     Thresholds,
     Refresh,
+    Runners,
     Display,
 }
 
 impl Category {
-    pub const ALL: [Category; 5] = [
+    pub const ALL: [Category; 6] = [
         Category::Panels,
         Category::Usage,
         Category::Thresholds,
         Category::Refresh,
+        Category::Runners,
         Category::Display,
     ];
 
@@ -28,6 +31,7 @@ impl Category {
             Category::Usage => "usage",
             Category::Thresholds => "thresholds",
             Category::Refresh => "refresh",
+            Category::Runners => "runners",
             Category::Display => "display",
         }
     }
@@ -44,9 +48,64 @@ impl Category {
     }
 }
 
+/// The three lists of the `[runners]` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerList {
+    /// `roots`: folders searched for runner directories.
+    Roots,
+    /// `names`: patterns for the folder names looked for.
+    Names,
+    /// `units`: runner directory = systemd unit.
+    Units,
+}
+
+impl RunnerList {
+    /// What an entry is called on screen.
+    pub fn noun(self) -> &'static str {
+        match self {
+            RunnerList::Roots => "folder",
+            RunnerList::Names => "name",
+            RunnerList::Units => "unit",
+        }
+    }
+
+    /// What the prompt asks for.
+    pub fn prompt(self) -> &'static str {
+        match self {
+            RunnerList::Roots => "folder",
+            RunnerList::Names => "name",
+            RunnerList::Units => "DIR=UNIT",
+        }
+    }
+
+    /// What the prompt accepts, for the line under it.
+    pub fn help(self) -> &'static str {
+        match self {
+            RunnerList::Roots => {
+                "An absolute path, or one under ~/. Its subfolders named like the names below are searched."
+            }
+            RunnerList::Names => "A folder name; * and ? match. Like actions-runner*.",
+            RunnerList::Units => {
+                "A runner directory and its systemd unit, like ~/actions-runner-app=actions-runner-app.service."
+            }
+        }
+    }
+}
+
 /// What one row of the menu changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
+    /// `[runners] processes`.
+    RunnerProcesses,
+    /// A saved entry of a runner list, by its key (the path, glob or
+    /// directory). Changing the row removes it.
+    RunnerEntry(RunnerList, String),
+    /// The row that types a new entry.
+    RunnerAdd(RunnerList),
+    /// What a list searches while it has no entries; it cannot change.
+    RunnerDefault(RunnerList),
+    /// An entry a command-line flag gives for this run; it cannot change.
+    RunnerFlag(RunnerList, String),
     Panel(Panel),
     /// Every window of one usage provider.
     Provider(String),
@@ -118,8 +177,161 @@ pub fn items(
             .into_iter()
             .map(|s| setting_item(s, file, overrides))
             .collect(),
+        Category::Runners => runner_items(file, overrides),
         Category::Display => vec![setting_item(Setting::Ascii, file, overrides)],
     }
+}
+
+fn runner_items(file: &Settings, overrides: &Overrides) -> Vec<Item> {
+    let r = &file.runners;
+    let mut out = vec![Item {
+        target: Target::RunnerProcesses,
+        label: "from processes".into(),
+        detail: String::new(),
+        value: if r.processes { "on" } else { "off" }.into(),
+        on: r.processes,
+        locked: None,
+        about: "Find runners from the Runner.Listener processes that are running, wherever they are, and read each one's systemd unit from its cgroup. A runner that has stopped is found only through a folder or a unit below."
+            .into(),
+    }];
+    let entry = |list: RunnerList, key: &str, label: String, detail: String, about: String| Item {
+        target: Target::RunnerEntry(list, key.to_string()),
+        label,
+        detail,
+        value: "remove".into(),
+        on: true,
+        locked: None,
+        about,
+    };
+    let add = |list: RunnerList, about: &str| Item {
+        target: Target::RunnerAdd(list),
+        label: format!("add {}", list.noun()),
+        detail: String::new(),
+        value: "add".into(),
+        on: true,
+        locked: None,
+        about: about.into(),
+    };
+    let fixed = |list: RunnerList, key: &str, label: String, detail: String, flag: &str| Item {
+        target: Target::RunnerFlag(list, key.to_string()),
+        label,
+        detail,
+        value: "searched".into(),
+        on: true,
+        locked: Some(format!("set by {flag}")),
+        about: format!(
+            "Set by {flag} for this run. Flags win over config.toml, which keeps its own entries."
+        ),
+    };
+
+    // Folders.
+    if !overrides.runner_roots.is_empty() {
+        for p in &overrides.runner_roots {
+            let p = p.display().to_string();
+            out.push(fixed(
+                RunnerList::Roots,
+                &p,
+                format!("folder {p}"),
+                "set by --runner-root".into(),
+                "--runner-root",
+            ));
+        }
+        for p in &r.roots {
+            out.push(Item {
+                on: false,
+                ..entry(
+                    RunnerList::Roots,
+                    p,
+                    format!("folder {p}"),
+                    "not used this run".into(),
+                    format!(
+                        "{p} stays in config.toml but --runner-root replaces it for this run. Press \u{2192} to remove it."
+                    ),
+                )
+            });
+        }
+    } else {
+        if r.roots.is_empty() {
+            out.push(Item {
+                target: Target::RunnerDefault(RunnerList::Roots),
+                label: "folder ~".into(),
+                detail: "default".into(),
+                value: "searched".into(),
+                on: true,
+                locked: Some("default".into()),
+                about: "Searched while no folder is set: the subfolders of your home directory that are named like the names below. Add a folder to replace it."
+                    .into(),
+            });
+        }
+        for p in &r.roots {
+            out.push(entry(
+                RunnerList::Roots,
+                p,
+                format!("folder {}", p),
+                String::new(),
+                format!("{p} is searched for runner folders. Press \u{2192} to stop."),
+            ));
+        }
+        out.push(add(
+            RunnerList::Roots,
+            "Press Enter, then type a folder to search for runner folders. The folders you add replace your home directory.",
+        ));
+    }
+
+    // Names.
+    if r.names.is_empty() {
+        out.push(Item {
+            target: Target::RunnerDefault(RunnerList::Names),
+            label: format!("name {DEFAULT_NAME}"),
+            detail: "default".into(),
+            value: "searched".into(),
+            on: true,
+            locked: Some("default".into()),
+            about: "A folder is taken for a runner's when its name matches (* and ? match anything) and it holds the .runner file. Add a name to replace this one."
+                .into(),
+        });
+    }
+    for g in &r.names {
+        out.push(entry(
+            RunnerList::Names,
+            g,
+            format!("name {g}"),
+            String::new(),
+            format!("Folders named {g} are looked for. Press \u{2192} to stop."),
+        ));
+    }
+    out.push(add(
+        RunnerList::Names,
+        "Press Enter, then type a folder name to look for in the folders above. * and ? match. The names you add replace actions-runner*.",
+    ));
+
+    // Units.
+    for (dir, unit) in &overrides.runner_units {
+        let dir = dir.display().to_string();
+        out.push(fixed(
+            RunnerList::Units,
+            &dir,
+            format!("unit {dir} \u{2192} {unit}"),
+            "set by --runner-unit".into(),
+            "--runner-unit",
+        ));
+    }
+    for (dir, unit) in &r.units {
+        out.push(entry(
+            RunnerList::Units,
+            dir,
+            format!("unit {} \u{2192} {unit}", dir),
+            String::new(),
+            format!(
+                "The runner in {dir} runs as the systemd unit {unit}, and is found even when it has stopped. Press \u{2192} to remove."
+            ),
+        ));
+    }
+    out.push(add(
+        RunnerList::Units,
+        "Press Enter, then type DIR=UNIT, like ~/actions-runner-app=actions-runner-app.service. Without one, the unit comes from the running listener's cgroup, else from the .service file svc.sh install wrote.",
+    ));
+    out
 }
 
 fn panel_about(p: Panel) -> &'static str {
@@ -280,6 +492,12 @@ fn setting_item(s: Setting, file: &Settings, overrides: &Overrides) -> Item {
     }
 }
 
+fn remove(list: &mut Vec<String>, key: &str) -> bool {
+    let before = list.len();
+    list.retain(|x| x != key);
+    list.len() != before
+}
+
 /// Change the row `target` in `file`: toggle it, or step a number up or down.
 /// Returns false when the row cannot change.
 pub fn change(target: &Target, file: &mut Settings, overrides: &Overrides, up: bool) -> bool {
@@ -300,6 +518,16 @@ pub fn change(target: &Target, file: &mut Settings, overrides: &Overrides, up: b
             toggle(&mut file.hidden_usage, usage_key(provider, id));
         }
         Target::Absent(key) => return file.hidden_usage.remove(key),
+        Target::RunnerProcesses => file.runners.processes = !file.runners.processes,
+        Target::RunnerEntry(list, key) => {
+            let r = &mut file.runners;
+            return match list {
+                RunnerList::Roots => remove(&mut r.roots, key),
+                RunnerList::Names => remove(&mut r.names, key),
+                RunnerList::Units => r.units.remove(key).is_some(),
+            };
+        }
+        Target::RunnerAdd(_) | Target::RunnerDefault(_) | Target::RunnerFlag(..) => return false,
         Target::Setting(s) => {
             if overrides.get(*s).is_some() {
                 return false;
@@ -412,5 +640,119 @@ mod tests {
         assert!(file.ascii);
         assert!(change(&Target::Panel(Panel::Host), &mut file, &none, true));
         assert!(!file.shown(Panel::Host));
+    }
+
+    fn runner_rows(file: &Settings, o: &Overrides) -> Vec<(String, String, bool)> {
+        items(Category::Runners, file, o, &[])
+            .into_iter()
+            .map(|r| (r.label, r.value, r.locked.is_some()))
+            .collect()
+    }
+
+    fn row(label: &str, value: &str, locked: bool) -> (String, String, bool) {
+        (label.into(), value.into(), locked)
+    }
+
+    #[test]
+    fn runner_rows_say_what_is_searched_by_default() {
+        assert_eq!(
+            runner_rows(&Settings::default(), &Overrides::default()),
+            [
+                row("from processes", "on", false),
+                row("folder ~", "searched", true),
+                row("add folder", "add", false),
+                row("name actions-runner*", "searched", true),
+                row("add name", "add", false),
+                row("add unit", "add", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_rows_list_entries_and_changing_one_removes_it() {
+        let mut file = Settings::default();
+        file.runners.roots = vec!["/srv/ci".into()];
+        file.runners.names = vec!["gh-*".into()];
+        file.runners
+            .units
+            .insert("/srv/ci/gh-one".into(), "gh-one.service".into());
+        let o = Overrides::default();
+        assert_eq!(
+            runner_rows(&file, &o),
+            [
+                row("from processes", "on", false),
+                row("folder /srv/ci", "remove", false),
+                row("add folder", "add", false),
+                row("name gh-*", "remove", false),
+                row("add name", "add", false),
+                row(
+                    "unit /srv/ci/gh-one \u{2192} gh-one.service",
+                    "remove",
+                    false
+                ),
+                row("add unit", "add", false),
+            ],
+            "a set list has no default row"
+        );
+        let remove = |t: Target, file: &mut Settings| change(&t, file, &o, true);
+        assert!(remove(
+            Target::RunnerEntry(RunnerList::Units, "/srv/ci/gh-one".into()),
+            &mut file
+        ));
+        assert!(file.runners.units.is_empty());
+        assert!(remove(
+            Target::RunnerEntry(RunnerList::Roots, "/srv/ci".into()),
+            &mut file
+        ));
+        assert!(remove(
+            Target::RunnerEntry(RunnerList::Names, "gh-*".into()),
+            &mut file
+        ));
+        assert_eq!(file.runners, Settings::default().runners);
+        assert!(
+            !remove(
+                Target::RunnerEntry(RunnerList::Names, "gone".into()),
+                &mut file
+            ),
+            "nothing to remove"
+        );
+        for fixed in [
+            Target::RunnerAdd(RunnerList::Roots),
+            Target::RunnerDefault(RunnerList::Names),
+            Target::RunnerFlag(RunnerList::Units, "/x".into()),
+        ] {
+            assert!(!remove(fixed, &mut file), "typed or fixed, not toggled");
+        }
+        assert!(change(&Target::RunnerProcesses, &mut file, &o, false));
+        assert!(!file.runners.processes);
+    }
+
+    #[test]
+    fn runner_flags_show_as_locked_rows() {
+        let mut file = Settings::default();
+        file.runners.roots = vec!["/srv/ci".into()];
+        let mut o = Overrides::default();
+        o.runner_roots.push("/flag/root".into());
+        o.runner_units
+            .push(("/flag/root/a".into(), "a.service".into()));
+        assert_eq!(
+            runner_rows(&file, &o),
+            [
+                row("from processes", "on", false),
+                row("folder /flag/root", "searched", true),
+                row("folder /srv/ci", "remove", false),
+                row("name actions-runner*", "searched", true),
+                row("add name", "add", false),
+                row("unit /flag/root/a \u{2192} a.service", "searched", true),
+                row("add unit", "add", false),
+            ],
+            "a flag replaces the folders: no add row, the file's stay"
+        );
+        let rows = items(Category::Runners, &file, &o, &[]);
+        assert_eq!(rows[1].detail, "set by --runner-root");
+        assert_eq!(rows[2].detail, "not used this run");
+        assert!(!rows[2].on, "drawn dimmed");
+        // Locked rows do not change.
+        assert!(!change(&rows[1].target, &mut file, &o, true));
     }
 }

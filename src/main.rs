@@ -3,8 +3,8 @@
 use clap::Parser;
 use crowsnest::app::{App, ConfigStatus, DEFAULT_READ_OVERDUE_SECS};
 use crowsnest::collector::{self, Config};
-use crowsnest::config::{self, Loaded, Overrides, Setting, Settings};
-use crowsnest::keys;
+use crowsnest::config::{self, Loaded, Overrides, Setting, Settings, inside};
+use crowsnest::keys::{self, Mode};
 use crowsnest::timefmt::now_epoch;
 use crowsnest::ui::{self, View, theme::Theme};
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
@@ -24,6 +24,11 @@ use std::time::{Duration, Instant};
 /// $XDG_CONFIG_HOME/crowsnest/config.toml (or ~/.config/crowsnest/config.toml),
 /// which must be outside the firstmate home. The options below that also have
 /// a setting win over the file for the run they are given on.
+///
+/// Self-hosted runners are found from the Runner.Listener processes that are
+/// running, from the folders and names set under [runners] in the config file
+/// (default: actions-runner* in your home directory), and from the runner
+/// directories listed in its `units`.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
 struct Args {
@@ -58,13 +63,17 @@ struct Args {
     #[arg(long, value_name = "SECS")]
     pipeline_interval: Option<u64>,
 
-    /// Directory to search for actions-runner* directories (repeatable;
-    /// default: your home directory).
+    /// Directory to search for runner directories (repeatable;
+    /// replaces the config file's [runners] roots; default: your home
+    /// directory). Runners whose Runner.Listener is running are found
+    /// wherever they are.
     #[arg(long = "runner-root", value_name = "DIR")]
     runner_roots: Vec<PathBuf>,
 
-    /// The systemd unit that runs a runner directory, for the runner detail's
-    /// service line (repeatable; default: the unit `svc.sh install` recorded).
+    /// The systemd unit that runs a runner directory, for the lane's restart
+    /// count and the detail's service line (repeatable; wins over the config
+    /// file's [runners] units; default: the unit of the running listener's
+    /// cgroup, else the one `svc.sh install` recorded).
     #[arg(long = "runner-unit", value_name = "DIR=UNIT", value_parser = parse_runner_unit)]
     runner_units: Vec<(PathBuf, String)>,
 
@@ -146,6 +155,8 @@ fn home() -> Option<PathBuf> {
 /// The settings given on the command line.
 fn overrides(args: &Args) -> Overrides {
     let mut o = Overrides::default();
+    o.runner_roots.clone_from(&args.runner_roots);
+    o.runner_units.clone_from(&args.runner_units);
     for (setting, value) in [
         (Setting::StaleMinutes, args.stale_minutes),
         (Setting::ParkedMinutes, args.parked_minutes),
@@ -190,7 +201,14 @@ fn read_overdue_secs(s: &Settings) -> i64 {
     (fleet_interval(s).as_secs() as i64 * 3).max(DEFAULT_READ_OVERDUE_SECS)
 }
 
-fn config(args: &Args, settings: &Settings, config_file: Option<&Path>) -> Result<Config, String> {
+/// The collector's configuration, and what is wrong with the config file's
+/// runner paths.
+fn config(
+    args: &Args,
+    settings: &Settings,
+    overrides: &Overrides,
+    config_file: Option<&Path>,
+) -> Result<(Config, Vec<String>), String> {
     let snapshot = args.fm_home.join("bin").join("fm-fleet-snapshot.sh");
     if !snapshot.is_file() {
         return Err(format!(
@@ -215,40 +233,25 @@ fn config(args: &Args, settings: &Settings, config_file: Option<&Path>) -> Resul
     {
         return Err("the config file must be outside the firstmate home".into());
     }
-    let runner_roots = if args.runner_roots.is_empty() {
-        home().into_iter().collect()
-    } else {
-        args.runner_roots.clone()
-    };
+    let (runners, runner_problems) =
+        config::discovery(&settings.runners, overrides, &fm_home, home().as_deref());
     let disk_paths = if args.disks.is_empty() {
         std::iter::once(PathBuf::from("/")).chain(home()).collect()
     } else {
         args.disks.clone()
     };
-    Ok(Config {
+    let cfg = Config {
         fm_home,
         cache_dir,
-        runner_roots,
-        runner_units: args.runner_units.clone(),
+        runners,
         disk_paths,
         fleet_interval: fleet_interval(settings),
         pipeline_interval: pipeline_interval(settings),
         github: !args.no_github,
         quota: !args.no_quota,
         quota_providers: args.quota_providers.clone(),
-    })
-}
-
-/// Whether `file` is under `dir`, following symlinks in its existing parents.
-fn inside(file: &Path, dir: &Path) -> bool {
-    let real = file
-        .ancestors()
-        .find_map(|a| {
-            let rest = file.strip_prefix(a).ok()?;
-            Some(a.canonicalize().ok()?.join(rest))
-        })
-        .unwrap_or_else(|| file.to_path_buf());
-    real.starts_with(dir) || file.starts_with(dir)
+    };
+    Ok((cfg, runner_problems))
 }
 
 /// `path` with the home directory shown as `~`.
@@ -267,9 +270,12 @@ fn run_tui(
 ) -> std::io::Result<()> {
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let host = sysinfo::System::host_name().unwrap_or_default();
+    let fm_home = cfg.fm_home.clone();
     let (tx, rx) = mpsc::channel();
     let (shared, handle) = collector::start(cfg, tx);
     let mut app = App::new(loaded.settings, overrides);
+    app.fm_home = Some(fm_home.clone());
+    app.home = home();
     app.config = ConfigStatus {
         path: config_file.as_deref().map(display_path).unwrap_or_default(),
         problems: loaded.problems,
@@ -318,7 +324,14 @@ fn run_tui(
         match event::poll(Duration::from_millis(200)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
-                    if let Some(action) = keys::action(k.code, k.modifiers, app.menu.is_some()) {
+                    let mode = if app.editing() {
+                        Mode::Typing
+                    } else if app.menu.is_some() {
+                        Mode::Menu
+                    } else {
+                        Mode::Dashboard
+                    };
+                    if let Some(action) = keys::action(k.code, k.modifiers, mode) {
                         let mut snap = shared.lock().unwrap().clone();
                         snap.now = now_epoch();
                         let was_paused = app.paused;
@@ -330,7 +343,13 @@ fn run_tui(
                             handle.set_paused(app.paused);
                         }
                         if app.settings != before {
-                            settings_changed(&mut app, &handle, config_file.as_deref(), &mut saved);
+                            settings_changed(
+                                &mut app,
+                                &handle,
+                                config_file.as_deref(),
+                                &mut saved,
+                                &fm_home,
+                            );
                             theme = Theme::new(color, app.effective().ascii);
                         }
                         dirty = true;
@@ -359,15 +378,24 @@ fn settings_changed(
     handle: &collector::Handle,
     file: Option<&Path>,
     saved: &mut Settings,
+    fm_home: &Path,
 ) {
     let effective = app.effective();
     handle.set_intervals(fleet_interval(&effective), pipeline_interval(&effective));
+    let (runners, runner_problems) = config::discovery(
+        &app.settings.runners,
+        &app.overrides,
+        fm_home,
+        home().as_deref(),
+    );
+    handle.set_discovery(runners);
     app.read_overdue_secs = read_overdue_secs(&effective);
     let result = match file {
         Some(path) => config::save(path, saved, &app.settings).map(|()| {
             *saved = app.settings.clone();
             // What is left of the file's problems after the save.
             app.config.problems = config::load(path).problems;
+            app.config.problems.extend(runner_problems);
         }),
         None => Err("no config directory: set XDG_CONFIG_HOME or HOME".into()),
     };
@@ -380,8 +408,12 @@ fn main() -> ExitCode {
     let loaded = config_file.as_deref().map(config::load).unwrap_or_default();
     let overrides = overrides(&args);
     let settings = overrides.apply(&loaded.settings);
-    let cfg = match config(&args, &settings, config_file.as_deref()) {
-        Ok(c) => c,
+    let mut loaded = loaded;
+    let cfg = match config(&args, &settings, &overrides, config_file.as_deref()) {
+        Ok((c, problems)) => {
+            loaded.problems.extend(problems);
+            c
+        }
         Err(e) => {
             eprintln!("crowsnest: {e}");
             return ExitCode::from(2);

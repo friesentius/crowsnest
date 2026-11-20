@@ -3,7 +3,7 @@ source: tests/render.rs
 expression: "draw(&s, &app, 180, 44).backend()"
 ---
 "╭ ²RUNNERS ✓ all moving ──────────────────────────────────────────────────────── queue 1 ╮╭ ³HOST ─────────────────────────────────────────────────────────────────────────────────╮"
-"│ ◐ pantry    ✓ moving · online                                                    q1 6m ││ load 3.42 2.95 2.71  16 cpu                                                            │"
+"│ ◐ pantry    ✓ moving · online                                        2 restarts  q1 6m ││ load 3.42 2.95 2.71  16 cpu                                                            │"
 "│   ◐ Unit + e2e tests #122                                           8m ━━──────── ~40m ││ mem  ━━━━━━━━━━━━────  72% 9.0G avail                                                  │"
 "│     step 4/9 setup-node 8m · out 1s ago                                                ││ swap ━━━━────────────  25% 6.0G free                                                   │"
 "│   ○ Lint & typecheck #124                                              wait 6m → 14:58 ││ disk / 61%  /home 78%                                                                  │"

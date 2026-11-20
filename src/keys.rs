@@ -5,9 +5,23 @@ use crate::app::Action;
 use crate::config::Panel;
 use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-/// The action for a key press, on the dashboard or, with `menu`, in the
-/// options menu.
-pub fn action(code: KeyCode, mods: KeyModifiers, menu: bool) -> Option<Action> {
+/// Where a key press lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Dashboard,
+    /// The options menu.
+    Menu,
+    /// An entry being typed in the options menu: every printable key is
+    /// text, including the ones that mean something elsewhere.
+    Typing,
+}
+
+/// The action for a key press.
+pub fn action(code: KeyCode, mods: KeyModifiers, mode: Mode) -> Option<Action> {
+    if mode == Mode::Typing {
+        return typing_action(code, mods);
+    }
+    let menu = mode == Mode::Menu;
     if let KeyCode::Char(c) = code {
         if c == 'c' && mods.contains(KeyModifiers::CONTROL) {
             return Some(Action::Quit);
@@ -35,6 +49,19 @@ pub fn action(code: KeyCode, mods: KeyModifiers, menu: bool) -> Option<Action> {
     })
 }
 
+fn typing_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
+    Some(match code {
+        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => Action::Quit,
+        KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+            Action::Type(c)
+        }
+        KeyCode::Backspace => Action::Erase,
+        KeyCode::Enter => Action::Commit,
+        KeyCode::Esc => Action::Cancel,
+        _ => return None,
+    })
+}
+
 fn menu_action(code: KeyCode) -> Option<Action> {
     Some(match code {
         KeyCode::Left | KeyCode::Char('h') => Action::Change { up: false },
@@ -53,7 +80,8 @@ mod tests {
     use super::*;
 
     fn key(code: KeyCode, menu: bool) -> Option<Action> {
-        action(code, KeyModifiers::NONE, menu)
+        let mode = if menu { Mode::Menu } else { Mode::Dashboard };
+        action(code, KeyModifiers::NONE, mode)
     }
 
     #[test]
@@ -104,8 +132,29 @@ mod tests {
         }
         assert_eq!(key(KeyCode::Char('f'), true), None, "no roster keys");
         assert_eq!(
-            action(KeyCode::Char('c'), KeyModifiers::CONTROL, true),
+            action(KeyCode::Char('c'), KeyModifiers::CONTROL, Mode::Menu),
             Some(Action::Quit)
+        );
+    }
+
+    #[test]
+    fn typing_takes_every_printable_key_as_text() {
+        let typed = |c| action(KeyCode::Char(c), KeyModifiers::NONE, Mode::Typing);
+        // Keys that hide a panel, close the menu or move the selection
+        // elsewhere are plain text here.
+        for c in ['2', 'o', 'q', 'j', 'k', 'g', '/', '=', ' ', '~', 'G'] {
+            assert_eq!(typed(c), Some(Action::Type(c)), "{c}");
+        }
+        let key = |code| action(code, KeyModifiers::NONE, Mode::Typing);
+        assert_eq!(key(KeyCode::Backspace), Some(Action::Erase));
+        assert_eq!(key(KeyCode::Enter), Some(Action::Commit));
+        assert_eq!(key(KeyCode::Esc), Some(Action::Cancel));
+        assert_eq!(key(KeyCode::F(2)), None);
+        assert_eq!(key(KeyCode::Tab), None);
+        assert_eq!(
+            action(KeyCode::Char('c'), KeyModifiers::CONTROL, Mode::Typing),
+            Some(Action::Quit),
+            "Ctrl-C still quits"
         );
     }
 }
