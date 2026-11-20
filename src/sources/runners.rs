@@ -96,6 +96,7 @@ fn discover_dirs(roots: &[PathBuf]) -> (Vec<Runner>, Vec<String>) {
             .filter(|p| {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with("actions-runner"))
+                    && p.is_dir()
             })
             .collect();
         dirs.sort();
@@ -416,6 +417,11 @@ mod tests {
         std::fs::create_dir_all(&broken).unwrap();
         std::fs::create_dir_all(&fresh).unwrap();
         std::fs::write(broken.join(".runner"), "{not json").unwrap();
+        std::fs::write(
+            root.join("actions-runner-linux-x64-2.321.0.tar.gz"),
+            "tarball",
+        )
+        .unwrap();
         let missing = root.join("gone");
         let (found, errors) = discover(&[root.clone(), missing.clone()], &[]);
         assert!(found.is_empty());
