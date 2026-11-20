@@ -1443,6 +1443,61 @@ fn config_problems_show_in_the_footer() {
 }
 
 #[test]
+fn a_config_problem_leaves_room_for_quit_and_the_freshness_markers() {
+    utc();
+    let s = snapshot();
+    let mut app = with_settings(
+        &s,
+        hide(
+            &[Panel::Roster, Panel::Runners, Panel::Host, Panel::Usage],
+            &[],
+        ),
+        Overrides::default(),
+        None,
+    );
+    app.config.problems = vec![
+        "unknown key thresholds.fleet_seconds".into(),
+        "unknown key display.theme".into(),
+    ];
+    let footer = |app: &App| {
+        let text = draw(&s, app, 100, 34).backend().to_string();
+        text.lines().last().unwrap().to_string()
+    };
+    let check = |f: &str| {
+        assert!(f.contains(" q  quit "), "{f}");
+        assert!(f.ends_with("nm 9s gh 25s quota 2m \""), "{f}");
+    };
+    let f = footer(&app);
+    check(&f);
+    assert!(f.contains("hidden ¹roster ²runners ³host ⁴usage"), "{f}");
+    assert!(f.contains("! config: unknow\u{2026} (+1 more)"), "{f}");
+
+    let mut app = with_settings(
+        &s,
+        hide(&[Panel::Runners, Panel::Host], &[]),
+        Overrides::default(),
+        None,
+    );
+    app.config.problems = vec![
+        "unknown key thresholds.fleet_seconds".into(),
+        "unknown key display.theme".into(),
+    ];
+    app.filter = crowsnest::app::Filter::NeedsYou;
+    app.paused = true;
+    let f = footer(&app);
+    check(&f);
+    assert!(f.contains(" ? ") && f.contains(" help "), "{f}");
+    assert!(
+        f.contains("filter: needs you") && f.contains("PAUSED"),
+        "{f}"
+    );
+    assert!(
+        !f.contains("config"),
+        "no room for any of the problem leaves the note out: {f}"
+    );
+}
+
+#[test]
 fn the_menu_never_panics_and_says_when_it_has_no_room() {
     utc();
     let s = snapshot();

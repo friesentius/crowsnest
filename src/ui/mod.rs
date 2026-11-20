@@ -1278,9 +1278,6 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         ("q", "quit"),
     ]);
     let mut right: Vec<Span<'static>> = Vec::new();
-    if let Some(note) = config_note(view, (w / 2).max(12)) {
-        right.push(span(format!("{note}  "), t.warn()));
-    }
     if view.app.filter != crate::app::Filter::All {
         right.push(span(
             format!("filter: {}  ", view.app.filter.label()),
@@ -1314,7 +1311,6 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
             right.push(span(format!("{tier} {} ", timefmt::dur(a)), t.dim()));
         }
     }
-    let rw = width_of(&right);
     // Keys that do not fit are dropped whole, least needed first (help
     // lists them all), rather than cut mid-word.
     let render = |keys: &[(&str, &str)]| {
@@ -1325,6 +1321,17 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         }
         left
     };
+    // The config note gets at most half the row, and never the room the
+    // other right-hand spans and "q quit" need; when that leaves too little
+    // it is left out (help lists every problem).
+    let reserve = width_of(&render(&[("q", "quit")])) + 2;
+    let budget = (w / 2).min(w.saturating_sub(width_of(&right) + reserve + 2));
+    if budget >= 12
+        && let Some(note) = config_note(view, budget)
+    {
+        right.insert(0, span(format!("{note}  "), t.warn()));
+    }
+    let rw = width_of(&right);
     for drop in [
         "pause", "refresh", "panels", "filter", "options", "roster", "runners", "detail", "select",
         "help",
@@ -1342,7 +1349,8 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
 }
 
 /// A failed save, or else what the config file had wrong, for the footer,
-/// in at most `w` columns. A long problem is cut, never the count after it.
+/// in at most `w` columns. A long problem is cut, never the count after it,
+/// and with no room left for any of the problem there is no note.
 fn config_note(view: &View, w: usize) -> Option<String> {
     let c = &view.app.config;
     if let Some((_, Some(e))) = &c.saved {
@@ -1355,6 +1363,9 @@ fn config_note(view: &View, w: usize) -> Option<String> {
         n => format!(" (+{} more)", n - 1),
     };
     let room = w.saturating_sub(head.width() + more.width());
+    if room == 0 {
+        return None;
+    }
     Some(format!("{head}{}{more}", trunc(first, room)))
 }
 
