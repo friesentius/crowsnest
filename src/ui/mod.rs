@@ -1348,8 +1348,8 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     }
     let rw = width_of(&right);
     for drop in [
-        "pause", "refresh", "panels", "filter", "options", "roster", "runners", "detail", "select",
-        "help",
+        "pause", "refresh", "panels", "filter", "options", "roster", "runners", "runner", "detail",
+        "select", "back", "help",
     ] {
         if width_of(&render(&keys)) < w.saturating_sub(rw + 1) {
             break;

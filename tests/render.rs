@@ -1507,8 +1507,26 @@ fn a_config_problem_leaves_room_for_quit_and_the_freshness_markers() {
         assert!(f.contains("! not saved") && f.contains(" q  quit "), "{f}");
         assert!(f.ends_with("nm 9s gh 25s quota 2m \""), "{f}");
     }
-    app.paused = false;
-    app.filter = crowsnest::app::Filter::All;
+
+    // With the runners focused, "esc back" gives way too.
+    let r = fleet_of_runners();
+    let mut app = with_settings(&r, Settings::default(), Overrides::default(), None);
+    app.apply(Action::Focus, &r);
+    assert!(app.runners_focused(&r));
+    app.filter = crowsnest::app::Filter::NeedsYou;
+    app.paused = true;
+    app.config.saved = Some((r.now, Some("cannot save /x/config.toml: read-only".into())));
+    let f = draw(&r, &app, 80, 34).backend().to_string();
+    let f = f.lines().last().unwrap();
+    assert!(f.contains("! not saved") && f.contains(" q  quit "), "{f}");
+
+    let mut app = with_settings(
+        &s,
+        hide(&[Panel::Runners, Panel::Host], &[]),
+        Overrides::default(),
+        None,
+    );
+    app.config.saved = Some((s.now, Some("cannot save /x/config.toml: read-only".into())));
     let f = footer(&app);
     check(&f);
     assert!(f.contains("! not saved: cannot save"), "{f}");
