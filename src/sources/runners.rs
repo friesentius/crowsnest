@@ -86,7 +86,7 @@ fn discover_dirs(roots: &[PathBuf]) -> (Vec<Runner>, Vec<String>) {
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(e) => {
-                errors.push(format!("{}: {}", root.display(), io_reason(&e)));
+                errors.push(format!("{}: {}", io_reason(&e), root.display()));
                 continue;
             }
         };
@@ -105,11 +105,11 @@ fn discover_dirs(roots: &[PathBuf]) -> (Vec<Runner>, Vec<String>) {
             match std::fs::read_to_string(&file) {
                 Ok(text) => match parse_runner_file(&dir, &text) {
                     Some(r) => out.push(r),
-                    None => errors.push(format!("{}: not a runner file", file.display())),
+                    None => errors.push(format!("not a runner file: {}", file.display())),
                 },
                 // A directory that was never configured is not a runner.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => errors.push(format!("{}: {}", file.display(), io_reason(&e))),
+                Err(e) => errors.push(format!("{}: {}", io_reason(&e), file.display())),
             }
         }
     }
@@ -426,10 +426,11 @@ mod tests {
         let (found, errors) = discover(&[root.clone(), missing.clone()], &[]);
         assert!(found.is_empty());
         assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(errors[0].ends_with("actions-runner-broken/.runner: not a runner file"));
+        assert!(errors[0].starts_with("not a runner file: "));
+        assert!(errors[0].ends_with("actions-runner-broken/.runner"));
         assert_eq!(
             errors[1],
-            format!("{}: No such file or directory", missing.display())
+            format!("No such file or directory: {}", missing.display())
         );
         std::fs::remove_dir_all(&root).unwrap();
     }

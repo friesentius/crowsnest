@@ -1693,7 +1693,15 @@ fn runner_read_failed() -> Snapshot {
     s.jobs.clear();
     s.gh_runners.clear();
     s.history.clear();
-    s.fresh.get_mut("runners").unwrap().error = Some("/srv/runners: Permission denied".into());
+    s.fresh.get_mut("runners").unwrap().error = Some("Permission denied: /srv/runners".into());
+    s
+}
+
+/// A runner read whose root sits deep enough to fill a narrow panel's row.
+fn runner_read_failed_long_path() -> Snapshot {
+    let mut s = runner_read_failed();
+    s.fresh.get_mut("runners").unwrap().error =
+        Some("Permission denied: /home/pantry/ci/self-hosted/actions-runners-locked".into());
     s
 }
 
@@ -1761,12 +1769,42 @@ fn a_failed_runner_read_is_shown_in_the_panel_and_the_footer() {
     for (w, h) in [(100, 34), (180, 44)] {
         let text = draw(&s, &app_for(&s), w, h).backend().to_string();
         assert!(
-            text.contains("! runners: /srv/runners:") && text.contains("Permission denied"),
+            text.contains("! runners: Permission denied:") && text.contains("/srv/runners"),
             "{w}:\n{text}"
         );
         assert!(text.contains("runners !"), "{w}:\n{text}");
         assert!(!text.contains("no self-hosted runners found"), "{text}");
     }
+}
+
+#[test]
+fn a_long_runner_root_keeps_the_reason_and_the_end_of_the_path() {
+    utc();
+    let s = runner_read_failed_long_path();
+    let text = draw(&s, &app_for(&s), 100, 34).backend().to_string();
+    assert!(text.contains("Permission denied"), "{text}");
+    assert!(text.contains("\u{2026}/actions-runners-locked"), "{text}");
+}
+
+#[test]
+fn a_runner_warning_uses_the_rows_the_panel_has_free() {
+    utc();
+    let mut s = runner_read_failed();
+    s.fresh.get_mut("runners").unwrap().error = Some(
+        "Permission denied: /srv/runners; not a runner file: /srv/runners/actions-runner-2/.runner"
+            .into(),
+    );
+    let text = draw(&s, &app_for(&s), 100, 34).backend().to_string();
+    // Past two rows: the second error's reason and the end of its path.
+    assert!(text.contains("not a runner"), "{text}");
+    assert!(text.contains("/.runner"), "{text}");
+}
+
+#[test]
+fn runner_read_failed_long_path_100() {
+    utc();
+    let s = runner_read_failed_long_path();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
 }
 
 #[test]

@@ -957,18 +957,18 @@ mod tests {
     fn the_runners_tier_reports_what_discovery_could_not_read() {
         let scan = runners::ProcessScan::new();
         let one = [Runner::default()];
-        let err = ["/srv: Permission denied".to_string()];
+        let err = ["Permission denied: /srv".to_string()];
         assert_eq!(runners_read(&one, &[], &scan), Read::Ok);
         assert_eq!(runners_read(&[], &[], &scan), Read::Ok);
         // Some found: partial, so the cadence stays.
         assert_eq!(
             runners_read(&one, &err, &scan),
-            Read::Partial("/srv: Permission denied".into())
+            Read::Partial("Permission denied: /srv".into())
         );
         // Nothing found and something unreadable: the read failed.
         assert_eq!(
             runners_read(&[], &err, &scan),
-            Read::Failed("/srv: Permission denied".into())
+            Read::Failed("Permission denied: /srv".into())
         );
     }
 

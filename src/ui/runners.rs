@@ -394,11 +394,6 @@ fn panel_lines(view: &View, lanes: &[Lane], w: usize, wide: bool) -> Vec<(u8, Li
         .unwrap_or(0);
     let name_w = max_label.min(w * 35 / 100).max(4);
     let mut lines = Vec::new();
-    lines.extend(
-        super::tier_error_lines(view, "runners", w)
-            .into_iter()
-            .map(|l| (0, l)),
-    );
     for (i, lane) in lanes.iter().enumerate() {
         lines.push((0, head(view, lane, name_w, wide, sel == Some(i), w)));
         if wide {
@@ -438,9 +433,10 @@ fn panel_lines(view: &View, lanes: &[Lane], w: usize, wide: bool) -> Vec<(u8, Li
 /// Rows the wide panel wants, borders included.
 pub fn wide_height(view: &View, w: u16) -> u16 {
     let lanes = lanes::lanes(view.snap, &view.app.runner_thresholds);
-    let n = panel_lines(view, &lanes, w.saturating_sub(4) as usize, true)
-        .len()
-        .max(1);
+    let w = w.saturating_sub(4) as usize;
+    let n = (panel_lines(view, &lanes, w, true).len()
+        + super::tier_error_lines(view, "runners", w, 0).len())
+    .max(1);
     n as u16 + 2
 }
 
@@ -457,8 +453,17 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
             t.dim(),
         ))));
     }
+    let body = panel_lines(view, &lanes, w, wide);
+    // First, and never dropped, so the warning can use the rows the lanes
+    // leave free.
+    let mut lines: Vec<(u8, Line<'static>)> =
+        super::tier_error_lines(view, "runners", w, avail.saturating_sub(body.len()))
+            .into_iter()
+            .map(|l| (0, l))
+            .collect();
+    lines.extend(body);
     content.extend(
-        keep(panel_lines(view, &lanes, w, wide), avail, t)
+        keep(lines, avail, t)
             .into_iter()
             .map(Content::Line),
     );
