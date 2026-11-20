@@ -1323,21 +1323,28 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         left
     };
     // The config note gets at most half the row, and never the room the
-    // other right-hand spans and "? help q quit" need. The list of hidden
-    // panels gives way to it first.
-    let reserve = width_of(&render(&[("?", "help"), ("q", "quit")])) + 2;
-    let budget =
-        |right: &[Span<'static>]| (w / 2).min(w.saturating_sub(width_of(right) + reserve + 2));
-    if let Some(mut note) = config_note(view, budget(&right)) {
-        if note.width() > budget(&right)
-            && let Some(i) = hidden_at
-        {
-            right.remove(i);
-            note = config_note(view, budget(&right)).unwrap_or_default();
-        }
-        if note.width() <= budget(&right) {
-            right.insert(0, span(format!("{note}  "), t.warn()));
-        }
+    // other right-hand spans and "? help q quit" need ("q quit" alone when
+    // that is the only way to show a failed save). The list of hidden panels
+    // gives way to it when that makes it fit.
+    let mut reserves = vec![width_of(&render(&[("?", "help"), ("q", "quit")])) + 2];
+    if matches!(view.app.config.saved, Some((_, Some(_)))) {
+        reserves.push(width_of(&render(&[("q", "quit")])) + 2);
+    }
+    let mut fewer = right.clone();
+    if let Some(i) = hidden_at {
+        fewer.remove(i);
+    }
+    let fits = reserves.iter().find_map(|reserve| {
+        [&right, &fewer].into_iter().find_map(|r| {
+            let budget = (w / 2).min(w.saturating_sub(width_of(r) + reserve + 2));
+            config_note(view, budget)
+                .filter(|n| n.width() <= budget)
+                .map(|n| (n, r.clone()))
+        })
+    });
+    if let Some((note, r)) = fits {
+        right = r;
+        right.insert(0, span(format!("{note}  "), t.warn()));
     }
     let rw = width_of(&right);
     for drop in [

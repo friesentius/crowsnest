@@ -1498,8 +1498,17 @@ fn a_config_problem_leaves_room_for_quit_and_the_freshness_markers() {
         "{f}"
     );
 
-    // A failed save from a panel hotkey is never crowded out.
+    // A failed save from a panel hotkey is never crowded out: "? help"
+    // gives way to it.
     app.config.saved = Some((s.now, Some("cannot save /x/config.toml: read-only".into())));
+    for width in [100, 80] {
+        let f = draw(&s, &app, width, 34).backend().to_string();
+        let f = f.lines().last().unwrap();
+        assert!(f.contains("! not saved") && f.contains(" q  quit "), "{f}");
+        assert!(f.ends_with("nm 9s gh 25s quota 2m \""), "{f}");
+    }
+    app.paused = false;
+    app.filter = crowsnest::app::Filter::All;
     let f = footer(&app);
     check(&f);
     assert!(f.contains("! not saved: cannot save"), "{f}");
