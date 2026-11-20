@@ -1115,7 +1115,17 @@ mod tests {
             std::fs::create_dir_all(&bin).unwrap();
             let exe = bin.join("Runner.Listener");
             std::fs::copy(sleep, &exe).unwrap();
-            FakeListener(std::process::Command::new(exe).arg("60").spawn().unwrap())
+            // A multicall coreutils (uutils, as on Ubuntu 26.04) picks the
+            // tool from argv[0], so keep that `sleep`; discovery goes by the
+            // executable, which is still `Runner.Listener`.
+            use std::os::unix::process::CommandExt;
+            FakeListener(
+                std::process::Command::new(exe)
+                    .arg0("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            )
         }
 
         fn stop(&mut self) {
