@@ -1414,6 +1414,20 @@ fn config_problems_show_in_the_footer() {
         f.contains("! config: unknown key display.theme (+1 more)"),
         "100 columns: {f}"
     );
+    // A problem too long for the footer is cut; the count after it stays.
+    app.config.problems = vec![
+        "unknown key thresholds.fleet_seconds".into(),
+        "unknown key display.theme".into(),
+    ];
+    let narrow = draw(&s, &app, 100, 34).backend().to_string();
+    let f = narrow.lines().last().unwrap();
+    assert!(
+        f.contains("! config: unknown key thresholds.fleet_\u{2026} (+1 more)"),
+        "100 columns: {f}"
+    );
+    app.config
+        .problems
+        .push("refresh.fleet_seconds must be a whole number from 10 to 3600".into());
     // Help lists every problem in full.
     app.help = true;
     let text = draw(&s, &app, 100, 34).backend().to_string();

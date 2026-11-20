@@ -277,6 +277,10 @@ fn run_tui(
         saved: None,
     };
     app.read_overdue_secs = read_overdue_secs(&app.effective());
+    // The settings as last written to (or read from) the file. A save
+    // writes every key that differs from these, so a change whose save
+    // failed is written by the next save that works.
+    let mut saved = app.settings.clone();
     let mut theme = Theme::new(color, app.effective().ascii);
     let mut terminal = ratatui::init();
     let mut last_title = usize::MAX;
@@ -327,7 +331,7 @@ fn run_tui(
                             handle.set_paused(app.paused);
                         }
                         if app.settings != before {
-                            settings_changed(&mut app, &handle, config_file.as_deref(), &before);
+                            settings_changed(&mut app, &handle, config_file.as_deref(), &mut saved);
                             theme = Theme::new(color, app.effective().ascii);
                         }
                         dirty = true;
@@ -355,13 +359,14 @@ fn settings_changed(
     app: &mut App,
     handle: &collector::Handle,
     file: Option<&Path>,
-    before: &Settings,
+    saved: &mut Settings,
 ) {
     let effective = app.effective();
     handle.set_intervals(fleet_interval(&effective), pipeline_interval(&effective));
     app.read_overdue_secs = read_overdue_secs(&effective);
     let result = match file {
-        Some(path) => config::save(path, before, &app.settings).map(|()| {
+        Some(path) => config::save(path, saved, &app.settings).map(|()| {
+            *saved = app.settings.clone();
             // What is left of the file's problems after the save.
             app.config.problems = config::load(path).problems;
         }),

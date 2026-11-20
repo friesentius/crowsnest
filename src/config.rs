@@ -533,6 +533,15 @@ pub fn render(
         None => DocumentMut::new(),
     };
     let all = existing.is_none();
+    // A file of nothing but comments holds them as the document's trailing
+    // text, which would end up below any table added now: keep them on top.
+    let lead = if doc.is_empty() {
+        let text = doc.trailing().as_str().unwrap_or_default().to_string();
+        doc.set_trailing("");
+        text
+    } else {
+        String::new()
+    };
     let names =
         |it: &mut dyn Iterator<Item = &str>| -> Value { Value::Array(it.collect::<Array>()) };
     if all || before.hidden_panels != after.hidden_panels {
@@ -566,8 +575,9 @@ pub fn render(
         set(&mut doc, setting.section(), setting.key(), v);
     }
     Ok(match existing {
-        Some(_) => doc.to_string(),
         None => format!("{HEADER}\n{doc}"),
+        Some(_) if doc.is_empty() || lead.trim().is_empty() => format!("{lead}{doc}"),
+        Some(_) => format!("{}\n\n{doc}", lead.trim_end()),
     })
 }
 
@@ -738,6 +748,23 @@ mod tests {
             "no temp file left"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_keeps_a_comment_only_file_on_top() {
+        let mut s = Settings::default();
+        s.hidden_panels.insert(Panel::Runners);
+        let text = render(
+            Some("# crowsnest, by hand\n# stale_minutes = 45\n"),
+            &Settings::default(),
+            &s,
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "# crowsnest, by hand\n# stale_minutes = 45\n\n[panels]\nhidden = [\"runners\"]\n"
+        );
+        assert_eq!(parse(&text).settings, s);
     }
 
     #[test]

@@ -1278,11 +1278,8 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         ("q", "quit"),
     ]);
     let mut right: Vec<Span<'static>> = Vec::new();
-    if let Some(note) = config_note(view) {
-        right.push(span(
-            format!("{}  ", trunc(&note, (w / 2).max(12))),
-            t.warn(),
-        ));
+    if let Some(note) = config_note(view, (w / 2).max(12)) {
+        right.push(span(format!("{note}  "), t.warn()));
     }
     if view.app.filter != crate::app::Filter::All {
         right.push(span(
@@ -1344,18 +1341,21 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     buf.set_line(area.x, area.y, &Line::from(spans), area.width);
 }
 
-/// A failed save, or else what the config file had wrong, for the footer.
-fn config_note(view: &View) -> Option<String> {
+/// A failed save, or else what the config file had wrong, for the footer,
+/// in at most `w` columns. A long problem is cut, never the count after it.
+fn config_note(view: &View, w: usize) -> Option<String> {
     let c = &view.app.config;
     if let Some((_, Some(e))) = &c.saved {
-        return Some(format!("! not saved: {e}"));
+        return Some(trunc(&format!("! not saved: {e}"), w));
     }
     let first = c.problems.first()?;
+    let head = "! config: ";
     let more = match c.problems.len() {
         1 => String::new(),
         n => format!(" (+{} more)", n - 1),
     };
-    Some(format!("! config: {first}{more}"))
+    let room = w.saturating_sub(head.width() + more.width());
+    Some(format!("{head}{}{more}", trunc(first, room)))
 }
 
 fn help(view: &View, buf: &mut Buffer, area: Rect) {
