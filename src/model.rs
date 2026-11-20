@@ -705,7 +705,9 @@ pub fn classify(
     match w.fm_state.as_str() {
         "failed" => return (WorkerState::Failed, None),
         "parked" => return gate(),
-        "done" => return (WorkerState::Done, None),
+        // A pipeline still moving outranks the report: the work is not
+        // finished until the run is, so the row shows its running step.
+        "done" if !pipe.is_some_and(Pipeline::is_live) => return (WorkerState::Done, None),
         "no_active_work" | "idle" => return (WorkerState::Idle, None),
         _ => {}
     }
@@ -715,7 +717,7 @@ pub fn classify(
     if pipe.is_some_and(Pipeline::is_parked) {
         return gate();
     }
-    let active = matches!(w.fm_state.as_str(), "working" | "paused");
+    let active = matches!(w.fm_state.as_str(), "working" | "paused" | "done");
     if !active {
         return (WorkerState::Unknown, None);
     }
@@ -1006,6 +1008,42 @@ mod tests {
             derive_state(&w, None, 1000 + 720, &th()),
             WorkerState::Stale
         );
+    }
+
+    #[test]
+    fn a_live_pipeline_outranks_a_reported_done() {
+        let w = worker("done");
+        let live = Pipeline {
+            status: "running".into(),
+            ..Default::default()
+        };
+        // The pipeline is still moving: the row is working, not done.
+        assert_eq!(
+            derive_state(&w, Some(&live), 1000, &th()),
+            WorkerState::Working
+        );
+        // Even long after the last status line, a moving run is not stale.
+        assert_eq!(
+            derive_state(&w, Some(&live), 1000 + 100_000, &th()),
+            WorkerState::Working
+        );
+        // Done once the run is finished, parked, failed or absent.
+        for status in ["completed", "failed", "cancelled"] {
+            let p = Pipeline {
+                status: status.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                derive_state(&w, Some(&p), 1000, &th()),
+                WorkerState::Done,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            derive_state(&w, Some(&parked(5)), 1000, &th()),
+            WorkerState::Done
+        );
+        assert_eq!(derive_state(&w, None, 1000, &th()), WorkerState::Done);
     }
 
     #[test]

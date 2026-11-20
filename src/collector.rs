@@ -6,7 +6,7 @@
 //! | host     | 2 s                                                          |
 //! | runners  | 5 s (process scan, `_diag` file times), directories re-listed every 60 s, systemd units every 30 s |
 //! | pipelines| 15 s per live no-mistakes task                               |
-//! | fleet    | 60 s, or 20 s after firstmate's fleet ledger changes         |
+//! | fleet    | 60 s                                                         |
 //! | github   | 60 s while a PR, runner or queued job is active, otherwise 5 min |
 //! | ↳ history| completed runs every 10 min, or when a watched run finishes; each run's jobs once |
 //! | ↳ runners API | 5 min per repository                                    |
@@ -21,7 +21,12 @@
 use crate::model::{
     Fleet, Freshness, Job, PrChecks, RepoHistory, RepoRunners, Runner, Service, Snapshot,
 };
-use crate::sources::{self, history::RepoCache, host::HostReader, runners};
+use crate::sources::{
+    self,
+    history::RepoCache,
+    host::{self, HostReader},
+    runners,
+};
 use crate::timefmt::now_epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -41,19 +46,10 @@ pub struct Config {
     pub runner_units: Vec<(PathBuf, String)>,
     pub disk_paths: Vec<PathBuf>,
     pub fleet_interval: Duration,
-    pub fleet_min_gap: Duration,
     pub pipeline_interval: Duration,
     pub github: bool,
     pub quota: bool,
     pub quota_providers: Vec<String>,
-}
-
-impl Config {
-    /// Firstmate's documented, opt-in activity ledger. Its modification time
-    /// is a cheap "something happened" signal when a home has it enabled.
-    fn ledger(&self) -> PathBuf {
-        self.fm_home.join("state").join("fleet-ledger.jsonl")
-    }
 }
 
 pub type Shared = Arc<Mutex<Snapshot>>;
@@ -413,9 +409,9 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             paused.clone(),
             || Duration::from_secs(2),
             move |_| {
-                let host = reader.read();
-                shared.lock().unwrap().host = Some(host);
-                Read::Ok
+                let read = reader.read();
+                shared.lock().unwrap().host = Some(read.host);
+                item_read(read.errors, host::PARTS)
             },
         );
     }
@@ -427,6 +423,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let mut scan = runners::ProcessScan::new();
         let mut services = Services::default();
         let mut list = Vec::new();
+        let mut list_errors: Vec<String> = Vec::new();
         let mut listed: Option<Instant> = None;
         let gh_wake = gh_tx.clone();
         let mut repos_seen: Vec<String> = Vec::new();
@@ -439,7 +436,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             || Duration::from_secs(5),
             move |_| {
                 if listed.is_none_or(|t| t.elapsed() > Duration::from_secs(60)) {
-                    list = runners::discover(&roots, &units);
+                    (list, list_errors) = runners::discover(&roots, &units);
                     listed = Some(Instant::now());
                 }
                 scan.update(&mut list);
@@ -455,7 +452,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     repos_seen = repos;
                     let _ = gh_wake.send(());
                 }
-                Read::Ok
+                runners_read(&list, &list_errors, &scan)
             },
         );
     }
@@ -463,11 +460,8 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     // Fleet.
     {
         let (shared, cfg2) = (shared.clone(), cfg.clone());
-        let ledger = cfg.ledger();
         let mut last_run: Option<Instant> = None;
-        let mut ledger_seen = mtime(&ledger);
         let intervals = intervals.clone();
-        let min_gap = cfg.fleet_min_gap;
         let paused2 = paused.clone();
         let (gh_read, gh_tx) = (gh_read.clone(), gh_tx.clone());
         spawn_tier(
@@ -479,20 +473,15 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             || Duration::from_secs(2),
             move |forced| {
                 let since = last_run.map(|t| t.elapsed());
-                let ledger_now = mtime(&ledger);
-                let ledger_moved = ledger_now != ledger_seen;
                 let due = match since {
                     None => true,
                     Some(e) if forced => e >= Duration::from_secs(3),
                     Some(_) if paused2.load(Ordering::Relaxed) => false,
-                    Some(e) => {
-                        e >= Intervals::get(&intervals.fleet) || (ledger_moved && e >= min_gap)
-                    }
+                    Some(e) => e >= Intervals::get(&intervals.fleet),
                 };
                 if !due {
                     return Read::Skipped;
                 }
-                ledger_seen = ledger_now;
                 last_run = Some(Instant::now());
                 match sources::read_fleet(&cfg2.fm_home, &cfg2.cache_dir) {
                     Ok(fleet) => {
@@ -556,7 +545,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 if has_new_prs(&s, &gh_read.lock().unwrap()) {
                     let _ = gh_tx.send(());
                 }
-                nm_read(errors, total)
+                item_read(errors, total)
             },
         );
     }
@@ -633,9 +622,9 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     (shared, handle)
 }
 
-/// Pipelines are read one task at a time: the read fails outright only when
-/// every task failed.
-fn nm_read(errors: Vec<String>, total: usize) -> Read {
+/// A tier read in `total` parts (a task's pipeline, a part of the host): it
+/// fails outright only when every part failed, and is partial when some did.
+fn item_read(errors: Vec<String>, total: usize) -> Read {
     if errors.len() == total {
         Read::from_errors(errors, Vec::new())
     } else {
@@ -666,8 +655,21 @@ fn gh_active(s: &Snapshot) -> bool {
         || !sources::pr_urls(s.fleet.as_ref(), &s.pipelines).is_empty()
 }
 
-fn mtime(p: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+/// What the runner tier read: a root or `.runner` file that could not be
+/// read, or a process table that cannot be scanned, is an error. With
+/// nothing discovered the read failed outright; otherwise it is partial.
+fn runners_read(list: &[Runner], discovery: &[String], scan: &runners::ProcessScan) -> Read {
+    let mut errors = discovery.to_vec();
+    if scan.unavailable() && !list.is_empty() {
+        errors.push("process table unavailable: runners cannot be told up or busy".into());
+    }
+    if errors.is_empty() {
+        Read::Ok
+    } else if list.is_empty() {
+        Read::Failed(errors.join("; "))
+    } else {
+        Read::Partial(errors.join("; "))
+    }
 }
 
 /// Collect every tier once, in order, for `--once`.
@@ -679,16 +681,19 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     let note = |s: &mut Snapshot, tier: &str, r: Read| {
         r.record(s.fresh.entry(tier.into()).or_default());
     };
-    s.host = Some(HostReader::new(cfg.disk_paths.clone()).read());
-    note(&mut s, "host", Read::Ok);
-    let mut list = runners::discover(&cfg.runner_roots, &cfg.runner_units);
-    runners::ProcessScan::new().update(&mut list);
+    let read = HostReader::new(cfg.disk_paths.clone()).read();
+    s.host = Some(read.host);
+    note(&mut s, "host", item_read(read.errors, host::PARTS));
+    let (mut list, list_errors) = runners::discover(&cfg.runner_roots, &cfg.runner_units);
+    let mut scan = runners::ProcessScan::new();
+    scan.update(&mut list);
     for r in &mut list {
         runners::read_diag(r);
     }
     Services::default().update(&mut list);
+    let r = runners_read(&list, &list_errors, &scan);
     s.runners = list;
-    note(&mut s, "runners", Read::Ok);
+    note(&mut s, "runners", r);
     let r = match sources::read_fleet(&cfg.fm_home, &cfg.cache_dir) {
         Ok(f) => {
             s.fleet = Some(f);
@@ -713,7 +718,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
             Err(e) => errors.push(format!("{id}: {e}")),
         }
     }
-    note(&mut s, "nm", nm_read(errors, total));
+    note(&mut s, "nm", item_read(errors, total));
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
         let prs = sources::read_pr_checks(&urls);
@@ -931,9 +936,50 @@ mod tests {
     #[test]
     fn pipelines_fail_outright_only_when_every_task_failed() {
         let e = || vec!["a: no-mistakes: timed out".to_string()];
-        assert!(matches!(nm_read(e(), 1), Read::Failed(_)));
-        assert!(matches!(nm_read(e(), 2), Read::Partial(_)));
-        assert_eq!(nm_read(vec![], 2), Read::Ok);
-        assert_eq!(nm_read(vec![], 0), Read::Ok);
+        assert!(matches!(item_read(e(), 1), Read::Failed(_)));
+        assert!(matches!(item_read(e(), 2), Read::Partial(_)));
+        assert_eq!(item_read(vec![], 2), Read::Ok);
+        assert_eq!(item_read(vec![], 0), Read::Ok);
+    }
+
+    #[test]
+    fn the_host_fails_outright_only_when_every_part_failed() {
+        let parts = |n: usize| (0..n).map(|i| format!("part {i}")).collect::<Vec<_>>();
+        assert_eq!(item_read(vec![], host::PARTS), Read::Ok);
+        assert!(matches!(item_read(parts(1), host::PARTS), Read::Partial(_)));
+        assert!(matches!(
+            item_read(parts(host::PARTS), host::PARTS),
+            Read::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn the_runners_tier_reports_what_discovery_could_not_read() {
+        let scan = runners::ProcessScan::new();
+        let one = [Runner::default()];
+        let err = ["/srv: Permission denied".to_string()];
+        assert_eq!(runners_read(&one, &[], &scan), Read::Ok);
+        assert_eq!(runners_read(&[], &[], &scan), Read::Ok);
+        // Some found: partial, so the cadence stays.
+        assert_eq!(
+            runners_read(&one, &err, &scan),
+            Read::Partial("/srv: Permission denied".into())
+        );
+        // Nothing found and something unreadable: the read failed.
+        assert_eq!(
+            runners_read(&[], &err, &scan),
+            Read::Failed("/srv: Permission denied".into())
+        );
+    }
+
+    #[test]
+    fn a_failed_read_is_recorded_and_a_good_one_clears_it() {
+        let mut f = Freshness::default();
+        Read::Failed("boom".into()).record(&mut f);
+        assert_eq!(f.error.as_deref(), Some("boom"));
+        assert_eq!(f.ok_at, None);
+        Read::Ok.record(&mut f);
+        assert_eq!(f.error, None);
+        assert!(f.ok_at.is_some());
     }
 }

@@ -201,7 +201,7 @@ Saving rewrites only the entries whose setting you changed, so your comments, an
 | `◆ GATE` | Its no-mistakes run is parked at a gate, for less than `--parked-minutes`. The STEP column shows how long (`parked 4m`). |
 | `◐ WORKING` | Working. |
 | `‖ PAUSED` | Paused, for example on a declared wait (`until <time>` in its status line). |
-| `✓ DONE` | Reported done. |
+| `✓ DONE` | Reported done, and its pipeline (if any) is finished. A task reported done whose no-mistakes run is still moving shows `WORKING` and its running step until the run ends. |
 | `~ UNKNOWN` | Firstmate cannot tell, for example because the worker's pane is gone. |
 | `○ IDLE` | Nothing in flight, for example a secondmate with no active child work. |
 
@@ -278,7 +278,7 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 
 | Panel | Source | Default cadence |
 | --- | --- | --- |
-| Roster, held calls | `bin/fm-fleet-snapshot.sh --json`, schema `fm-fleet-snapshot.v1` | 60 s, or 20 s after the opt-in fleet ledger (`state/fleet-ledger.jsonl`) changes |
+| Roster, held calls | `bin/fm-fleet-snapshot.sh --json`, schema `fm-fleet-snapshot.v1` | 60 s (`--fleet-interval`), or at once on `r`; crowsnest never reads firstmate's state files, so nothing else speeds it up |
 | Pipeline strip and steps | `no-mistakes axi status`, inside each no-mistakes task's worktree | 15 s |
 | PR checks | one `gh api graphql` read query for every PR on screen | 60 s while anything is active, otherwise 5 min |
 | Runners | `actions-runner*/.runner` files; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s |
@@ -290,7 +290,8 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Usage | `quota-axi --no-credential-refresh --json` | 5 min |
 
 Each source runs on its own thread, with a timeout, and never overlaps itself.
-A source that fails keeps its last good data and is marked with `!` in the footer (a fleet snapshot error is spelled out under the summary line).
+A source that fails keeps its last good data and is marked with `!` in the footer (`host !`, `runners !`, `nm !`, `gh !`, `quota !`); the fleet snapshot's error is spelled out under the summary line, and the host and runner errors at the top of their panels.
+The host fails outright only when load, memory and disks all failed; the runners fail outright when a root cannot be listed and no runner was found. An unreadable root, an unreadable or malformed `.runner` file, or a process table that cannot be scanned is otherwise a partial failure: the runners that were read stay.
 When its read fails outright, it is retried less often, doubling up to 5 minutes, until it recovers; a read where only some items failed, such as one unresolvable PR or one worktree, is still marked but keeps its normal cadence.
 The fleet snapshot is the expensive one (a few CPU-seconds per run), which is why it runs once a minute; everything else is close to free.
 Crowsnest itself, not counting the commands it runs, measured about 1% of one core and 7 MB of memory over two minutes against a six-worker fleet.

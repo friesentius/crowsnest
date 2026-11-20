@@ -394,6 +394,11 @@ fn panel_lines(view: &View, lanes: &[Lane], w: usize, wide: bool) -> Vec<(u8, Li
         .unwrap_or(0);
     let name_w = max_label.min(w * 35 / 100).max(4);
     let mut lines = Vec::new();
+    lines.extend(
+        super::tier_error_lines(view, "runners", w)
+            .into_iter()
+            .map(|l| (0, l)),
+    );
     for (i, lane) in lanes.iter().enumerate() {
         lines.push((0, head(view, lane, name_w, wide, sel == Some(i), w)));
         if wide {
@@ -446,7 +451,7 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
     let snap = view.snap;
     let lanes = lanes::lanes(snap, &view.app.runner_thresholds);
     let mut content: Vec<Content> = Vec::new();
-    if snap.runners.is_empty() {
+    if snap.runners.is_empty() && !snap.fresh.get("runners").is_some_and(|f| f.error.is_some()) {
         content.push(Content::Line(Line::from(span(
             "no self-hosted runners found",
             t.dim(),

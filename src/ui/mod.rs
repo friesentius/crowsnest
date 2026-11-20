@@ -1002,10 +1002,51 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
     );
 }
 
+/// The error of a tier's last read, if it failed.
+fn tier_error<'a>(view: &View<'a>, tier: &str) -> Option<&'a str> {
+    view.snap.fresh.get(tier)?.error.as_deref()
+}
+
+/// The most rows a panel gives a failed read's error.
+const ERROR_ROWS: usize = 2;
+
+/// A panel's warning for its tier's failed read, wrapped to `w` cells over at
+/// most [`ERROR_ROWS`] rows: `! host: disks: cannot list mounts`.
+pub(crate) fn tier_error_lines(view: &View, tier: &str, w: usize) -> Vec<Line<'static>> {
+    let Some(err) = tier_error(view, tier) else {
+        return Vec::new();
+    };
+    let text = format!("! {tier}: {err}");
+    let mut rows: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        match rows.last_mut() {
+            Some(row) if row.chars().count() + 1 + word.chars().count() <= w => {
+                row.push(' ');
+                row.push_str(word);
+            }
+            _ => rows.push(word.to_string()),
+        }
+    }
+    // A message that runs on past the last row is cut there, not dropped.
+    if rows.len() > ERROR_ROWS {
+        let tail = rows.split_off(ERROR_ROWS - 1).join(" ");
+        rows.push(tail);
+    }
+    rows.into_iter()
+        .map(|row| fit(vec![span(row, view.theme.warn())], w))
+        .collect()
+}
+
 fn host_panel(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Content> = Vec::new();
+    // First, so a small panel cuts the least needed readings instead.
+    lines.extend(
+        tier_error_lines(view, "host", w)
+            .into_iter()
+            .map(Content::Line),
+    );
     if let Some(h) = &view.snap.host {
         let n = w.saturating_sub(22).clamp(4, 16);
         lines.push(Content::Line(fit(
@@ -1302,13 +1343,16 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         right.push(span(format!("hidden {}  ", hidden.join(" ")), t.dim()));
         right.len() - 1
     });
-    for tier in ["nm", "gh", "quota"] {
+    // The local tiers read every few seconds and are only named when they fail.
+    for tier in ["host", "runners", "nm", "gh", "quota"] {
         let Some(f) = view.snap.fresh.get(tier) else {
             continue;
         };
         if f.error.is_some() {
             right.push(span(format!("{tier} ! "), t.warn()));
-        } else if let Some(a) = age_of(view.snap, tier) {
+        } else if let Some(a) = age_of(view.snap, tier)
+            && !matches!(tier, "host" | "runners")
+        {
             right.push(span(format!("{tier} {} ", timefmt::dur(a)), t.dim()));
         }
     }
