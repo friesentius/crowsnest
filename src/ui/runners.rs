@@ -462,11 +462,7 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
             .map(|l| (0, l))
             .collect();
     lines.extend(body);
-    content.extend(
-        keep(lines, avail, t)
-            .into_iter()
-            .map(Content::Line),
-    );
+    content.extend(keep(lines, avail, t).into_iter().map(Content::Line));
     let mut title = vec![
         span(super::panel_mark(t, Panel::Runners), t.bold()),
         span("RUNNERS", t.bold()),
