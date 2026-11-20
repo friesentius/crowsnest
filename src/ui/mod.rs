@@ -1298,9 +1298,10 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
             }
         })
         .collect();
-    if !hidden.is_empty() {
+    let hidden_at = (!hidden.is_empty()).then(|| {
         right.push(span(format!("hidden {}  ", hidden.join(" ")), t.dim()));
-    }
+        right.len() - 1
+    });
     for tier in ["nm", "gh", "quota"] {
         let Some(f) = view.snap.fresh.get(tier) else {
             continue;
@@ -1322,14 +1323,21 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         left
     };
     // The config note gets at most half the row, and never the room the
-    // other right-hand spans and "q quit" need; when that leaves too little
-    // it is left out (help lists every problem).
-    let reserve = width_of(&render(&[("q", "quit")])) + 2;
-    let budget = (w / 2).min(w.saturating_sub(width_of(&right) + reserve + 2));
-    if budget >= 12
-        && let Some(note) = config_note(view, budget)
-    {
-        right.insert(0, span(format!("{note}  "), t.warn()));
+    // other right-hand spans and "? help q quit" need. The list of hidden
+    // panels gives way to it first.
+    let reserve = width_of(&render(&[("?", "help"), ("q", "quit")])) + 2;
+    let budget =
+        |right: &[Span<'static>]| (w / 2).min(w.saturating_sub(width_of(right) + reserve + 2));
+    if let Some(mut note) = config_note(view, budget(&right)) {
+        if note.width() > budget(&right)
+            && let Some(i) = hidden_at
+        {
+            right.remove(i);
+            note = config_note(view, budget(&right)).unwrap_or_default();
+        }
+        if note.width() <= budget(&right) {
+            right.insert(0, span(format!("{note}  "), t.warn()));
+        }
     }
     let rw = width_of(&right);
     for drop in [
@@ -1349,12 +1357,18 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
 }
 
 /// A failed save, or else what the config file had wrong, for the footer,
-/// in at most `w` columns. A long problem is cut, never the count after it,
-/// and with no room left for any of the problem there is no note.
+/// in at most `w` columns. A long problem is cut, never the count after it;
+/// with too little room for the problem the note is only a short marker.
 fn config_note(view: &View, w: usize) -> Option<String> {
+    const MIN_TEXT: usize = 8;
     let c = &view.app.config;
     if let Some((_, Some(e))) = &c.saved {
-        return Some(trunc(&format!("! not saved: {e}"), w));
+        let head = "! not saved";
+        return Some(if w >= head.width() + 2 + MIN_TEXT {
+            trunc(&format!("{head}: {e}"), w)
+        } else {
+            head.to_string()
+        });
     }
     let first = c.problems.first()?;
     let head = "! config: ";
@@ -1363,10 +1377,11 @@ fn config_note(view: &View, w: usize) -> Option<String> {
         n => format!(" (+{} more)", n - 1),
     };
     let room = w.saturating_sub(head.width() + more.width());
-    if room == 0 {
-        return None;
-    }
-    Some(format!("{head}{}{more}", trunc(first, room)))
+    Some(if room >= MIN_TEXT {
+        format!("{head}{}{more}", trunc(first, room))
+    } else {
+        format!("{head}{} ignored", c.problems.len())
+    })
 }
 
 fn help(view: &View, buf: &mut Buffer, area: Rect) {

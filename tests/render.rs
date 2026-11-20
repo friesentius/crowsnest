@@ -1425,6 +1425,7 @@ fn config_problems_show_in_the_footer() {
         f.contains("! config: unknown key thresholds.fleet_\u{2026} (+1 more)"),
         "100 columns: {f}"
     );
+    assert!(f.contains(" ?  help  q  quit "), "100 columns: {f}");
     app.config
         .problems
         .push("refresh.fleet_seconds must be a whole number from 10 to 3600".into());
@@ -1446,6 +1447,22 @@ fn config_problems_show_in_the_footer() {
 fn a_config_problem_leaves_room_for_quit_and_the_freshness_markers() {
     utc();
     let s = snapshot();
+    let problems = || -> Vec<String> {
+        vec![
+            "unknown key thresholds.fleet_seconds".into(),
+            "unknown key display.theme".into(),
+        ]
+    };
+    let footer = |app: &App| {
+        let text = draw(&s, app, 100, 34).backend().to_string();
+        text.lines().last().unwrap().to_string()
+    };
+    let check = |f: &str| {
+        assert!(f.contains(" ?  help  q  quit "), "{f}");
+        assert!(f.ends_with("nm 9s gh 25s quota 2m \""), "{f}");
+    };
+
+    // The list of hidden panels gives way to the note.
     let mut app = with_settings(
         &s,
         hide(
@@ -1455,22 +1472,11 @@ fn a_config_problem_leaves_room_for_quit_and_the_freshness_markers() {
         Overrides::default(),
         None,
     );
-    app.config.problems = vec![
-        "unknown key thresholds.fleet_seconds".into(),
-        "unknown key display.theme".into(),
-    ];
-    let footer = |app: &App| {
-        let text = draw(&s, app, 100, 34).backend().to_string();
-        text.lines().last().unwrap().to_string()
-    };
-    let check = |f: &str| {
-        assert!(f.contains(" q  quit "), "{f}");
-        assert!(f.ends_with("nm 9s gh 25s quota 2m \""), "{f}");
-    };
+    app.config.problems = problems();
     let f = footer(&app);
     check(&f);
-    assert!(f.contains("hidden ¹roster ²runners ³host ⁴usage"), "{f}");
-    assert!(f.contains("! config: unknow\u{2026} (+1 more)"), "{f}");
+    assert!(f.contains("! config: unknown key thresholds"), "{f}");
+    assert!(f.contains("(+1 more)"), "{f}");
 
     let mut app = with_settings(
         &s,
@@ -1478,23 +1484,25 @@ fn a_config_problem_leaves_room_for_quit_and_the_freshness_markers() {
         Overrides::default(),
         None,
     );
-    app.config.problems = vec![
-        "unknown key thresholds.fleet_seconds".into(),
-        "unknown key display.theme".into(),
-    ];
+    app.config.problems = problems();
     app.filter = crowsnest::app::Filter::NeedsYou;
     app.paused = true;
     let f = footer(&app);
     check(&f);
-    assert!(f.contains(" ? ") && f.contains(" help "), "{f}");
     assert!(
         f.contains("filter: needs you") && f.contains("PAUSED"),
         "{f}"
     );
     assert!(
-        !f.contains("config"),
-        "no room for any of the problem leaves the note out: {f}"
+        f.contains("! config: unknown") && f.contains("(+1 more)"),
+        "{f}"
     );
+
+    // A failed save from a panel hotkey is never crowded out.
+    app.config.saved = Some((s.now, Some("cannot save /x/config.toml: read-only".into())));
+    let f = footer(&app);
+    check(&f);
+    assert!(f.contains("! not saved: cannot save"), "{f}");
 }
 
 #[test]
