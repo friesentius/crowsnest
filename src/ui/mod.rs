@@ -1530,6 +1530,9 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
     let settings = &view.app.settings;
     let wide = area.width >= WIDE;
     let roster_shown = settings.shown(Panel::Roster);
+    // Where the options menu may sit: over a panel it covers whole, never
+    // across the edge of the others.
+    let mut menu_area = main;
     // The held calls need the wide layout's right column, or the whole
     // screen once the roster is hidden.
     let side: Vec<Panel> = Panel::ALL[1..]
@@ -1544,11 +1547,13 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
             Layout::horizontal([Constraint::Min(60), Constraint::Length(RIGHT_COL)]).areas(main);
         roster(view, buf, left, host);
         stack(view, buf, right, &side, host);
+        menu_area = left;
     } else if roster_shown {
         let panels_h = if main.height >= 22 { 7 } else { 0 };
         let [roster_area, panels] =
             Layout::vertical([Constraint::Min(6), Constraint::Length(panels_h)]).areas(main);
         roster(view, buf, roster_area, host);
+        menu_area = roster_area;
         if panels_h > 0 {
             let n = side.len() as u32;
             let rects =
@@ -1578,6 +1583,7 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
         for (col, r) in cols.iter().zip(rects.iter()) {
             stack(view, buf, *r, col, host);
         }
+        menu_area = rects[0];
     } else {
         stack(view, buf, main, &side, host);
     }
@@ -1589,7 +1595,7 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
         help(view, buf, area);
     }
     if view.app.menu.is_some() {
-        menu::draw(view, buf, main);
+        menu::draw(view, buf, menu_area, main);
     }
     if view.theme.ascii {
         ascii_fold(buf, area);

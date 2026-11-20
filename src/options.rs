@@ -174,8 +174,8 @@ fn usage_items(file: &Settings, quota: &[QuotaWindow]) -> Vec<Item> {
                 on,
                 locked: (!p_on).then(|| format!("{p} is hidden")),
                 about: format!(
-                    "{p}/{} on its own. quota-axi reports what is left, so a window your plan does not include (0 of 0) reads as 100% used.",
-                    w.id
+                    "Only the {} window of {p}. quota-axi reports what is left, so a window your plan does not include (0 of 0) reads as 100% used.",
+                    w.label
                 ),
             });
         }

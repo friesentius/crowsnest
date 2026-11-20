@@ -15,19 +15,44 @@ use unicode_width::UnicodeWidthStr;
 /// The category column, between the left border and the divider.
 const CAT_W: u16 = 14;
 const MAX_W: u16 = 86;
+/// Below this much room beside it, the box takes all of the width.
+const SNAP: u16 = 20;
 /// Description lines kept under the rows.
 const MAX_ABOUT: usize = 4;
 /// How long "saved" shows after a save, in seconds.
 const SAVED_FOR: i64 = 3;
 
-pub fn draw(view: &View, buf: &mut Buffer, area: Rect) {
-    let t = &view.theme;
-    let app = view.app;
-    let Some(menu) = &app.menu else {
+/// Draw the menu in `area`, a panel or column it may cover whole, or in
+/// `fallback` (the whole body) when that is too small to hold it.
+pub fn draw(view: &View, buf: &mut Buffer, area: Rect, fallback: Rect) {
+    if view.app.menu.is_none() {
         return;
+    }
+    match geometry(view, area).or_else(|| geometry(view, fallback)) {
+        Some(g) => draw_in(view, buf, &g),
+        None => too_small(&view.theme, buf, fallback),
+    }
+}
+
+/// Where the menu sits and how tall each of its parts is.
+struct Geometry {
+    r: Rect,
+    rw: usize,
+    list_h: u16,
+    about_h: usize,
+}
+
+/// The menu's box in `area`, or None when `area` cannot hold it.
+fn geometry(view: &View, area: Rect) -> Option<Geometry> {
+    let app = view.app;
+    // Where the box is narrower than `area` by a few cells, it takes the
+    // whole width, so its edges are the borders around it and never cut
+    // through the text beside it.
+    let w = if area.width < MAX_W + SNAP {
+        area.width
+    } else {
+        MAX_W
     };
-    let items = app.menu_items(view.snap);
-    let w = MAX_W.min(area.width.saturating_sub(4));
     let rw = w.saturating_sub(CAT_W + 3) as usize;
     // The box keeps one size while you move between rows and categories.
     let all: Vec<Vec<Item>> = Category::ALL
@@ -49,9 +74,9 @@ pub fn draw(view: &View, buf: &mut Buffer, area: Rect) {
         .max(Category::ALL.len());
     let chrome = about_h as u16 + 5;
     let list_h = (rows_wanted as u16).min(area.height.saturating_sub(chrome));
-    if rw < 30 || list_h < Category::ALL.len() as u16 {
-        too_small(t, buf, area);
-        return;
+    // Room for the rows, as when the box kept two cells clear of each side.
+    if rw < 30 || area.width < CAT_W + 37 || list_h < Category::ALL.len() as u16 {
+        return None;
     }
     let h = list_h + chrome;
     let r = Rect::new(
@@ -60,6 +85,28 @@ pub fn draw(view: &View, buf: &mut Buffer, area: Rect) {
         w,
         h,
     );
+    Some(Geometry {
+        r,
+        rw,
+        list_h,
+        about_h,
+    })
+}
+
+fn draw_in(view: &View, buf: &mut Buffer, g: &Geometry) {
+    let t = &view.theme;
+    let app = view.app;
+    let Some(menu) = &app.menu else {
+        return;
+    };
+    let items = app.menu_items(view.snap);
+    let Geometry {
+        r,
+        rw,
+        list_h,
+        about_h,
+    } = *g;
+    let w = r.width;
     Clear.render(r, buf);
     let b = t.focus_border();
     let path = trunc(
@@ -138,9 +185,16 @@ pub fn draw(view: &View, buf: &mut Buffer, area: Rect) {
         buf.set_string(r.right() - 1, mid - 1, t.g("\u{25bc}", "v"), b);
     }
 
-    let about = selected
+    let mut about = selected
         .and_then(|i| items.get(i))
         .map_or_else(Vec::new, |i| wrap(&i.about, rw - 2));
+    // Text that does not fit ends in an ellipsis instead of stopping short.
+    if about.len() > about_h {
+        about.truncate(about_h);
+        if let Some(last) = about.last_mut() {
+            *last = trunc(&format!("{last} \u{2026}"), rw - 2);
+        }
+    }
     for (n, text) in about.iter().take(about_h).enumerate() {
         let line = Line::from(span(text.clone(), t.dim()));
         buf.set_line(x + 1, mid + 1 + n as u16, &line, rw as u16 - 2);

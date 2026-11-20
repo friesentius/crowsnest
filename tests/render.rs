@@ -1221,6 +1221,69 @@ fn options_menu_on_usage_180() {
     insta::assert_snapshot!(draw(&s, &app, 180, 50).backend());
 }
 
+/// The options menu over a usage window, at `cols`. It must leave every
+/// other panel's text whole: a cell outside the box's border is a border or
+/// a space, never the tail of a cut word.
+fn options_menu_at(cols: u16, rows: u16) -> String {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        hide(&[], &["copilot/premium_interactions"]),
+        Overrides::default(),
+        Some((Category::Usage, "premium interactions")),
+    );
+    let text = draw(&s, &app, cols, rows).backend().to_string();
+    let top = text
+        .lines()
+        .find(|l| l.contains("OPTIONS"))
+        .expect("the menu is open");
+    let (_, after) = top
+        .rsplit_once('\u{256e}')
+        .expect("the box's top right corner");
+    if let Some(next) = after.chars().next() {
+        assert!(
+            !next.is_alphanumeric(),
+            "text cut at the box edge ({cols} cols): {top}"
+        );
+    }
+    for cut in ["laude ", "opilot ", "nswer these"] {
+        for line in text.lines() {
+            if let Some((before, _)) = line.split_once(cut) {
+                assert!(
+                    !before.ends_with('\u{256e}') && !before.ends_with('\u{2502}'),
+                    "{cols} cols: {line}"
+                );
+            }
+        }
+    }
+    assert!(
+        text.contains("Only the premium interactions window of copilot."),
+        "{text}"
+    );
+    text
+}
+
+#[test]
+fn options_menu_clears_the_side_panels_at_100() {
+    insta::assert_snapshot!(options_menu_at(100, 40));
+}
+
+#[test]
+fn options_menu_clears_the_side_panels_at_140() {
+    insta::assert_snapshot!(options_menu_at(140, 44));
+}
+
+#[test]
+fn options_menu_clears_the_side_panels_at_180() {
+    insta::assert_snapshot!(options_menu_at(180, 50));
+}
+
+#[test]
+fn options_menu_clears_the_side_panels_at_220() {
+    insta::assert_snapshot!(options_menu_at(220, 50));
+}
+
 #[test]
 fn options_menu_shows_flags_as_locked() {
     utc();
