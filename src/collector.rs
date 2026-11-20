@@ -1113,7 +1113,15 @@ mod tests {
             // A copy of the shell, waiting on a stdin nothing writes to.
             // Not `sleep`: a multicall coreutils (uutils, as on Ubuntu 26.04)
             // refuses to run under any name but its own tools'.
-            std::fs::copy("/bin/sh", &exe).unwrap();
+            // Copied by `cp`, not in this process: a test thread forking
+            // here would inherit the copy's write fd and make the exec
+            // below fail with "Text file busy".
+            let copied = std::process::Command::new("cp")
+                .arg("/bin/sh")
+                .arg(&exe)
+                .status()
+                .unwrap();
+            assert!(copied.success(), "cp /bin/sh {}", exe.display());
             FakeListener(
                 std::process::Command::new(exe)
                     .args(["-c", "read _"])
