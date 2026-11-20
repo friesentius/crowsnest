@@ -1107,22 +1107,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     impl FakeListener {
         fn start(dir: &std::path::Path) -> Self {
-            let sleep = ["/bin/sleep", "/usr/bin/sleep"]
-                .into_iter()
-                .find(|p| std::path::Path::new(p).is_file())
-                .expect("sleep");
             let bin = dir.join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             let exe = bin.join("Runner.Listener");
-            std::fs::copy(sleep, &exe).unwrap();
-            // A multicall coreutils (uutils, as on Ubuntu 26.04) picks the
-            // tool from argv[0], so keep that `sleep`; discovery goes by the
-            // executable, which is still `Runner.Listener`.
-            use std::os::unix::process::CommandExt;
+            // A copy of the shell, waiting on a stdin nothing writes to.
+            // Not `sleep`: a multicall coreutils (uutils, as on Ubuntu 26.04)
+            // refuses to run under any name but its own tools'.
+            std::fs::copy("/bin/sh", &exe).unwrap();
             FakeListener(
                 std::process::Command::new(exe)
-                    .arg0("sleep")
-                    .arg("60")
+                    .args(["-c", "read _"])
+                    .stdin(std::process::Stdio::piped())
                     .spawn()
                     .unwrap(),
             )
