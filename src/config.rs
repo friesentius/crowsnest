@@ -330,13 +330,15 @@ impl Overrides {
     }
 }
 
-/// The default location: `$XDG_CONFIG_HOME/crowsnest/config.toml`, or
-/// `~/.config/crowsnest/config.toml`.
+/// The location: `$XDG_CONFIG_HOME/crowsnest/config.toml`, or
+/// `~/.config/crowsnest/config.toml`. Always absolute: a relative
+/// `XDG_CONFIG_HOME` is ignored, and a relative `HOME` gives none.
 pub fn default_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .filter(|p| p.is_absolute())?;
     Some(base.join("crowsnest").join("config.toml"))
 }
 
@@ -514,37 +516,52 @@ const HEADER: &str = "\
 # Every key is optional. The README lists what each one does.
 ";
 
-/// The text of the config file holding `s`, starting from `existing` so its
-/// comments and any entries crowsnest does not know are kept. Fails only when
-/// `existing` is not valid TOML, which is never overwritten.
-pub fn render(existing: Option<&str>, s: &Settings) -> Result<String, String> {
+/// The text of the config file after a change from `before` to `after`,
+/// starting from `existing` so its comments, the entries crowsnest does not
+/// know, and any entry whose setting did not change are kept exactly as
+/// written. A new file gets every key. Fails only when `existing` is not
+/// valid TOML, which is never overwritten.
+pub fn render(
+    existing: Option<&str>,
+    before: &Settings,
+    after: &Settings,
+) -> Result<String, String> {
     let mut doc = match existing {
         Some(text) => text
             .parse::<DocumentMut>()
             .map_err(|e| syntax_error(text, &e).replace(", using defaults", ""))?,
         None => DocumentMut::new(),
     };
+    let all = existing.is_none();
     let names =
         |it: &mut dyn Iterator<Item = &str>| -> Value { Value::Array(it.collect::<Array>()) };
-    set(
-        &mut doc,
-        "panels",
-        "hidden",
-        names(&mut s.hidden_panels.iter().map(|p| p.name())),
-    );
-    set(
-        &mut doc,
-        "usage",
-        "hidden",
-        names(&mut s.hidden_usage.iter().map(String::as_str)),
-    );
+    if all || before.hidden_panels != after.hidden_panels {
+        set(
+            &mut doc,
+            "panels",
+            "hidden",
+            names(&mut after.hidden_panels.iter().map(|p| p.name())),
+        );
+    }
+    if all || before.hidden_usage != after.hidden_usage {
+        set(
+            &mut doc,
+            "usage",
+            "hidden",
+            names(&mut after.hidden_usage.iter().map(String::as_str)),
+        );
+    }
     for setting in Setting::ALL {
+        if !all && setting.get(before) == setting.get(after) {
+            continue;
+        }
+        let v = setting.get(after);
         let v = if setting.is_bool() {
-            Value::from(setting.get(s) != 0)
+            Value::from(v != 0)
         } else if setting.scale() > 1 {
-            Value::from(setting.get(s) as f64 / setting.scale() as f64)
+            Value::from(v as f64 / setting.scale() as f64)
         } else {
-            Value::from(setting.get(s) as i64)
+            Value::from(v as i64)
         };
         set(&mut doc, setting.section(), setting.key(), v);
     }
@@ -554,9 +571,7 @@ pub fn render(existing: Option<&str>, s: &Settings) -> Result<String, String> {
     })
 }
 
-/// Set `section.key`. An existing entry that already holds the value is left
-/// exactly as written; a changed one keeps its key, and the comments above
-/// and after it.
+/// Set `section.key`, keeping the key and the comments above and after it.
 fn set(doc: &mut DocumentMut, section: &str, key: &str, mut value: Value) {
     let entry = doc.entry(section).or_insert_with(toml_edit::table);
     if entry.as_table_like().is_none() {
@@ -565,29 +580,13 @@ fn set(doc: &mut DocumentMut, section: &str, key: &str, mut value: Value) {
     let table = entry.as_table_like_mut().expect("just made a table");
     match table.get_mut(key) {
         Some(Item::Value(old)) => {
-            if !same(old, &value) {
-                *value.decor_mut() = old.decor().clone();
-                *old = value;
-            }
+            *value.decor_mut() = old.decor().clone();
+            *old = value;
         }
         Some(item) => *item = Item::Value(value),
         None => {
             table.insert(key, Item::Value(value));
         }
-    }
-}
-
-/// Whether two values mean the same, however they are written.
-fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Array(x), Value::Array(y)) => {
-            x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| same(p, q))
-        }
-        (Value::String(x), Value::String(y)) => x.value() == y.value(),
-        (Value::Integer(x), Value::Integer(y)) => x.value() == y.value(),
-        (Value::Float(x), Value::Float(y)) => x.value() == y.value(),
-        (Value::Boolean(x), Value::Boolean(y)) => x.value() == y.value(),
-        _ => false,
     }
 }
 
@@ -599,27 +598,38 @@ fn file_name(path: &Path) -> String {
     )
 }
 
-/// Save `s` to `path`: create the directory and file on first save, keep what
-/// crowsnest does not manage, and replace the file in one rename so a reader
-/// never sees half of it.
-pub fn save(path: &Path, s: &Settings) -> Result<(), String> {
+/// Save a change from `before` to `after` to `path`: create the directory
+/// and file on first save, rewrite only the entries whose setting changed,
+/// and replace the file in one rename so a reader never sees half of it. A
+/// symlinked file is written through to its target, keeping its permissions.
+pub fn save(path: &Path, before: &Settings, after: &Settings) -> Result<(), String> {
     let existing = match std::fs::read_to_string(path) {
         Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(format!("cannot read {}: {e}", file_name(path))),
     };
-    let text = render(existing.as_deref(), s)?;
+    let text = render(existing.as_deref(), before, after)?;
     if existing.as_deref() == Some(text.as_str()) {
         return Ok(());
     }
-    let dir = path
+    let target = match existing {
+        Some(_) => std::fs::canonicalize(path)
+            .map_err(|e| format!("cannot resolve {}: {e}", file_name(path)))?,
+        None => path.to_path_buf(),
+    };
+    let dir = target
         .parent()
-        .ok_or_else(|| format!("{} has no directory", path.display()))?;
+        .ok_or_else(|| format!("{} has no directory", target.display()))?;
     std::fs::create_dir_all(dir)
         .map_err(|e| format!("cannot create the directory for {}: {e}", file_name(path)))?;
     let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, text)
-        .and_then(|()| std::fs::rename(&tmp, path))
+        .and_then(|()| match std::fs::metadata(&target) {
+            Ok(m) => std::fs::set_permissions(&tmp, m.permissions()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .and_then(|()| std::fs::rename(&tmp, &target))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("cannot save {}: {e}", file_name(path))
@@ -669,7 +679,8 @@ mod tests {
 
     #[test]
     fn a_new_file_has_every_key() {
-        let text = render(None, &Settings::default()).unwrap();
+        let d = Settings::default();
+        let text = render(None, &d, &d).unwrap();
         assert!(text.starts_with("# crowsnest settings"), "{text}");
         for s in Setting::ALL {
             assert!(text.contains(&format!("\n{} = ", s.key())), "{text}");
@@ -704,7 +715,7 @@ mod tests {
         s.wait_grace_minutes = 0;
         s.fleet_seconds = 120;
         s.ascii = true;
-        save(&path, &s).unwrap();
+        save(&path, &Settings::default(), &s).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("hidden = [\"runners\", \"held\"]"), "{text}");
         assert_eq!(
@@ -716,7 +727,7 @@ mod tests {
         );
         // Saving what is already there leaves the file alone.
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        save(&path, &s).unwrap();
+        save(&path, &s, &s).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             modified
@@ -760,10 +771,11 @@ theme = \"amber\"
                 "unknown key display.theme"
             ]
         );
-        let mut s = loaded.settings;
+        let before = loaded.settings;
+        let mut s = before.clone();
         s.stale_minutes = 30;
         s.hidden_panels.insert(Panel::Host);
-        save(&path, &s).unwrap();
+        save(&path, &before, &s).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(
             text.starts_with(
@@ -847,7 +859,7 @@ accent = \"cyan\"
             Settings::default().runner_thresholds(),
             RunnerThresholds::default()
         );
-        let text = render(None, &l.settings).unwrap();
+        let text = render(None, &l.settings, &l.settings).unwrap();
         assert!(text.contains("runner_overdue_factor = 2.5\n"), "{text}");
         assert!(text.contains("runner_idle_cpu_seconds = 3.0\n"), "{text}");
         assert_eq!(parse(&text).settings, l.settings);
@@ -875,9 +887,113 @@ accent = \"cyan\"
             "{:?}",
             l.problems
         );
-        let err = save(&path, &Settings::default()).unwrap_err();
+        let d = Settings::default();
+        let err = save(&path, &d, &d).unwrap_err();
         assert!(err.starts_with("not valid TOML"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn invalid_entries_are_kept_until_their_own_setting_changes() {
+        let dir = scratch("invalid-kept");
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = "\
+display = true
+[panels]
+hidden = [\"runners\", \"graphs\"] # graphs is coming
+[thresholds]
+runner_pickup_minutes = 1.5 # want 90s
+";
+        std::fs::write(&path, mine).unwrap();
+        let loaded = load(&path);
+        assert_eq!(loaded.problems.len(), 3, "{:?}", loaded.problems);
+        let before = loaded.settings;
+
+        // A change to another setting leaves every invalid entry as written.
+        let mut s = before.clone();
+        s.stale_minutes = 45;
+        save(&path, &before, &s).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            text,
+            format!("{mine}stale_minutes = 45\n"),
+            "only the changed key is written"
+        );
+        assert_eq!(load(&path).problems, loaded.problems, "still reported");
+
+        // Changing a setting rewrites its own entry, and only that one.
+        let before = s.clone();
+        s.runner_pickup_minutes = 10;
+        save(&path, &before, &s).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("runner_pickup_minutes = 10 # want 90s\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("hidden = [\"runners\", \"graphs\"] # graphs is coming\n"),
+            "{text}"
+        );
+        assert!(text.starts_with("display = true\n"), "{text}");
+
+        let before = s.clone();
+        s.hidden_panels.remove(&Panel::Runners);
+        save(&path, &before, &s).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("hidden = [] # graphs is coming\n"), "{text}");
+        assert!(text.starts_with("display = true\n"), "{text}");
+
+        let before = s.clone();
+        s.ascii = true;
+        save(&path, &before, &s).unwrap();
+        let again = load(&path);
+        assert_eq!(again.settings, s);
+        assert!(again.problems.is_empty(), "{:?}", again.problems);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlink_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("symlink");
+        let dotfiles = dir.join("dotfiles");
+        let config = dir.join("config");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        let real = dotfiles.join("config.toml");
+        std::fs::write(&real, "[thresholds]\nstale_minutes = 30\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = config.join("config.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let before = load(&link).settings;
+        let mut s = before.clone();
+        s.stale_minutes = 45;
+        save(&link, &before, &s).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link is kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "[thresholds]\nstale_minutes = 45\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(&dotfiles).unwrap().count(),
+            1,
+            "no temp file left"
+        );
+        assert_eq!(std::fs::read_dir(&config).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

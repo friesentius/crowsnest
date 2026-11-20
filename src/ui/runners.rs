@@ -410,8 +410,13 @@ fn panel_lines(view: &View, lanes: &[Lane], w: usize, wide: bool) -> Vec<(u8, Li
     }
     if wide && !lanes.is_empty() {
         let hint = if focused {
+            let back = if view.app.settings.shown(Panel::Roster) {
+                " \u{b7} Esc back"
+            } else {
+                ""
+            };
             format!(
-                "    {} runner \u{b7} Enter detail \u{b7} Esc back",
+                "    {} runner \u{b7} Enter detail{back}",
                 t.g("\u{2191}\u{2193}", "j/k")
             )
         } else {

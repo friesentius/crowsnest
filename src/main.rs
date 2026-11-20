@@ -20,9 +20,10 @@ use std::time::{Duration, Instant};
 /// Crowsnest never writes firstmate state, steers workers, or runs anything
 /// that changes the fleet. To act, talk to firstmate.
 ///
-/// Settings changed in the options menu (press o) are saved to the config
-/// file. The options below that also have a setting win over the file for
-/// the run they are given on.
+/// Settings changed in the options menu (press o) are saved to
+/// $XDG_CONFIG_HOME/crowsnest/config.toml (or ~/.config/crowsnest/config.toml),
+/// which must be outside the firstmate home. The options below that also have
+/// a setting win over the file for the run they are given on.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
 struct Args {
@@ -111,11 +112,6 @@ struct Args {
     /// file's].
     #[arg(long)]
     ascii: bool,
-
-    /// Settings file (default: $XDG_CONFIG_HOME/crowsnest/config.toml). It is
-    /// only written when a setting is changed in the options menu.
-    #[arg(long, value_name = "FILE")]
-    config: Option<PathBuf>,
 
     /// Collect everything once, print it as JSON, and exit.
     #[arg(long)]
@@ -331,7 +327,7 @@ fn run_tui(
                             handle.set_paused(app.paused);
                         }
                         if app.settings != before {
-                            settings_changed(&mut app, &handle, config_file.as_deref());
+                            settings_changed(&mut app, &handle, config_file.as_deref(), &before);
                             theme = Theme::new(color, app.effective().ascii);
                         }
                         dirty = true;
@@ -355,23 +351,28 @@ fn run_tui(
 
 /// Put changed settings into effect and save them. A failed save is shown in
 /// the footer; the change still holds for this run.
-fn settings_changed(app: &mut App, handle: &collector::Handle, file: Option<&Path>) {
+fn settings_changed(
+    app: &mut App,
+    handle: &collector::Handle,
+    file: Option<&Path>,
+    before: &Settings,
+) {
     let effective = app.effective();
     handle.set_intervals(fleet_interval(&effective), pipeline_interval(&effective));
     app.read_overdue_secs = read_overdue_secs(&effective);
     let result = match file {
-        Some(path) => config::save(path, &app.settings).map(|()| {
-            // What is left of the file's problems after the save rewrote it.
+        Some(path) => config::save(path, before, &app.settings).map(|()| {
+            // What is left of the file's problems after the save.
             app.config.problems = config::load(path).problems;
         }),
-        None => Err("no config directory: set XDG_CONFIG_HOME or --config".into()),
+        None => Err("no config directory: set XDG_CONFIG_HOME or HOME".into()),
     };
     app.config.saved = Some((now_epoch(), result.err()));
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let config_file = args.config.clone().or_else(config::default_path);
+    let config_file = config::default_path();
     let loaded = config_file.as_deref().map(config::load).unwrap_or_default();
     let overrides = overrides(&args);
     let settings = overrides.apply(&loaded.settings);

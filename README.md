@@ -98,7 +98,6 @@ The ones you are most likely to want:
 | `--no-github`, `--no-quota` | | Skip the GitHub or quota-axi reads. |
 | `--ascii` | | ASCII borders and glyphs, for fonts without box drawing. |
 | `--once` | | Collect everything once, print it as JSON, and exit. |
-| `--config FILE` | `~/.config/crowsnest/config.toml` | Where settings are read from and saved to. |
 
 The stale, parked, wait and runner thresholds, the two intervals and `--ascii` are also [settings](#settings).
 A flag wins over the config file for the run it is given on, and the options menu shows that setting as locked.
@@ -138,7 +137,9 @@ Like btop's, it lists categories on the left (panels, usage, thresholds, refresh
 | `1` to `5` | Hide or show a panel, as on the dashboard |
 | `Esc`, `o`, `F2` or `q` | Close the menu (`Ctrl-C` still quits) |
 
-Every change applies at once and is saved to `$XDG_CONFIG_HOME/crowsnest/config.toml`, or `~/.config/crowsnest/config.toml` when `XDG_CONFIG_HOME` is not set.
+Every change applies at once and is saved to `$XDG_CONFIG_HOME/crowsnest/config.toml`, or `~/.config/crowsnest/config.toml` when `XDG_CONFIG_HOME` is not set (a relative `XDG_CONFIG_HOME` is ignored).
+That is the only place settings are read from; crowsnest refuses to start if it is inside the firstmate home.
+If `config.toml` is a symlink, as dotfile managers make it, the change is written to the file it points to, which keeps its permissions.
 The file is created the first time you change something, including when you hide a panel with `1` to `5`, so panel visibility is remembered.
 You can also write it by hand; every key is optional:
 
@@ -187,7 +188,7 @@ quota-axi reports how much of each window is left, and a window with an allowanc
 An unknown key or a value of the wrong type or range is ignored, and the rest of the file still applies.
 The footer says what was ignored (`! config: unknown key display.theme`), help (`?`) lists every ignored entry, and `--once` prints them to stderr.
 A file that is not valid TOML is ignored as a whole and never overwritten; fix it by hand.
-Saving changes only the keys above that changed, so your comments and any other keys stay as they are; a list crowsnest changes is rewritten, along with any comments inside it.
+Saving rewrites only the entries whose setting you changed, so your comments, any other keys and any ignored entries stay exactly as written (and are still reported) until you change that setting in the menu; a list crowsnest changes is rewritten, along with anything ignored or commented inside it.
 
 ## States
 

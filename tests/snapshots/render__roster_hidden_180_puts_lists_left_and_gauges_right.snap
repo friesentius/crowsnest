@@ -1,6 +1,5 @@
 ---
 source: tests/render.rs
-assertion_line: 1294
 expression: "draw(&s, &app, 180, 44).backend()"
 ---
 "╭ ²RUNNERS ✓ all moving ──────────────────────────────────────────────────────── queue 1 ╮╭ ³HOST ─────────────────────────────────────────────────────────────────────────────────╮"
@@ -9,7 +8,7 @@ expression: "draw(&s, &app, 180, 44).backend()"
 "│     step 4/9 setup-node 8m · out 1s ago                                                ││ swap ━━━━────────────  25% 6.0G free                                                   │"
 "│   ○ Lint & typecheck #124                                              wait 6m → 14:58 ││ disk / 61%  /home 78%                                                                  │"
 "│ ○ bookshop  idle · online ?                                                            ││ psi  mem 0.4%  cpu 6.1%                                                                │"
-"│     Tab focus · ↑↓ runner · Enter detail                                               │╰────────────────────────────────────────────────────────────────────────────────────────╯"
+"│     ↑↓ runner · Enter detail                                                           │╰────────────────────────────────────────────────────────────────────────────────────────╯"
 "╰────────────────────────────────────────────────────────────────────────────────────────╯╭ ⁴USAGE ────────────────────────────────────────────────────────────────────────────────╮"
 "╭ ⁵HELD CALLS 8 ─────────────────────────────────────────────────────────────────────────╮│ copilot premium interac… ━━━━━━ 100%  ↻ Tue 00:00                                      │"
 "│ ⚑ webshop-shop-price-ids-2                                                          8d ││ claude session           ━━────  41%  ↻ 15:20                                          │"
@@ -46,4 +45,4 @@ expression: "draw(&s, &app, 180, 44).backend()"
 "│                                                                                        ││                                                                                        │"
 "│                                                                                        ││                                                                                        │"
 "╰────────────────────────────────────────────────────────────────────────────────────────╯╰────────────────────────────────────────────────────────────────────────────────────────╯"
-" ↑↓  select  ⏎  detail  tab  runners  f  filter  r  refresh  p  pause  o  options  1-5  panels  ?  help  q  quit                              hidden ¹roster  nm 9s gh 25s quota 2m "
+" ↑↓  runner  ⏎  detail  r  refresh  p  pause  o  options  1-5  panels  ?  help  q  quit                                                       hidden ¹roster  nm 9s gh 25s quota 2m "

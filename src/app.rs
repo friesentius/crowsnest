@@ -168,7 +168,7 @@ impl App {
     pub fn new(settings: Settings, overrides: Overrides) -> Self {
         let effective = overrides.apply(&settings);
         let thresholds = effective.thresholds();
-        App {
+        let mut app = App {
             selected: None,
             expanded: BTreeSet::new(),
             filter: Filter::All,
@@ -187,7 +187,9 @@ impl App {
             read_overdue_secs: DEFAULT_READ_OVERDUE_SECS,
             changes: BTreeMap::new(),
             seeded: false,
-        }
+        };
+        app.sync();
+        app
     }
 
     /// Note which rows changed since the last call. Call it with every
@@ -287,13 +289,16 @@ impl App {
         false
     }
 
-    /// Put changed settings into effect in the app itself.
+    /// Put changed settings into effect in the app itself. A hidden panel
+    /// cannot have the keys: they go to the other one if it is shown.
     fn sync(&mut self) {
         self.thresholds = self.effective().thresholds();
         self.runner_thresholds = self.effective().runner_thresholds();
         if !self.settings.shown(Panel::Runners) {
             self.focus = Focus::Roster;
             self.runner_detail = false;
+        } else if !self.settings.shown(Panel::Roster) {
+            self.focus = Focus::Runners;
         }
     }
 
@@ -324,11 +329,14 @@ impl App {
     /// Keys on the dashboard, against the rows and runners on screen
     /// (`runners` as [`runner_keys`] gives them).
     fn apply_dashboard(&mut self, action: Action, rows: &[Row], runners: &[String]) -> bool {
+        let roster = self.settings.shown(Panel::Roster);
         match action {
-            Action::Filter => self.filter = self.filter.next(),
             Action::Refresh => return true,
             Action::Pause => self.paused = !self.paused,
             Action::Help => self.help = true,
+            // Without the roster there is nothing to filter or to Tab back to.
+            Action::Filter | Action::Focus if !roster => {}
+            Action::Filter => self.filter = self.filter.next(),
             Action::Focus => {
                 self.runner_detail = false;
                 self.focus = match self.focus {
@@ -341,7 +349,8 @@ impl App {
                 };
             }
             _ if self.focus == Focus::Runners => self.move_runner(action, runners),
-            _ => self.move_row(action, rows),
+            _ if roster => self.move_row(action, rows),
+            _ => {}
         }
         false
     }
@@ -375,8 +384,11 @@ impl App {
     }
 
     fn move_runner(&mut self, action: Action, runners: &[String]) {
+        let roster = self.settings.shown(Panel::Roster);
         if runners.is_empty() {
-            self.focus = Focus::Roster;
+            if roster {
+                self.focus = Focus::Roster;
+            }
             self.runner_detail = false;
             return;
         }
@@ -395,7 +407,7 @@ impl App {
                 // Esc closes the detail first, then leaves the panel.
                 if self.runner_detail {
                     self.runner_detail = false;
-                } else {
+                } else if roster {
                     self.focus = Focus::Roster;
                 }
                 idx
@@ -890,5 +902,59 @@ mod tests {
         assert!(!app.runner_detail);
         app.apply(Action::Focus, &s);
         assert_eq!(app.focus, Focus::Roster, "Tab skips a hidden panel");
+    }
+
+    #[test]
+    fn a_hidden_roster_hands_the_keys_to_the_runners() {
+        let mut s = snap();
+        s.runners = ["/srv/a", "/srv/b"]
+            .map(|d| Runner {
+                dir: d.into(),
+                ..Default::default()
+            })
+            .into();
+        let mut app = App::default();
+        app.apply(Action::Panel(Panel::Roster), &s);
+        assert_eq!(app.focus, Focus::Runners);
+        app.apply(Action::Down, &s);
+        assert_eq!(app.runner.as_deref(), Some("/srv/b"));
+        assert_eq!(app.selected, None, "the hidden roster does not move");
+        app.apply(Action::Toggle, &s);
+        assert!(app.runner_detail);
+        assert!(app.expanded.is_empty());
+        // Esc closes the detail but cannot leave for the hidden roster, and
+        // neither can Tab; the roster's filter does nothing.
+        app.apply(Action::Collapse, &s);
+        app.apply(Action::Collapse, &s);
+        assert!(!app.runner_detail);
+        app.apply(Action::Focus, &s);
+        app.apply(Action::Filter, &s);
+        assert_eq!(app.focus, Focus::Runners);
+        assert_eq!(app.filter, Filter::All);
+        // With no runner to select the keys stay with the runner panel.
+        let none = snap();
+        app.apply(Action::Down, &none);
+        assert_eq!(app.focus, Focus::Runners);
+
+        // With the runners hidden too, the movement keys do nothing.
+        app.apply(Action::Panel(Panel::Runners), &s);
+        assert_eq!(app.focus, Focus::Roster);
+        for a in [Action::Down, Action::Bottom, Action::Toggle, Action::Focus] {
+            app.apply(a, &s);
+        }
+        assert_eq!(app.selected, None);
+        assert!(app.expanded.is_empty());
+        assert_eq!(app.focus, Focus::Roster);
+        assert_eq!(app.runner.as_deref(), Some("/srv/b"));
+
+        // A roster hidden in the config file starts with the runners focused.
+        let started = App::new(
+            crate::config::Settings {
+                hidden_panels: [Panel::Roster].into(),
+                ..Default::default()
+            },
+            Overrides::default(),
+        );
+        assert_eq!(started.focus, Focus::Runners);
     }
 }

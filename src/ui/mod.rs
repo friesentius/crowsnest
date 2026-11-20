@@ -1243,13 +1243,21 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
     }
     let t = &view.theme;
     let w = area.width as usize;
+    let roster = view.app.settings.shown(Panel::Roster);
     let mut keys: Vec<(&str, &str)> = if view.app.runners_focused(view.snap) {
-        vec![
+        let mut k = vec![
             (t.g("\u{2191}\u{2193}", "j/k"), "runner"),
             (t.g("\u{23ce}", "ret"), "detail"),
-            ("esc", "back"),
-            ("tab", "roster"),
-        ]
+        ];
+        if roster || view.app.runner_detail {
+            k.push(("esc", "back"));
+        }
+        if roster {
+            k.push(("tab", "roster"));
+        }
+        k
+    } else if !roster {
+        Vec::new()
     } else {
         let mut k = vec![
             (t.g("\u{2191}\u{2193}", "j/k"), "select"),

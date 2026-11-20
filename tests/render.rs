@@ -1309,6 +1309,53 @@ fn roster_hidden_100_stacks_the_panels() {
 }
 
 #[test]
+fn a_hidden_roster_leaves_its_keys_out_of_the_footer() {
+    utc();
+    let s = fleet_of_runners();
+    let footer = |app: &App| {
+        let text = draw(&s, app, 180, 44).backend().to_string();
+        text.lines().last().unwrap().to_string()
+    };
+    let shown = with_settings(&s, Settings::default(), Overrides::default(), None);
+    let f = footer(&shown);
+    assert!(
+        f.contains(" select ") && f.contains(" tab ") && f.contains(" filter "),
+        "{f}"
+    );
+
+    // The runners have the keys; there is no roster to filter or Tab to.
+    let mut app = with_settings(&s, hide(&[Panel::Roster], &[]), Overrides::default(), None);
+    let f = footer(&app);
+    assert!(f.contains(" runner ") && f.contains(" detail "), "{f}");
+    for gone in [" select ", " filter ", " tab ", " roster ", " esc "] {
+        assert!(!f.contains(gone), "{gone:?} in {f}");
+    }
+    assert!(f.contains(" o ") && f.contains(" options "), "{f}");
+    app.apply(Action::Toggle, &s);
+    let f = footer(&app);
+    assert!(
+        f.contains(" esc ") && f.contains(" back "),
+        "the detail closes: {f}"
+    );
+
+    // Both hidden: only the keys that work anywhere.
+    let app = with_settings(
+        &s,
+        hide(&[Panel::Roster, Panel::Runners], &[]),
+        Overrides::default(),
+        None,
+    );
+    let f = footer(&app);
+    for gone in [" select ", " runner ", " detail ", " filter ", " tab "] {
+        assert!(!f.contains(gone), "{gone:?} in {f}");
+    }
+    assert!(
+        f.contains(" refresh ") && f.contains(" options ") && f.contains(" quit "),
+        "{f}"
+    );
+}
+
+#[test]
 fn only_the_roster() {
     utc();
     let s = snapshot();
