@@ -19,7 +19,7 @@ Crowsnest is a renderer, so it is the missing render half of #5499, and the natu
 - **Documented contracts only.**
   The fleet comes from `bin/fm-fleet-snapshot.sh --json`, and crowsnest refuses any schema other than `fm-fleet-snapshot.v1` with a clear error.
   It never reads `state/*.meta`, status logs or library internals.
-  The only firstmate file it looks at directly is the opt-in fleet ledger (`state/fleet-ledger.jsonl`, documented as the stable hook for outside tools), and only its modification time, as a refresh trigger.
+  It reads no firstmate file directly: the fleet is refreshed on its own interval (or on demand with `r`), with no file-change trigger.
 - **No hard-coded home.**
   The firstmate home comes from `--fm-home` or `FM_HOME`, and nothing in the code names a machine, user, project or account.
   Runner directories and disks are discovered or configured.

@@ -232,7 +232,6 @@ fn config(args: &Args, settings: &Settings, config_file: Option<&Path>) -> Resul
         runner_units: args.runner_units.clone(),
         disk_paths,
         fleet_interval: fleet_interval(settings),
-        fleet_min_gap: Duration::from_secs(20),
         pipeline_interval: pipeline_interval(settings),
         github: !args.no_github,
         quota: !args.no_quota,

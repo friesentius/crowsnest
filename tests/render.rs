@@ -1656,3 +1656,181 @@ fn the_menu_never_panics_and_says_when_it_has_no_room() {
     assert!(odd.is_empty(), "--ascii drew {odd:?}");
     assert!(ascii.contains("| > 3 host"), "{ascii}");
 }
+
+/// The quiet fleet, but firstmate has already reported pantry-tour-followups
+/// done while its pipeline is still waiting on CI.
+fn done_with_live_ci() -> Snapshot {
+    let mut s = snapshot();
+    let w = s
+        .fleet
+        .as_mut()
+        .unwrap()
+        .workers
+        .iter_mut()
+        .find(|w| w.id == "pantry-tour-followups")
+        .unwrap();
+    w.fm_state = "done".into();
+    w.open_decisions.clear();
+    if let Some(e) = w.last_event.as_mut() {
+        e.state = "done".into();
+        e.note = "PR https://github.com/acme/pantry/pull/122 checks green".into();
+    }
+    s
+}
+
+/// A host read where the disk list failed, keeping the last good values.
+fn host_read_failed() -> Snapshot {
+    let mut s = snapshot();
+    s.fresh.get_mut("host").unwrap().error =
+        Some("disks: cannot list mounts: Permission denied".into());
+    s
+}
+
+/// A runner read where the root cannot be listed and nothing was found.
+fn runner_read_failed() -> Snapshot {
+    let mut s = snapshot();
+    s.runners.clear();
+    s.jobs.clear();
+    s.gh_runners.clear();
+    s.history.clear();
+    s.fresh.get_mut("runners").unwrap().error = Some("Permission denied: /srv/runners".into());
+    s
+}
+
+/// A runner read whose root sits deep enough to fill a narrow panel's row.
+fn runner_read_failed_long_path() -> Snapshot {
+    let mut s = runner_read_failed();
+    s.fresh.get_mut("runners").unwrap().error =
+        Some("Permission denied: /home/pantry/ci/self-hosted/actions-runners-locked".into());
+    s
+}
+
+#[test]
+fn a_reported_done_with_a_running_pipeline_shows_the_step_not_done() {
+    utc();
+    let s = done_with_live_ci();
+    let rows = all_rows(&s, &th());
+    let row = rows
+        .iter()
+        .find(|r| r.worker.id == "pantry-tour-followups")
+        .unwrap();
+    assert_eq!(row.state, WorkerState::Working);
+    let text = draw(&s, &app_for(&s), 180, 44).backend().to_string();
+    let line = row_text(&draw(&s, &app_for(&s), 180, 44), "pantry-tour-followups");
+    assert!(line.contains("ci"), "{line}");
+    assert!(!line.contains("DONE"), "{line}");
+    assert!(!text.contains("1 done"), "{text}");
+}
+
+#[test]
+fn a_finished_pipeline_leaves_a_reported_done_done() {
+    utc();
+    let mut s = done_with_live_ci();
+    s.pipelines.get_mut("pantry-tour-followups").unwrap().status = "completed".into();
+    let rows = all_rows(&s, &th());
+    let row = rows
+        .iter()
+        .find(|r| r.worker.id == "pantry-tour-followups")
+        .unwrap();
+    assert_eq!(row.state, WorkerState::Done);
+}
+
+#[test]
+fn done_with_live_ci_100() {
+    utc();
+    let s = done_with_live_ci();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn done_with_live_ci_180() {
+    utc();
+    let s = done_with_live_ci();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 44).backend());
+}
+
+#[test]
+fn a_failed_host_read_is_shown_in_the_panel_and_the_footer() {
+    utc();
+    let s = host_read_failed();
+    for (w, h) in [(100, 34), (180, 44)] {
+        let text = draw(&s, &app_for(&s), w, h).backend().to_string();
+        assert!(text.contains("! host: disks: cannot list"), "{w}:\n{text}");
+        assert!(text.contains("host !"), "{w}:\n{text}");
+        // The last good values stay up.
+        assert!(text.contains("3.42"), "{w}:\n{text}");
+    }
+}
+
+#[test]
+fn a_failed_runner_read_is_shown_in_the_panel_and_the_footer() {
+    utc();
+    let s = runner_read_failed();
+    for (w, h) in [(100, 34), (180, 44)] {
+        let text = draw(&s, &app_for(&s), w, h).backend().to_string();
+        assert!(
+            text.contains("! runners: Permission denied:") && text.contains("/srv/runners"),
+            "{w}:\n{text}"
+        );
+        assert!(text.contains("runners !"), "{w}:\n{text}");
+        assert!(!text.contains("no self-hosted runners found"), "{text}");
+    }
+}
+
+#[test]
+fn a_long_runner_root_keeps_the_reason_and_the_end_of_the_path() {
+    utc();
+    let s = runner_read_failed_long_path();
+    let text = draw(&s, &app_for(&s), 100, 34).backend().to_string();
+    assert!(text.contains("Permission denied"), "{text}");
+    assert!(text.contains("\u{2026}/actions-runners-locked"), "{text}");
+}
+
+#[test]
+fn a_runner_warning_uses_the_rows_the_panel_has_free() {
+    utc();
+    let mut s = runner_read_failed();
+    s.fresh.get_mut("runners").unwrap().error = Some(
+        "Permission denied: /srv/runners; not a runner file: /srv/runners/actions-runner-2/.runner"
+            .into(),
+    );
+    let text = draw(&s, &app_for(&s), 100, 34).backend().to_string();
+    // Past two rows: the second error's reason and the end of its path.
+    assert!(text.contains("not a runner"), "{text}");
+    assert!(text.contains("/.runner"), "{text}");
+}
+
+#[test]
+fn runner_read_failed_long_path_100() {
+    utc();
+    let s = runner_read_failed_long_path();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn host_read_failed_100() {
+    utc();
+    let s = host_read_failed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn host_read_failed_180() {
+    utc();
+    let s = host_read_failed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 44).backend());
+}
+
+#[test]
+fn runner_read_failed_100() {
+    utc();
+    let s = runner_read_failed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn runner_read_failed_180() {
+    utc();
+    let s = runner_read_failed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 44).backend());
+}

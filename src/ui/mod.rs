@@ -1002,9 +1002,70 @@ fn roster(view: &View, buf: &mut Buffer, area: Rect, host: &str) {
     );
 }
 
+/// The error of a tier's last read, if it failed.
+fn tier_error<'a>(view: &View<'a>, tier: &str) -> Option<&'a str> {
+    view.snap.fresh.get(tier)?.error.as_deref()
+}
+
+/// The fewest rows a panel gives a failed read's error, even when its
+/// readings fill it.
+const ERROR_ROWS: usize = 2;
+
+/// A panel's warning for its tier's failed read, wrapped to `w` cells over
+/// the panel's `free` rows but no fewer than [`ERROR_ROWS`]:
+/// `! runners: Permission denied: …/runners-locked`. Errors lead with their
+/// reason, and a word too wide for a row (a long path) keeps its end.
+pub(crate) fn tier_error_lines(
+    view: &View,
+    tier: &str,
+    w: usize,
+    free: usize,
+) -> Vec<Line<'static>> {
+    let Some(err) = tier_error(view, tier) else {
+        return Vec::new();
+    };
+    let text = format!("! {tier}: {err}");
+    let mut rows: Vec<String> = Vec::new();
+    for word in text.split_whitespace() {
+        let word = keep_end(word, w);
+        match rows.last_mut() {
+            Some(row) if row.chars().count() + 1 + word.chars().count() <= w => {
+                row.push(' ');
+                row.push_str(&word);
+            }
+            _ => rows.push(word),
+        }
+    }
+    // A message that runs on past the last row is cut there, not dropped.
+    let max = free.max(ERROR_ROWS);
+    if rows.len() > max {
+        let tail = rows.split_off(max - 1).join(" ");
+        rows.push(tail);
+    }
+    rows.into_iter()
+        .map(|row| fit(vec![span(row, view.theme.warn())], w))
+        .collect()
+}
+
+/// `word` cut from the left to `w` chars, from a `/` where one fits:
+/// `/tmp/cn-e2e/runners-locked` at 18 is `…/runners-locked`.
+fn keep_end(word: &str, w: usize) -> String {
+    let n = word.chars().count();
+    if n <= w || w < 2 {
+        return word.to_string();
+    }
+    let tail: String = word.chars().skip(n - (w - 1)).collect();
+    let tail = match tail.find('/') {
+        Some(i) if i > 0 && i + 1 < tail.len() => tail[i..].to_string(),
+        _ => tail,
+    };
+    format!("\u{2026}{tail}")
+}
+
 fn host_panel(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
+    let rows = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Content> = Vec::new();
     if let Some(h) = &view.snap.host {
         let n = w.saturating_sub(22).clamp(4, 16);
@@ -1061,6 +1122,9 @@ fn host_panel(view: &View, buf: &mut Buffer, area: Rect) {
             )));
         }
     }
+    // First, so a small panel cuts the least needed readings instead.
+    let errors = tier_error_lines(view, "host", w, rows.saturating_sub(lines.len()));
+    lines.splice(0..0, errors.into_iter().map(Content::Line));
     draw_box(
         buf,
         area,
@@ -1302,13 +1366,16 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         right.push(span(format!("hidden {}  ", hidden.join(" ")), t.dim()));
         right.len() - 1
     });
-    for tier in ["nm", "gh", "quota"] {
+    // The local tiers read every few seconds and are only named when they fail.
+    for tier in ["host", "runners", "nm", "gh", "quota"] {
         let Some(f) = view.snap.fresh.get(tier) else {
             continue;
         };
         if f.error.is_some() {
             right.push(span(format!("{tier} ! "), t.warn()));
-        } else if let Some(a) = age_of(view.snap, tier) {
+        } else if let Some(a) = age_of(view.snap, tier)
+            && !matches!(tier, "host" | "runners")
+        {
             right.push(span(format!("{tier} {} ", timefmt::dur(a)), t.dim()));
         }
     }

@@ -54,8 +54,12 @@ pub fn parse_runner_file(dir: &Path, text: &str) -> Option<Runner> {
 /// Find runner directories directly under each root. `units` names the
 /// systemd unit of a runner directory; otherwise the unit is the one the
 /// runner's own `svc.sh install` recorded in its `.service` file.
-pub fn discover(roots: &[PathBuf], units: &[(PathBuf, String)]) -> Vec<Runner> {
-    let mut out = discover_dirs(roots);
+///
+/// The second value lists what could not be read: a root that cannot be
+/// listed, and a `.runner` file that cannot be read or parsed. Such a runner
+/// is left out of the list, so the failure has to be reported alongside it.
+pub fn discover(roots: &[PathBuf], units: &[(PathBuf, String)]) -> (Vec<Runner>, Vec<String>) {
+    let (mut out, errors) = discover_dirs(roots);
     for r in &mut out {
         r.unit = units
             .iter()
@@ -68,18 +72,23 @@ pub fn discover(roots: &[PathBuf], units: &[(PathBuf, String)]) -> Vec<Runner> {
                     .filter(|u| crate::exec::valid_unit(u))
             });
     }
-    out
+    (out, errors)
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
-fn discover_dirs(roots: &[PathBuf]) -> Vec<Runner> {
+fn discover_dirs(roots: &[PathBuf]) -> (Vec<Runner>, Vec<String>) {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(e) => {
+                errors.push(format!("{}: {}", io_reason(&e), root.display()));
+                continue;
+            }
         };
         let mut dirs: Vec<PathBuf> = entries
             .flatten()
@@ -87,18 +96,33 @@ fn discover_dirs(roots: &[PathBuf]) -> Vec<Runner> {
             .filter(|p| {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with("actions-runner"))
+                    && p.is_dir()
             })
             .collect();
         dirs.sort();
         for dir in dirs {
-            if let Ok(text) = std::fs::read_to_string(dir.join(".runner"))
-                && let Some(r) = parse_runner_file(&dir, &text)
-            {
-                out.push(r);
+            let file = dir.join(".runner");
+            match std::fs::read_to_string(&file) {
+                Ok(text) => match parse_runner_file(&dir, &text) {
+                    Some(r) => out.push(r),
+                    None => errors.push(format!("not a runner file: {}", file.display())),
+                },
+                // A directory that was never configured is not a runner.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => errors.push(format!("{}: {}", io_reason(&e), file.display())),
             }
         }
     }
-    out
+    (out, errors)
+}
+
+/// An I/O error without the OS error number: "Permission denied".
+fn io_reason(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match text.rfind(" (os error") {
+        Some(i) => text[..i].to_string(),
+        None => text,
+    }
 }
 
 /// Unix modification time of a file.
@@ -201,6 +225,12 @@ impl ProcessScan {
             jobs: BTreeMap::new(),
             idle_since: BTreeMap::new(),
         }
+    }
+
+    /// Whether the process table cannot be read at all, so no runner can be
+    /// told up or busy.
+    pub fn unavailable(&self) -> bool {
+        self.sys.is_none()
     }
 
     pub fn update(&mut self, runners: &mut [Runner]) {
@@ -359,7 +389,8 @@ mod tests {
             "actions.runner.acme-pantry.pantry-local-runner.service\n",
         )
         .unwrap();
-        let found = discover(std::slice::from_ref(&root), &[]);
+        let (found, errors) = discover(std::slice::from_ref(&root), &[]);
+        assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].dir, dir);
         assert_eq!(
@@ -367,13 +398,39 @@ mod tests {
             Some("actions.runner.acme-pantry.pantry-local-runner.service")
         );
         // A configured unit wins over the recorded one.
-        let found = discover(
+        let (found, _) = discover(
             std::slice::from_ref(&root),
             &[(dir.clone(), "actions-runner-pantry.service".into())],
         );
         assert_eq!(
             found[0].unit.as_deref(),
             Some("actions-runner-pantry.service")
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn discovery_reports_what_it_cannot_read() {
+        let root = std::env::temp_dir().join(format!("crowsnest-broken-{}", std::process::id()));
+        let broken = root.join("actions-runner-broken");
+        let fresh = root.join("actions-runner-unconfigured");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        std::fs::write(broken.join(".runner"), "{not json").unwrap();
+        std::fs::write(
+            root.join("actions-runner-linux-x64-2.321.0.tar.gz"),
+            "tarball",
+        )
+        .unwrap();
+        let missing = root.join("gone");
+        let (found, errors) = discover(&[root.clone(), missing.clone()], &[]);
+        assert!(found.is_empty());
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors[0].starts_with("not a runner file: "));
+        assert!(errors[0].ends_with("actions-runner-broken/.runner"));
+        assert_eq!(
+            errors[1],
+            format!("No such file or directory: {}", missing.display())
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
