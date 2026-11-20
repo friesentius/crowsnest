@@ -71,6 +71,9 @@ pub struct Discovery {
     /// Runner directories and their units. A directory named here is a
     /// runner directory even when it is under no folder and has stopped.
     pub units: Vec<(PathBuf, String)>,
+    /// The firstmate home: a folder searched by name never leads into it,
+    /// unless the root searched is itself inside it.
+    pub fm_home: Option<PathBuf>,
 }
 
 impl Default for Discovery {
@@ -80,6 +83,7 @@ impl Default for Discovery {
             roots: Vec::new(),
             names: vec![DEFAULT_NAME.into()],
             units: Vec::new(),
+            fm_home: None,
         }
     }
 }
@@ -214,7 +218,7 @@ pub fn discover(
     remembered: &[Remembered],
     proc_root: &Path,
 ) -> Found {
-    let (mut dirs, mut errors) = scan_roots(&d.roots, &d.names);
+    let (mut dirs, mut errors) = scan_roots(&d.roots, &d.names, d.fm_home.as_deref());
     dirs.extend(d.units.iter().map(|(dir, _)| dir.clone()));
     let mut live: Vec<Remembered> = Vec::new();
     let mut unlocated = 0;
@@ -231,10 +235,12 @@ pub fn discover(
     let remembered: &[Remembered] = if d.processes { remembered } else { &[] };
     dirs.extend(remembered.iter().map(|(dir, _)| dir.clone()));
     let mut runners: Vec<Runner> = Vec::new();
+    let mut visited: Vec<PathBuf> = Vec::new();
     for dir in dirs {
-        if runners.iter().any(|r| same_dir(&r.dir, &dir)) {
+        if visited.iter().any(|v| same_dir(v, &dir)) {
             continue;
         }
+        visited.push(dir.clone());
         let file = dir.join(".runner");
         let text = match std::fs::read_to_string(&file) {
             Ok(text) => text,
@@ -294,11 +300,17 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// The subfolders of each root whose name matches one of `names`, sorted
-/// within each root, and the roots that could not be listed.
-fn scan_roots(roots: &[PathBuf], names: &[String]) -> (Vec<PathBuf>, Vec<String>) {
+/// within each root, and the roots that could not be listed. None is inside
+/// `fm_home` unless its root is.
+fn scan_roots(
+    roots: &[PathBuf],
+    names: &[String],
+    fm_home: Option<&Path>,
+) -> (Vec<PathBuf>, Vec<String>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
     for root in roots {
+        let fence = fm_home.filter(|h| !crate::config::inside(root, h));
         let entries = match std::fs::read_dir(root) {
             Ok(entries) => entries,
             Err(e) => {
@@ -314,6 +326,7 @@ fn scan_roots(roots: &[PathBuf], names: &[String]) -> (Vec<PathBuf>, Vec<String>
                     let n = n.to_string_lossy();
                     names.iter().any(|g| glob_match(g, &n))
                 }) && p.is_dir()
+                    && !fence.is_some_and(|h| crate::config::inside(p, h))
             })
             .collect();
         dirs.sort();
@@ -969,6 +982,47 @@ mod tests {
         );
         assert!(errors[1].starts_with("not a runner file: "));
         assert!(errors[1].ends_with("actions-runner-broken/.runner"));
+        // A broken directory reached from every source is reported once.
+        let d = Discovery {
+            processes: true,
+            units: vec![(broken.clone(), "broken.service".into())],
+            ..only_roots(std::slice::from_ref(&root))
+        };
+        let found = discover(
+            &d,
+            &[Listener {
+                pid: 4244,
+                dir: Some(broken.clone()),
+            }],
+            &[(broken.clone(), None)],
+            Path::new("/nonexistent"),
+        );
+        assert_eq!(found.errors.len(), 1, "{:?}", found.errors);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_search_by_name_never_enters_the_firstmate_home() {
+        let root = scratch("fmhome");
+        let fm = runner_dir(&root, "firstmate");
+        runner_dir(&root, "actions-runner-a");
+        let d = Discovery {
+            names: vec!["*".into()],
+            fm_home: Some(fm.clone()),
+            ..only_roots(std::slice::from_ref(&root))
+        };
+        let found = discover(&d, &[], &[], Path::new("/nonexistent"));
+        let dirs: Vec<_> = found.runners.iter().map(|r| r.dir.clone()).collect();
+        assert_eq!(dirs, [root.join("actions-runner-a")]);
+        // A root inside the firstmate home, as only a flag can give, is searched.
+        let inner = runner_dir(&fm, "actions-runner-b");
+        let d = Discovery {
+            roots: vec![fm.clone()],
+            ..d
+        };
+        let found = discover(&d, &[], &[], Path::new("/nonexistent"));
+        let dirs: Vec<_> = found.runners.iter().map(|r| r.dir.clone()).collect();
+        assert_eq!(dirs, [inner]);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

@@ -343,7 +343,7 @@ When one is missing, its source is marked with `!` and the rest keeps working.
 - Crowsnest takes no firstmate locks, moves no inbox files, and never runs the `steer` or `watch` commands the snapshot lists.
 - `tests/readonly.rs` runs the real binary against a scratch firstmate home with logging shims for every command, and fails if any file under the home changes or any command was not a read.
 - The only file crowsnest writes is its own `config.toml`, and only when you change a setting; a config path inside the firstmate home is refused, and `--once` never writes it.
-- Runner folders and units in `config.toml` that lie inside the firstmate home are refused and reported, so crowsnest never reads there on a config file's say-so.
+- Runner folders and units in `config.toml` that lie inside the firstmate home are refused and reported, and a search by folder name never enters it, so crowsnest never reads there on a config file's say-so.
 
 There is no telemetry, and crowsnest makes no network calls of its own.
 

@@ -436,6 +436,7 @@ pub fn discovery(
             roots,
             names,
             units,
+            fm_home: Some(fm_home.to_path_buf()),
         },
         problems,
     )
@@ -1383,6 +1384,7 @@ colour = 1
             d,
             Discovery {
                 roots: vec![home.into()],
+                fm_home: Some(fm.into()),
                 ..Default::default()
             }
         );
