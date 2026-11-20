@@ -1,12 +1,16 @@
 //! Self-hosted GitHub Actions runners on this machine.
 //!
-//! A runner is a directory named `actions-runner*` holding the `.runner` file
-//! that `config.sh` writes. It is up while a `Runner.Listener` process runs
-//! from inside that directory, and busy while a `Runner.Worker` does. How
-//! recently it wrote its `_diag` logs comes from file times alone; no log is
-//! read. All of these are local reads; no API call is needed.
+//! A runner is a directory holding the `.runner` file that `config.sh`
+//! writes. It is found under the configured folders by name, by being named
+//! in the configured units, or from the directory of a running
+//! `Runner.Listener` (see [`discover`]). It is up while a `Runner.Listener`
+//! process runs from inside that directory, and busy while a `Runner.Worker`
+//! does. Its systemd unit comes from the configuration, the cgroup of its
+//! listener, or the `.service` file `svc.sh install` writes. How recently it
+//! wrote its `_diag` logs comes from file times alone; no log is read. All
+//! of these are local reads; no API call is needed.
 
-use crate::model::{Runner, Service};
+use crate::model::{Runner, RunnerSearch, Service, UnitSource};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,35 +55,245 @@ pub fn parse_runner_file(dir: &Path, text: &str) -> Option<Runner> {
     })
 }
 
-/// Find runner directories directly under each root. `units` names the
-/// systemd unit of a runner directory; otherwise the unit is the one the
-/// runner's own `svc.sh install` recorded in its `.service` file.
-///
-/// The second value lists what could not be read: a root that cannot be
-/// listed, and a `.runner` file that cannot be read or parsed. Such a runner
-/// is left out of the list, so the failure has to be reported alongside it.
-pub fn discover(roots: &[PathBuf], units: &[(PathBuf, String)]) -> (Vec<Runner>, Vec<String>) {
-    let (mut out, errors) = discover_dirs(roots);
-    for r in &mut out {
-        r.unit = units
-            .iter()
-            .find(|(d, _)| same_dir(d, &r.dir))
-            .map(|(_, u)| u.clone())
-            .or_else(|| {
-                std::fs::read_to_string(r.dir.join(".service"))
-                    .ok()
-                    .map(|t| t.trim().to_string())
-                    .filter(|u| crate::exec::valid_unit(u))
-            });
+/// The folder names searched for runner directories when none are set.
+pub const DEFAULT_NAME: &str = "actions-runner*";
+
+/// Where to look for runners and which systemd unit runs each: the settings
+/// of the `[runners]` config section and the `--runner-*` flags, resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Discovery {
+    /// Find runners from the `Runner.Listener` processes that are running.
+    pub processes: bool,
+    /// Folders whose subfolders are searched for runner directories.
+    pub roots: Vec<PathBuf>,
+    /// Glob patterns a subfolder's name must match (`*` and `?`).
+    pub names: Vec<String>,
+    /// Runner directories and their units. A directory named here is a
+    /// runner directory even when it is under no folder and has stopped.
+    pub units: Vec<(PathBuf, String)>,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Discovery {
+            processes: true,
+            roots: Vec::new(),
+            names: vec![DEFAULT_NAME.into()],
+            units: Vec::new(),
+        }
     }
-    (out, errors)
+}
+
+/// Whether `name` matches `pattern`, where `*` matches any run of
+/// characters and `?` any one.
+pub fn glob_match(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni) = (0, 0);
+    // Where the last `*` was, and how much of `name` it has taken.
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        match p.get(pi) {
+            Some('*') => {
+                star = Some((pi, ni));
+                pi += 1;
+            }
+            Some(c) if *c == '?' || *c == n[ni] => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match star {
+                Some((sp, sn)) => {
+                    pi = sp + 1;
+                    ni = sn + 1;
+                    star = Some((sp, sn + 1));
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
+/// A running `Runner.Listener` process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listener {
+    pub pid: u32,
+    /// The runner directory it runs from: the nearest folder above its
+    /// executable that holds `.runner`.
+    pub dir: Option<PathBuf>,
+}
+
+/// The runner directory a process started from `exe` (or, when another
+/// user's process hides its executable, from its first argument) belongs to:
+/// the nearest folder above it that holds `.runner`. The executable is
+/// `<dir>/bin/Runner.Listener` or `<dir>/bin.<version>/Runner.Listener`, so
+/// the search goes up a few levels rather than taking the parent.
+pub fn runner_dir_of(exe: Option<&Path>, argv0: Option<&Path>) -> Option<PathBuf> {
+    [exe, argv0].into_iter().flatten().find_map(|path| {
+        path.ancestors()
+            .skip(1)
+            .take(4)
+            .find(|a| a.join(".runner").is_file())
+            .map(Path::to_path_buf)
+    })
+}
+
+/// The systemd unit a `/proc/<pid>/cgroup` file puts its process in: the
+/// innermost `.service` of its cgroup path, as long as no `.scope` or
+/// `.slice` lies below it. A listener started from a terminal sits in
+/// `.../user@1000.service/app.slice/app-term.scope`, which belongs to the
+/// user's manager and not to any runner unit, so it has none.
+pub fn unit_from_cgroup(text: &str) -> Option<String> {
+    let mut v2 = None;
+    let mut v1 = None;
+    for line in text.lines() {
+        let mut f = line.splitn(3, ':');
+        let (Some(_), Some(controllers), Some(path)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        match controllers {
+            "" => v2 = v2.or(Some(path)),
+            "name=systemd" => v1 = v1.or(Some(path)),
+            _ => {}
+        }
+    }
+    let path = v1.or(v2)?;
+    for part in path.rsplit('/').filter(|p| !p.is_empty()) {
+        if part.ends_with(".scope") || part.ends_with(".slice") {
+            return None;
+        }
+        if part.ends_with(".service") {
+            let manager = part.starts_with("user@") || part.starts_with("user-runtime-dir@");
+            return (!manager && crate::exec::valid_unit(part)).then(|| part.to_string());
+        }
+    }
+    None
+}
+
+/// The unit of process `pid` from `<proc_root>/<pid>/cgroup`. Only Linux has
+/// that file; elsewhere, and for a process that has gone, there is none.
+pub fn unit_of(proc_root: &Path, pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(proc_root.join(pid.to_string()).join("cgroup")).ok()?;
+    unit_from_cgroup(&text)
+}
+
+/// Where Linux keeps its process files.
+pub fn proc_root() -> &'static Path {
+    Path::new("/proc")
+}
+
+/// A runner directory seen while its listener ran, with the unit that
+/// listener was in.
+pub type Remembered = (PathBuf, Option<String>);
+
+/// What one discovery found.
+#[derive(Debug, Default)]
+pub struct Found {
+    pub runners: Vec<Runner>,
+    pub search: RunnerSearch,
+    /// What could not be read: a root that cannot be listed, and a `.runner`
+    /// file that cannot be read or parsed. Such a runner is left out of
+    /// `runners`, so the failure has to be reported alongside it.
+    pub errors: Vec<String>,
+    /// The directories whose listeners ran, to be passed back as
+    /// `remembered` so a listener that dies leaves its runner on screen.
+    pub seen: Vec<Remembered>,
+}
+
+/// Find the runners: those under the `roots` whose folder name matches
+/// `names`, those named in `units`, those whose `Runner.Listener` runs (when
+/// `processes` is on), and those `remembered` from an earlier discovery of
+/// this run, in that order and without repeats.
+///
+/// A runner's unit comes from, in order: `units`; the cgroup of its listener
+/// under `proc_root`; the `.service` file `svc.sh install` wrote in its
+/// directory; the unit its listener was last seen in.
+pub fn discover(
+    d: &Discovery,
+    listeners: &[Listener],
+    remembered: &[Remembered],
+    proc_root: &Path,
+) -> Found {
+    let (mut dirs, mut errors) = scan_roots(&d.roots, &d.names);
+    dirs.extend(d.units.iter().map(|(dir, _)| dir.clone()));
+    let mut live: Vec<Remembered> = Vec::new();
+    let mut unlocated = 0;
+    if d.processes {
+        for l in listeners {
+            match &l.dir {
+                Some(dir) => live.push((dir.clone(), unit_of(proc_root, l.pid))),
+                None => unlocated += 1,
+            }
+        }
+    }
+    dirs.extend(live.iter().map(|(dir, _)| dir.clone()));
+    dirs.extend(remembered.iter().map(|(dir, _)| dir.clone()));
+    let mut runners: Vec<Runner> = Vec::new();
+    for dir in dirs {
+        if runners.iter().any(|r| same_dir(&r.dir, &dir)) {
+            continue;
+        }
+        let file = dir.join(".runner");
+        let text = match std::fs::read_to_string(&file) {
+            Ok(text) => text,
+            // A directory that was never configured is not a runner.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errors.push(format!("{}: {}", io_reason(&e), file.display()));
+                continue;
+            }
+        };
+        let Some(mut r) = parse_runner_file(&dir, &text) else {
+            errors.push(format!("not a runner file: {}", file.display()));
+            continue;
+        };
+        let find = |list: &[Remembered]| {
+            list.iter()
+                .find(|(x, _)| same_dir(x, &r.dir))
+                .and_then(|(_, u)| u.clone())
+        };
+        let (unit, source) = if let Some((_, u)) = d.units.iter().find(|(x, _)| same_dir(x, &r.dir))
+        {
+            (Some(u.clone()), Some(UnitSource::Configured))
+        } else if let Some(u) = find(&live) {
+            (Some(u), Some(UnitSource::Listener))
+        } else if let Some(u) = std::fs::read_to_string(r.dir.join(".service"))
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|u| crate::exec::valid_unit(u))
+        {
+            (Some(u), Some(UnitSource::Recorded))
+        } else if let Some(u) = find(remembered) {
+            (Some(u), Some(UnitSource::Listener))
+        } else {
+            (None, None)
+        };
+        r.unit = unit;
+        r.unit_source = source;
+        runners.push(r);
+    }
+    Found {
+        search: RunnerSearch {
+            processes: d.processes,
+            listeners: if d.processes { listeners.len() } else { 0 },
+            unlocated,
+            roots: d.roots.clone(),
+            names: d.names.clone(),
+            pinned: d.units.len(),
+        },
+        seen: live,
+        runners,
+        errors,
+    }
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
     a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
-fn discover_dirs(roots: &[PathBuf]) -> (Vec<Runner>, Vec<String>) {
+/// The subfolders of each root whose name matches one of `names`, sorted
+/// within each root, and the roots that could not be listed.
+fn scan_roots(roots: &[PathBuf], names: &[String]) -> (Vec<PathBuf>, Vec<String>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
     for root in roots {
@@ -94,24 +308,14 @@ fn discover_dirs(roots: &[PathBuf]) -> (Vec<Runner>, Vec<String>) {
             .flatten()
             .map(|e| e.path())
             .filter(|p| {
-                p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with("actions-runner"))
-                    && p.is_dir()
+                p.file_name().is_some_and(|n| {
+                    let n = n.to_string_lossy();
+                    names.iter().any(|g| glob_match(g, &n))
+                }) && p.is_dir()
             })
             .collect();
         dirs.sort();
-        for dir in dirs {
-            let file = dir.join(".runner");
-            match std::fs::read_to_string(&file) {
-                Ok(text) => match parse_runner_file(&dir, &text) {
-                    Some(r) => out.push(r),
-                    None => errors.push(format!("not a runner file: {}", file.display())),
-                },
-                // A directory that was never configured is not a runner.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => errors.push(format!("{}: {}", io_reason(&e), file.display())),
-            }
-        }
+        out.extend(dirs);
     }
     (out, errors)
 }
@@ -243,6 +447,12 @@ impl ProcessScan {
         if runners.is_empty() {
             return;
         }
+        self.refresh();
+        self.apply(runners, now);
+    }
+
+    /// Read the process table afresh.
+    pub fn refresh(&mut self) {
         let Some(sys) = self.sys.as_mut() else { return };
         sys.refresh_processes_specifics(
             ProcessesToUpdate::All,
@@ -252,6 +462,35 @@ impl ProcessScan {
                 .with_cmd(UpdateKind::OnlyIfNotSet)
                 .with_cpu(),
         );
+    }
+
+    /// The `Runner.Listener` processes in the table as last read, with the
+    /// runner directory each runs from.
+    pub fn listeners(&self) -> Vec<Listener> {
+        let Some(sys) = self.sys.as_ref() else {
+            return Vec::new();
+        };
+        let mut out: Vec<Listener> = sys
+            .processes()
+            .iter()
+            .filter(|(_, p)| p.name().to_string_lossy() == "Runner.Listener")
+            .map(|(pid, p)| Listener {
+                pid: pid.as_u32(),
+                dir: runner_dir_of(p.exe(), p.cmd().first().map(Path::new)),
+            })
+            .collect();
+        out.sort_by_key(|l| l.pid);
+        out
+    }
+
+    /// Mark `runners` up and busy from the process table as last read.
+    pub fn apply(&mut self, runners: &mut [Runner], now: i64) {
+        let Some(sys) = self.sys.as_mut() else {
+            for r in runners.iter_mut() {
+                r.scanned_at = None;
+            }
+            return;
+        };
         for r in runners.iter_mut() {
             r.busy = false;
             r.busy_secs = None;
@@ -373,39 +612,327 @@ mod tests {
         );
     }
 
-    #[test]
-    fn discovers_runner_directories() {
-        let root = std::env::temp_dir().join(format!("crowsnest-runners-{}", std::process::id()));
-        let dir = root.join("actions-runner-pantry");
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("crowsnest-runners-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::create_dir_all(root.join("unrelated")).unwrap();
+        dir
+    }
+
+    /// A runner directory `name` under `root`, as `config.sh` leaves it, with
+    /// the listener binary where the runner puts it.
+    fn runner_dir(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("bin.2.338.2")).unwrap();
+        std::fs::write(dir.join("bin.2.338.2").join("Runner.Listener"), "").unwrap();
         std::fs::write(
             dir.join(".runner"),
             include_str!("../../tests/fixtures/runner/.runner"),
         )
         .unwrap();
+        dir
+    }
+
+    fn fixture_proc() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/proc")
+    }
+
+    fn only_roots(roots: &[PathBuf]) -> Discovery {
+        Discovery {
+            processes: false,
+            roots: roots.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn discovers_runner_directories() {
+        let root = scratch("dirs");
+        let dir = runner_dir(&root, "actions-runner-pantry");
+        std::fs::create_dir_all(root.join("unrelated")).unwrap();
         std::fs::write(
             dir.join(".service"),
             "actions.runner.acme-pantry.pantry-local-runner.service\n",
         )
         .unwrap();
-        let (found, errors) = discover(std::slice::from_ref(&root), &[]);
-        assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].dir, dir);
+        let none = Path::new("/nonexistent");
+        let found = discover(&only_roots(std::slice::from_ref(&root)), &[], &[], none);
+        assert!(found.errors.is_empty(), "{:?}", found.errors);
+        assert_eq!(found.runners.len(), 1);
+        let r = &found.runners[0];
+        assert_eq!(r.dir, dir);
         assert_eq!(
-            found[0].unit.as_deref(),
+            r.unit.as_deref(),
             Some("actions.runner.acme-pantry.pantry-local-runner.service")
         );
+        assert_eq!(r.unit_source, Some(UnitSource::Recorded));
         // A configured unit wins over the recorded one.
-        let (found, _) = discover(
-            std::slice::from_ref(&root),
-            &[(dir.clone(), "actions-runner-pantry.service".into())],
-        );
+        let d = Discovery {
+            units: vec![(dir.clone(), "actions-runner-pantry.service".into())],
+            ..only_roots(std::slice::from_ref(&root))
+        };
+        let found = discover(&d, &[], &[], none);
+        assert_eq!(found.runners.len(), 1, "named twice, listed once");
         assert_eq!(
-            found[0].unit.as_deref(),
+            found.runners[0].unit.as_deref(),
             Some("actions-runner-pantry.service")
         );
+        assert_eq!(found.runners[0].unit_source, Some(UnitSource::Configured));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn names_choose_the_folders_searched() {
+        let root = scratch("names");
+        runner_dir(&root, "actions-runner-a");
+        runner_dir(&root, "gh-runner-b");
+        runner_dir(&root, "other");
+        let found = |names: &[&str]| -> Vec<String> {
+            let d = Discovery {
+                names: names.iter().map(|n| n.to_string()).collect(),
+                ..only_roots(std::slice::from_ref(&root))
+            };
+            discover(&d, &[], &[], Path::new("/nonexistent"))
+                .runners
+                .iter()
+                .map(|r| r.dir.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        assert_eq!(found(&["actions-runner*"]), ["actions-runner-a"]);
+        assert_eq!(
+            found(&["actions-runner*", "gh-runner-?"]),
+            ["actions-runner-a", "gh-runner-b"]
+        );
+        assert_eq!(found(&["*"]).len(), 3);
+        assert!(found(&["nothing*"]).is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn globs_match_stars_and_question_marks() {
+        for (p, n, want) in [
+            ("actions-runner*", "actions-runner", true),
+            ("actions-runner*", "actions-runner-app", true),
+            ("actions-runner*", "my-actions-runner", false),
+            ("*runner*", "my-actions-runner-2", true),
+            ("gh-?", "gh-1", true),
+            ("gh-?", "gh-12", false),
+            ("a*b*c", "aXXbYYc", true),
+            ("a*b*c", "aXXbYY", false),
+            ("*", "", true),
+            ("", "", true),
+            ("", "x", false),
+        ] {
+            assert_eq!(glob_match(p, n), want, "{p} vs {n}");
+        }
+    }
+
+    #[test]
+    fn the_runner_dir_is_found_above_the_listener_executable() {
+        let root = scratch("above");
+        let dir = runner_dir(&root, "ci-box");
+        // The real executable sits in a versioned folder; the first argument
+        // of the command line says `bin`.
+        let exe = dir.join("bin.2.338.2").join("Runner.Listener");
+        let argv0 = dir.join("bin").join("Runner.Listener");
+        assert_eq!(runner_dir_of(Some(&exe), None), Some(dir.clone()));
+        assert_eq!(
+            runner_dir_of(None, Some(&argv0)),
+            Some(dir.clone()),
+            "another user's process hides its executable"
+        );
+        assert_eq!(runner_dir_of(Some(Path::new("/usr/bin/x")), None), None);
+        assert_eq!(runner_dir_of(None, None), None);
+        // A `.runner` far above the executable is not its runner.
+        let deep = dir.join("a").join("b").join("c").join("d").join("e");
+        assert_eq!(
+            runner_dir_of(Some(&deep.join("Runner.Listener")), None),
+            None
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn units_come_from_cgroup_strings() {
+        let unit = |t: &str| unit_from_cgroup(t);
+        assert_eq!(
+            unit("0::/user.slice/user-1000.slice/user@1000.service/app.slice/actions-runner-potful.service\n").as_deref(),
+            Some("actions-runner-potful.service"),
+            "a hand-written user unit"
+        );
+        assert_eq!(
+            unit("0::/system.slice/actions.runner.acme-pantry.pantry-local-runner.service")
+                .as_deref(),
+            Some("actions.runner.acme-pantry.pantry-local-runner.service"),
+            "a svc.sh system unit"
+        );
+        assert_eq!(
+            unit("0::/system.slice/foo.service/payload\n").as_deref(),
+            Some("foo.service"),
+            "a delegated cgroup below the service"
+        );
+        assert_eq!(
+            unit("12:pids:/x.slice/app.scope\n1:name=systemd:/system.slice/b.service\n0::/system.slice/b.service\n").as_deref(),
+            Some("b.service"),
+            "cgroup v1 reads the systemd hierarchy"
+        );
+        // Started from a terminal: the user's manager is not a runner unit.
+        assert_eq!(
+            unit("0::/user.slice/user-1000.slice/session-199.scope\n"),
+            None
+        );
+        assert_eq!(
+            unit("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-term.scope\n"),
+            None
+        );
+        assert_eq!(
+            unit("0::/user.slice/user-1000.slice/user@1000.service\n"),
+            None
+        );
+        assert_eq!(unit("0::/\n"), None);
+        assert_eq!(unit(""), None);
+        assert_eq!(unit("garbage"), None);
+        assert_eq!(
+            unit("0::/system.slice/-rf.service"),
+            None,
+            "never an option for systemctl"
+        );
+    }
+
+    #[test]
+    fn units_are_read_from_a_proc_tree() {
+        let proc = fixture_proc();
+        assert_eq!(
+            unit_of(&proc, 4242).as_deref(),
+            Some("actions-runner-potful.service")
+        );
+        assert_eq!(
+            unit_of(&proc, 4243).as_deref(),
+            Some("actions.runner.acme-pantry.pantry-local-runner.service")
+        );
+        assert_eq!(unit_of(&proc, 4244), None, "a terminal session");
+        assert_eq!(
+            unit_of(&proc, 4245).as_deref(),
+            Some("actions.runner.acme-pantry.build.service")
+        );
+        assert_eq!(unit_of(&proc, 4246), None, "a terminal app");
+        assert_eq!(unit_of(&proc, 1), None, "a process that is not there");
+        assert_eq!(unit_of(Path::new("/nonexistent"), 4242), None, "no /proc");
+    }
+
+    #[test]
+    fn running_listeners_find_runners_anywhere() {
+        let root = scratch("procs");
+        let dir = runner_dir(&root, "ci-box");
+        let listener = |pid, dir: &Path| Listener {
+            pid,
+            dir: runner_dir_of(Some(&dir.join("bin.2.338.2").join("Runner.Listener")), None),
+        };
+        let proc = fixture_proc();
+        let d = Discovery::default();
+        let l = [listener(4242, &dir)];
+        let found = discover(&d, &l, &[], &proc);
+        assert_eq!(found.runners.len(), 1, "no folder was searched");
+        let r = &found.runners[0];
+        assert_eq!(r.dir, dir);
+        assert_eq!(r.unit.as_deref(), Some("actions-runner-potful.service"));
+        assert_eq!(r.unit_source, Some(UnitSource::Listener));
+        assert_eq!(found.seen, [(dir.clone(), r.unit.clone())]);
+        assert_eq!(found.search.listeners, 1);
+
+        // A listener that is not under systemd leaves the unit unknown.
+        let found = discover(&d, &[listener(4244, &dir)], &[], &proc);
+        assert_eq!(found.runners[0].unit, None);
+
+        // With processes off, nothing is found from them.
+        let off = Discovery {
+            processes: false,
+            ..Default::default()
+        };
+        let found = discover(&off, &l, &[], &proc);
+        assert!(found.runners.is_empty());
+        assert_eq!((found.search.processes, found.search.listeners), (false, 0));
+
+        // A listener with no runner directory above it is counted, not shown.
+        let lost = Listener { pid: 9, dir: None };
+        let found = discover(&d, &[lost], &[], &proc);
+        assert!(found.runners.is_empty());
+        assert_eq!((found.search.listeners, found.search.unlocated), (1, 1));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_unit_comes_from_the_most_specific_source() {
+        let root = scratch("precedence");
+        let dir = runner_dir(&root, "actions-runner-ci");
+        std::fs::write(dir.join(".service"), "recorded.service\n").unwrap();
+        let proc = fixture_proc();
+        let l = [Listener {
+            pid: 4242,
+            dir: Some(dir.clone()),
+        }];
+        let found = |units: Vec<(PathBuf, String)>, l: &[Listener], mem: &[Remembered]| {
+            let d = Discovery {
+                units,
+                ..only_roots(std::slice::from_ref(&root))
+            };
+            let f = discover(
+                &Discovery {
+                    processes: true,
+                    ..d
+                },
+                l,
+                mem,
+                &proc,
+            );
+            assert_eq!(f.runners.len(), 1, "one runner however it was found");
+            (f.runners[0].unit.clone(), f.runners[0].unit_source)
+        };
+        let configured = vec![(dir.clone(), "configured.service".to_string())];
+        let remembered = [(dir.clone(), Some("old.service".to_string()))];
+        let s = |u: &str| Some(u.to_string());
+        assert_eq!(
+            found(configured, &l, &remembered),
+            (s("configured.service"), Some(UnitSource::Configured))
+        );
+        assert_eq!(
+            found(vec![], &l, &remembered),
+            (
+                s("actions-runner-potful.service"),
+                Some(UnitSource::Listener)
+            )
+        );
+        assert_eq!(
+            found(vec![], &[], &remembered),
+            (s("recorded.service"), Some(UnitSource::Recorded)),
+            "the file svc.sh wrote beats what an old listener was in"
+        );
+        std::fs::remove_file(dir.join(".service")).unwrap();
+        assert_eq!(
+            found(vec![], &[], &remembered),
+            (s("old.service"), Some(UnitSource::Listener)),
+            "a listener that has died leaves its runner and unit on screen"
+        );
+        assert_eq!(found(vec![], &[], &[]), (None, None));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_unit_directory_is_a_runner_even_when_stopped() {
+        let root = scratch("pinned");
+        let dir = runner_dir(&root, "my-ci");
+        let d = Discovery {
+            units: vec![
+                (dir.clone(), "my-ci.service".into()),
+                (root.join("gone"), "gone.service".into()),
+            ],
+            ..only_roots(&[])
+        };
+        let found = discover(&d, &[], &[], Path::new("/nonexistent"));
+        assert_eq!(found.runners.len(), 1, "a missing directory is skipped");
+        assert_eq!(found.runners[0].dir, dir);
+        assert_eq!(found.search.pinned, 2);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -423,15 +950,22 @@ mod tests {
         )
         .unwrap();
         let missing = root.join("gone");
-        let (found, errors) = discover(&[root.clone(), missing.clone()], &[]);
-        assert!(found.is_empty());
+        let found = discover(
+            &only_roots(&[root.clone(), missing.clone()]),
+            &[],
+            &[],
+            Path::new("/nonexistent"),
+        );
+        assert!(found.runners.is_empty());
+        let errors = found.errors;
         assert_eq!(errors.len(), 2, "{errors:?}");
-        assert!(errors[0].starts_with("not a runner file: "));
-        assert!(errors[0].ends_with("actions-runner-broken/.runner"));
+        // Every root is listed before any runner file is read.
         assert_eq!(
-            errors[1],
+            errors[0],
             format!("No such file or directory: {}", missing.display())
         );
+        assert!(errors[1].starts_with("not a runner file: "));
+        assert!(errors[1].ends_with("actions-runner-broken/.runner"));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

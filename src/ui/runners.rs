@@ -193,7 +193,34 @@ fn head(
             }
         }
     }
+    // How often systemd has restarted it: a runner that keeps crashing looks
+    // fine between restarts. The words when there is room, else `↺2`.
+    if let Some(n) = restarts(lane.runner) {
+        let words = format!("{n} restart{}", if n == 1 { "" } else { "s" });
+        let gap = if right.is_empty() { 0 } else { 2 };
+        let room = w.saturating_sub(width_of(&l) + width_of(&right) + gap + 1);
+        let text = if wide && words.width() <= room {
+            words
+        } else {
+            format!("{}{n}", t.g("\u{21ba}", "r"))
+        };
+        let mut chip = vec![span(text, t.plain())];
+        if !right.is_empty() {
+            chip.push(span("  ", Style::new()));
+        }
+        chip.extend(right);
+        right = chip;
+    }
     lr(l, right, w)
+}
+
+/// Times systemd has restarted the runner's unit, when it has.
+fn restarts(r: &crate::model::Runner) -> Option<u32> {
+    r.service
+        .as_ref()
+        .filter(|s| s.error.is_none())
+        .and_then(|s| s.restarts)
+        .filter(|n| *n > 0)
 }
 
 /// The narrow panel's one line under a runner, if it has something to say.
@@ -430,10 +457,69 @@ fn panel_lines(view: &View, lanes: &[Lane], w: usize, wide: bool) -> Vec<(u8, Li
     lines
 }
 
+/// What the empty panel says: that no runner was found, and where crowsnest
+/// looked, so the way to fix it is on the screen. Only what discovery really
+/// did is named.
+fn empty_lines(view: &View, w: usize) -> Vec<Line<'static>> {
+    let t = &view.theme;
+    let dim = |text: String| Line::from(span(super::trunc(&text, w), t.dim()));
+    let mut out = vec![dim("no self-hosted runners found".into())];
+    let Some(s) = &view.snap.runner_search else {
+        return out;
+    };
+    out.push(dim("looked at:".into()));
+    let dot = t.g("\u{b7}", ".");
+    let plural = |n: usize| if n == 1 { "listener" } else { "listeners" };
+    out.push(dim(if !s.processes {
+        format!("{dot} listeners: off")
+    } else if s.listeners == 0 {
+        format!("{dot} listeners: none running")
+    } else if s.unlocated == s.listeners {
+        format!("{dot} {} {}, no .runner", s.listeners, plural(s.listeners))
+    } else {
+        format!("{dot} {} {} running", s.listeners, plural(s.listeners))
+    }));
+    let home = view.app.home.as_deref();
+    let shown = |p: &std::path::Path| match home.and_then(|h| p.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
+    };
+    let folders = s.roots.iter().map(|p| shown(p)).collect::<Vec<_>>();
+    out.push(dim(if folders.is_empty() {
+        format!("{dot} no folder to search")
+    } else {
+        format!("{dot} {} for {}", folders.join(", "), s.names.join(" "))
+    }));
+    if s.pinned > 0 {
+        out.push(dim(format!(
+            "{dot} {} unit folder{} without .runner",
+            s.pinned,
+            if s.pinned == 1 { "" } else { "s" }
+        )));
+    }
+    out.push(dim("o > runners to change".into()));
+    out
+}
+
+/// Whether the panel shows the empty state: no runner found, and no read
+/// error to show in its place.
+fn empty_state(view: &View) -> bool {
+    view.snap.runners.is_empty()
+        && !view
+            .snap
+            .fresh
+            .get("runners")
+            .is_some_and(|f| f.error.is_some())
+}
+
 /// Rows the wide panel wants, borders included.
 pub fn wide_height(view: &View, w: u16) -> u16 {
-    let lanes = lanes::lanes(view.snap, &view.app.runner_thresholds);
     let w = w.saturating_sub(4) as usize;
+    if empty_state(view) {
+        return empty_lines(view, w).len() as u16 + 2;
+    }
+    let lanes = lanes::lanes(view.snap, &view.app.runner_thresholds);
     let n = (panel_lines(view, &lanes, w, true).len()
         + super::tier_error_lines(view, "runners", w, 0).len())
     .max(1);
@@ -447,11 +533,8 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
     let snap = view.snap;
     let lanes = lanes::lanes(snap, &view.app.runner_thresholds);
     let mut content: Vec<Content> = Vec::new();
-    if snap.runners.is_empty() && !snap.fresh.get("runners").is_some_and(|f| f.error.is_some()) {
-        content.push(Content::Line(Line::from(span(
-            "no self-hosted runners found",
-            t.dim(),
-        ))));
+    if empty_state(view) {
+        content.extend(empty_lines(view, w).into_iter().map(Content::Line));
     }
     let body = panel_lines(view, &lanes, w, wide);
     // First, and never dropped, so the warning can use the rows the lanes
@@ -1096,7 +1179,7 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         )),
         (Some(u), None) => l.push(span(format!("service {u}: not read yet"), t.dim())),
         (None, _) => l.push(span(
-            "service not known (svc.sh install, or --runner-unit DIR=UNIT)",
+            "service not known (set units in config.toml, or --runner-unit DIR=UNIT)",
             t.dim(),
         )),
     }

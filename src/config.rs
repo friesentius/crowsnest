@@ -6,9 +6,10 @@
 //! place, so comments and entries crowsnest does not know survive.
 
 use crate::model::{RunnerThresholds, Thresholds};
+use crate::sources::runners::{DEFAULT_NAME, Discovery};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use toml_edit::{Array, DocumentMut, Item, TableLike, Value};
+use toml_edit::{Array, DocumentMut, InlineTable, Item, TableLike, Value};
 
 /// A panel the dashboard can show or hide, numbered by its hotkey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -231,6 +232,31 @@ impl Setting {
     }
 }
 
+/// The `[runners]` section: where to look for self-hosted runners. Paths are
+/// kept as written, so a leading `~/` survives a save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerSettings {
+    /// Find runners from the `Runner.Listener` processes that are running.
+    pub processes: bool,
+    /// Folders to search for runner directories. None: your home directory.
+    pub roots: Vec<String>,
+    /// Globs for the folder names to look for. None: `actions-runner*`.
+    pub names: Vec<String>,
+    /// Runner directory -> the systemd unit that runs it.
+    pub units: BTreeMap<String, String>,
+}
+
+impl Default for RunnerSettings {
+    fn default() -> Self {
+        RunnerSettings {
+            processes: true,
+            roots: Vec::new(),
+            names: Vec::new(),
+            units: BTreeMap::new(),
+        }
+    }
+}
+
 /// Everything the options menu can change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -250,6 +276,7 @@ pub struct Settings {
     pub fleet_seconds: u64,
     pub pipeline_seconds: u64,
     pub ascii: bool,
+    pub runners: RunnerSettings,
 }
 
 impl Default for Settings {
@@ -268,6 +295,7 @@ impl Default for Settings {
             fleet_seconds: 60,
             pipeline_seconds: 15,
             ascii: false,
+            runners: RunnerSettings::default(),
         }
     }
 }
@@ -309,25 +337,108 @@ pub fn usage_key(provider: &str, window: &str) -> String {
 /// Settings given on the command line for this run. They win over the file,
 /// and the options menu shows them as locked.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Overrides(BTreeMap<Setting, u64>);
+pub struct Overrides {
+    values: BTreeMap<Setting, u64>,
+    /// `--runner-root`: replaces the file's `[runners] roots`.
+    pub runner_roots: Vec<PathBuf>,
+    /// `--runner-unit`: each wins over the file's unit for its directory.
+    pub runner_units: Vec<(PathBuf, String)>,
+}
 
 impl Overrides {
     pub fn set(&mut self, s: Setting, v: u64) {
-        self.0.insert(s, v);
+        self.values.insert(s, v);
     }
 
     pub fn get(&self, s: Setting) -> Option<u64> {
-        self.0.get(&s).copied()
+        self.values.get(&s).copied()
     }
 
     /// The settings this run uses: the file's, with the overrides on top.
     pub fn apply(&self, file: &Settings) -> Settings {
         let mut s = file.clone();
-        for (k, v) in &self.0 {
+        for (k, v) in &self.values {
             k.set(&mut s, *v);
         }
         s
     }
+}
+
+/// Whether `file` is under `dir`, following symlinks in its existing parents.
+pub fn inside(file: &Path, dir: &Path) -> bool {
+    let real = file
+        .ancestors()
+        .find_map(|a| {
+            let rest = file.strip_prefix(a).ok()?;
+            Some(a.canonicalize().ok()?.join(rest))
+        })
+        .unwrap_or_else(|| file.to_path_buf());
+    real.starts_with(dir) || file.starts_with(dir)
+}
+
+/// A configured path with a leading `~` made the home directory.
+fn expand(path: &str, home: Option<&Path>) -> Option<PathBuf> {
+    match path.strip_prefix('~') {
+        None => Some(PathBuf::from(path)),
+        Some("") => home.map(Path::to_path_buf),
+        Some(rest) => Some(home?.join(rest.trim_start_matches('/'))),
+    }
+}
+
+/// Where this run looks for runners: the `--runner-*` flags, then the file's
+/// `[runners]`, then the defaults (your home directory, `actions-runner*`,
+/// running listeners). Paths from the file that are inside the firstmate home
+/// are not used, and the second value says so, one line each.
+pub fn discovery(
+    file: &RunnerSettings,
+    flags: &Overrides,
+    fm_home: &Path,
+    home: Option<&Path>,
+) -> (Discovery, Vec<String>) {
+    let mut problems = Vec::new();
+    let mut usable = |what: &str, text: &str| -> Option<PathBuf> {
+        let Some(path) = expand(text, home) else {
+            problems.push(format!("runners.{what}: {text} needs a home directory"));
+            return None;
+        };
+        if inside(&path, fm_home) {
+            problems.push(format!(
+                "runners.{what}: {text} is inside the firstmate home, ignored"
+            ));
+            return None;
+        }
+        Some(path)
+    };
+    let roots = if !flags.runner_roots.is_empty() {
+        flags.runner_roots.clone()
+    } else if file.roots.is_empty() {
+        home.map(Path::to_path_buf).into_iter().collect()
+    } else {
+        file.roots
+            .iter()
+            .filter_map(|r| usable("roots", r))
+            .collect()
+    };
+    let mut units = flags.runner_units.clone();
+    for (dir, unit) in &file.units {
+        if let Some(dir) = usable("units", dir) {
+            units.push((dir, unit.clone()));
+        }
+    }
+    let names = if file.names.is_empty() {
+        vec![DEFAULT_NAME.to_string()]
+    } else {
+        file.names.clone()
+    };
+    (
+        Discovery {
+            processes: file.processes,
+            roots,
+            names,
+            units,
+        },
+        problems,
+    )
 }
 
 /// The location: `$XDG_CONFIG_HOME/crowsnest/config.toml`, or
@@ -416,6 +527,7 @@ pub fn parse(text: &str) -> Loaded {
                     }
                 }
             }
+            "runners" => runners(table, &mut s.runners, problems),
             "thresholds" | "refresh" | "display" => scalars(name, table, s, problems),
             _ => problems.push(format!("unknown section [{name}]")),
         }
@@ -467,6 +579,68 @@ fn names(
                 "{what}: {} is not a name in quotes",
                 v.to_string().trim()
             )),
+        }
+    }
+}
+
+/// Whether `path` can be a configured path: absolute, or under `~`.
+pub fn valid_path(path: &str) -> bool {
+    !path.contains('\0') && (Path::new(path).is_absolute() || path == "~" || path.starts_with("~/"))
+}
+
+/// Whether `glob` can be a folder name pattern.
+pub fn valid_glob(glob: &str) -> bool {
+    !glob.trim().is_empty() && !glob.contains(['/', '\0'])
+}
+
+fn runners(table: &dyn TableLike, r: &mut RunnerSettings, problems: &mut Vec<String>) {
+    for (key, item) in table.iter() {
+        match key {
+            "processes" => match item.as_bool() {
+                Some(b) => r.processes = b,
+                None => problems.push("runners.processes must be true or false".into()),
+            },
+            "roots" => names(item, "runners.roots", problems, |p, problems| {
+                if !valid_path(&p) {
+                    problems.push(format!(
+                        "runners.roots: \"{p}\" is not an absolute path (or one under ~/)"
+                    ));
+                } else if !r.roots.contains(&p) {
+                    r.roots.push(p);
+                }
+            }),
+            "names" => names(item, "runners.names", problems, |g, problems| {
+                if !valid_glob(&g) {
+                    problems.push(format!(
+                        "runners.names: \"{g}\" is not a folder name (a pattern with * and ?)"
+                    ));
+                } else if !r.names.contains(&g) {
+                    r.names.push(g);
+                }
+            }),
+            "units" => {
+                let Some(units) = item.as_table_like() else {
+                    problems.push(
+                        "runners.units must be a table, like { \"~/actions-runner\" = \"runner.service\" }"
+                            .into(),
+                    );
+                    continue;
+                };
+                for (dir, unit) in units.iter() {
+                    match unit.as_str() {
+                        Some(u) if valid_path(dir) && crate::exec::valid_unit(u) => {
+                            r.units.insert(dir.to_string(), u.to_string());
+                        }
+                        Some(_) if !valid_path(dir) => problems.push(format!(
+                            "runners.units: \"{dir}\" is not an absolute path (or one under ~/)"
+                        )),
+                        _ => problems.push(format!(
+                            "runners.units: {dir} needs a systemd unit name in quotes, like \"actions-runner.service\""
+                        )),
+                    }
+                }
+            }
+            _ => problems.push(unknown("runners", key)),
         }
     }
 }
@@ -574,6 +748,33 @@ pub fn render(
         };
         set(&mut doc, setting.section(), setting.key(), v);
     }
+    let (b, a) = (&before.runners, &after.runners);
+    if all || b.processes != a.processes {
+        set(&mut doc, "runners", "processes", Value::from(a.processes));
+    }
+    if all || b.roots != a.roots {
+        set(
+            &mut doc,
+            "runners",
+            "roots",
+            names(&mut a.roots.iter().map(String::as_str)),
+        );
+    }
+    if all || b.names != a.names {
+        set(
+            &mut doc,
+            "runners",
+            "names",
+            names(&mut a.names.iter().map(String::as_str)),
+        );
+    }
+    if all || b.units != a.units {
+        let mut t = InlineTable::new();
+        for (dir, unit) in &a.units {
+            t.insert(dir, Value::from(unit.as_str()));
+        }
+        set(&mut doc, "runners", "units", Value::InlineTable(t));
+    }
     Ok(match existing {
         None => format!("{HEADER}\n{doc}"),
         Some(_) if doc.is_empty() || lead.trim().is_empty() => format!("{lead}{doc}"),
@@ -649,6 +850,7 @@ pub fn save(path: &Path, before: &Settings, after: &Settings) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sources::runners::Discovery;
 
     #[test]
     fn panels_map_to_their_hotkeys() {
@@ -696,6 +898,10 @@ mod tests {
             assert!(text.contains(&format!("\n{} = ", s.key())), "{text}");
         }
         assert!(text.contains("\n\n[panels]\nhidden = []\n"), "{text}");
+        assert!(
+            text.contains("\n[runners]\nprocesses = true\nroots = []\nnames = []\nunits = {}\n"),
+            "{text}"
+        );
         assert_eq!(parse(&text), Loaded::default());
     }
 
@@ -1022,5 +1228,249 @@ runner_pickup_minutes = 1.5 # want 90s
         );
         assert_eq!(std::fs::read_dir(&config).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The `[runners]` section as a person would write it.
+    const RUNNERS: &str = "\
+[runners]
+processes = false
+roots = [\"~/ci\", \"/srv/runners\"]
+names = [\"actions-runner*\", \"gh-*\"]
+units = { \"~/ci/actions-runner-app\" = \"actions-runner-app.service\", \"/srv/runners/gh.one\" = \"actions.runner.acme-app.one.service\" }
+";
+
+    fn runner_settings() -> RunnerSettings {
+        RunnerSettings {
+            processes: false,
+            roots: vec!["~/ci".into(), "/srv/runners".into()],
+            names: vec!["actions-runner*".into(), "gh-*".into()],
+            units: [
+                (
+                    "~/ci/actions-runner-app".to_string(),
+                    "actions-runner-app.service".to_string(),
+                ),
+                (
+                    "/srv/runners/gh.one".to_string(),
+                    "actions.runner.acme-app.one.service".to_string(),
+                ),
+            ]
+            .into(),
+        }
+    }
+
+    #[test]
+    fn runner_settings_load_and_save_back() {
+        let l = parse(RUNNERS);
+        assert_eq!(l.problems, Vec::<String>::new());
+        assert_eq!(l.settings.runners, runner_settings());
+
+        // Written to a new file and read back, every entry survives,
+        // including a path under `~` and a directory name with a dot.
+        let dir = scratch("runners-roundtrip");
+        let path = dir.join("config.toml");
+        save(&path, &Settings::default(), &l.settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("processes = false\n"), "{text}");
+        assert!(
+            text.contains("roots = [\"~/ci\", \"/srv/runners\"]\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"/srv/runners/gh.one\" = \"actions.runner.acme-app.one.service\""),
+            "{text}"
+        );
+        assert_eq!(load(&path), l);
+        std::fs::remove_dir_all(dir).unwrap();
+
+        // The defaults write nothing a person would not expect.
+        let d = Settings::default().runners;
+        assert!(d.processes && d.roots.is_empty() && d.names.is_empty() && d.units.is_empty());
+    }
+
+    #[test]
+    fn saving_a_runner_change_keeps_the_rest_of_the_file() {
+        let mine = "\
+# runners
+[runners]
+processes = true # find them while they run
+roots = [\"/srv/runners\"] # the CI box
+names = [\"gh-*\"]
+future = 1
+";
+        let loaded = parse(mine);
+        assert_eq!(loaded.problems, ["unknown key runners.future"]);
+        let before = loaded.settings;
+        let mut s = before.clone();
+        s.runners
+            .units
+            .insert("/srv/runners/gh-one".into(), "gh-one.service".into());
+        let text = render(Some(mine), &before, &s).unwrap();
+        assert!(
+            text.starts_with(
+                "# runners\n[runners]\nprocesses = true # find them while they run\nroots = [\"/srv/runners\"] # the CI box\nnames = [\"gh-*\"]\nfuture = 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("units = { \"/srv/runners/gh-one\" = \"gh-one.service\" }"),
+            "{text}"
+        );
+        assert_eq!(parse(&text).settings, s);
+        // Turning processes off rewrites that entry and keeps its comment.
+        let mut off = s.clone();
+        off.runners.processes = false;
+        let text = render(Some(&text), &s, &off).unwrap();
+        assert!(
+            text.contains("processes = false # find them while they run\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_units_table_written_on_its_own_lines_loads() {
+        let l = parse("[runners.units]\n\"~/a\" = \"a.service\"\n");
+        assert_eq!(l.problems, Vec::<String>::new());
+        assert_eq!(l.settings.runners.units["~/a"], "a.service");
+    }
+
+    #[test]
+    fn invalid_runner_entries_are_reported_and_ignored() {
+        let l = parse(
+            "\
+[runners]
+processes = \"yes\"
+roots = [\"relative/dir\", \"/ok\", \"/ok\", 4]
+names = [\"a/b\", \"\", \"good*\"]
+units = { \"~/x\" = \"--now\", \"rel\" = \"a.service\", \"~/y\" = 3, \"~/z\" = \"z.service\" }
+colour = 1
+",
+        );
+        assert_eq!(l.settings.runners.roots, ["/ok"], "no repeats");
+        assert_eq!(l.settings.runners.names, ["good*"]);
+        assert_eq!(l.settings.runners.units.len(), 1);
+        assert_eq!(l.settings.runners.units["~/z"], "z.service");
+        assert!(l.settings.runners.processes);
+        assert_eq!(
+            l.problems,
+            [
+                "runners.processes must be true or false",
+                "runners.roots: \"relative/dir\" is not an absolute path (or one under ~/)",
+                "runners.roots: 4 is not a name in quotes",
+                "runners.names: \"a/b\" is not a folder name (a pattern with * and ?)",
+                "runners.names: \"\" is not a folder name (a pattern with * and ?)",
+                "runners.units: ~/x needs a systemd unit name in quotes, like \"actions-runner.service\"",
+                "runners.units: \"rel\" is not an absolute path (or one under ~/)",
+                "runners.units: ~/y needs a systemd unit name in quotes, like \"actions-runner.service\"",
+                "unknown key runners.colour",
+            ]
+        );
+        let bad = parse("runners = 3\n[panels]\nhidden = []\n");
+        assert_eq!(bad.problems, ["runners must be a table, like [runners]"]);
+        let bad = parse("[runners]\nunits = [\"a\"]\n");
+        assert_eq!(bad.problems.len(), 1);
+    }
+
+    #[test]
+    fn discovery_takes_flags_then_the_file_then_the_defaults() {
+        let home = Path::new("/home/crew");
+        let fm = Path::new("/home/crew/firstmate");
+        let file = runner_settings().clone();
+        let none = Overrides::default();
+
+        // Nothing set: your home directory, the usual name, running listeners.
+        let (d, problems) = discovery(&RunnerSettings::default(), &none, fm, Some(home));
+        assert_eq!(
+            d,
+            Discovery {
+                roots: vec![home.into()],
+                ..Default::default()
+            }
+        );
+        assert!(problems.is_empty());
+        let (d, _) = discovery(&RunnerSettings::default(), &none, fm, None);
+        assert!(d.roots.is_empty(), "no home, no default folder");
+
+        // The file's settings, with `~` made the home directory.
+        let (d, problems) = discovery(&file, &none, fm, Some(home));
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(!d.processes);
+        assert_eq!(
+            d.roots,
+            [
+                PathBuf::from("/home/crew/ci"),
+                PathBuf::from("/srv/runners")
+            ]
+        );
+        assert_eq!(d.names, ["actions-runner*", "gh-*"]);
+        assert_eq!(
+            d.units,
+            [
+                (
+                    PathBuf::from("/srv/runners/gh.one"),
+                    "actions.runner.acme-app.one.service".to_string()
+                ),
+                (
+                    PathBuf::from("/home/crew/ci/actions-runner-app"),
+                    "actions-runner-app.service".to_string()
+                ),
+            ]
+        );
+
+        // Flags replace the roots and win over the file's unit for a directory.
+        let mut flags = Overrides::default();
+        flags.runner_roots.push("/flag/root".into());
+        flags
+            .runner_units
+            .push(("/srv/runners/gh.one".into(), "flag.service".into()));
+        let (d, _) = discovery(&file, &flags, fm, Some(home));
+        assert_eq!(d.roots, [PathBuf::from("/flag/root")]);
+        assert_eq!(
+            d.units[0],
+            ("/srv/runners/gh.one".into(), "flag.service".to_string())
+        );
+        assert_eq!(
+            d.units.len(),
+            3,
+            "the file's entries stay, after the flag's"
+        );
+    }
+
+    #[test]
+    fn config_paths_inside_the_firstmate_home_are_refused() {
+        let home = Path::new("/home/crew");
+        let fm = Path::new("/home/crew/firstmate");
+        let file = RunnerSettings {
+            roots: vec!["~/firstmate/state".into(), "~/ci".into()],
+            units: [
+                ("~/firstmate/runner".to_string(), "a.service".to_string()),
+                ("/srv/b".to_string(), "b.service".to_string()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let (d, problems) = discovery(&file, &Overrides::default(), fm, Some(home));
+        assert_eq!(d.roots, [PathBuf::from("/home/crew/ci")]);
+        assert_eq!(
+            d.units,
+            [(PathBuf::from("/srv/b"), "b.service".to_string())]
+        );
+        assert_eq!(
+            problems,
+            [
+                "runners.roots: ~/firstmate/state is inside the firstmate home, ignored",
+                "runners.units: ~/firstmate/runner is inside the firstmate home, ignored",
+            ]
+        );
+        // Every folder refused leaves none searched, not the home directory.
+        let only = RunnerSettings {
+            roots: vec!["/home/crew/firstmate".into()],
+            ..Default::default()
+        };
+        let (d, _) = discovery(&only, &Overrides::default(), fm, Some(home));
+        assert!(d.roots.is_empty());
+        // A path under `~` with no home directory cannot be used.
+        let (d, problems) = discovery(&file, &Overrides::default(), fm, None);
+        assert!(d.roots.is_empty());
+        assert_eq!(problems.len(), 3, "{problems:?}");
     }
 }

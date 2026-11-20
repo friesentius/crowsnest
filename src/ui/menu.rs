@@ -187,6 +187,29 @@ fn draw_in(view: &View, buf: &mut Buffer, g: &Geometry) {
     let mut about = selected
         .and_then(|i| items.get(i))
         .map_or_else(Vec::new, |i| wrap(&i.about, rw - 2));
+    // While an entry is typed, its prompt takes the description's place.
+    if let Some(edit) = &menu.edit {
+        let cursor = t.g("\u{258f}", "_");
+        let typed = format!("{}: {}{cursor}", edit.list.prompt(), edit.text);
+        let first = Line::from(vec![
+            span(" ", Style::new()),
+            span(tail(&typed, rw - 3), t.key()),
+        ]);
+        buf.set_line(x, mid + 1, &first, rw as u16);
+        let (text, style) = match &edit.error {
+            Some(e) => (e.clone(), t.warn()),
+            None => (edit.list.help().to_string(), t.dim()),
+        };
+        for (n, line) in wrap(&text, rw - 2)
+            .iter()
+            .take(about_h.saturating_sub(1))
+            .enumerate()
+        {
+            let line = Line::from(span(line.clone(), style));
+            buf.set_line(x + 1, mid + 2 + n as u16, &line, rw as u16 - 2);
+        }
+        about.clear();
+    }
     // Text that does not fit ends in an ellipsis instead of stopping short.
     if about.len() > about_h {
         about.truncate(about_h);
@@ -201,13 +224,18 @@ fn draw_in(view: &View, buf: &mut Buffer, g: &Geometry) {
 
     let iw = r.width as usize - 2;
     let mut hint = Vec::new();
-    for (k, v) in [
-        (t.g("\u{2191}\u{2193}", "j/k"), "option"),
-        (t.g("\u{2190}\u{2192}", "h/l"), "change"),
-        ("tab", "category"),
-        ("1-5", "panels"),
-        ("esc", "close"),
-    ] {
+    let keys: &[(&str, &str)] = if menu.edit.is_some() {
+        &[("enter", "add"), ("esc", "cancel")]
+    } else {
+        &[
+            (t.g("\u{2191}\u{2193}", "j/k"), "option"),
+            (t.g("\u{2190}\u{2192}", "h/l"), "change"),
+            ("tab", "category"),
+            ("1-5", "panels"),
+            ("esc", "close"),
+        ]
+    };
+    for &(k, v) in keys {
         hint.push(span(format!(" {k} "), t.key()));
         hint.push(span(format!(" {v} "), t.dim()));
     }
@@ -317,6 +345,26 @@ fn too_small(t: &Theme, buf: &mut Buffer, area: Rect) {
         .render(r, buf);
     let line: Line = Line::from(vec![Span::styled(trunc(msg, w as usize - 4), t.dim())]);
     buf.set_line(r.x + 2, r.y + 1, &line, w - 4);
+}
+
+/// The end of `text` that fits `w` cells, so what is being typed stays in
+/// view.
+fn tail(text: &str, w: usize) -> String {
+    if text.width() <= w {
+        return text.to_string();
+    }
+    let mut out: Vec<char> = Vec::new();
+    let mut used = 1;
+    for ch in text.chars().rev() {
+        let cw = ch.to_string().width();
+        if used + cw > w {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.reverse();
+    format!("\u{2026}{}", out.into_iter().collect::<String>())
 }
 
 /// Words of `text` in lines of at most `w` cells.

@@ -1,12 +1,13 @@
 //! UI state and key handling. Pure: no I/O, so it is unit-testable.
 
-use crate::config::{Overrides, Panel, Settings};
+use crate::config::{self, Overrides, Panel, Settings};
 use crate::model::{
     CheckState, Pipeline, PrChecks, RunnerThresholds, Snapshot, Stale, Thresholds, Worker,
     WorkerState, classify,
 };
-use crate::options::{self, Category, Item, Target};
+use crate::options::{self, Category, Item, RunnerList, Target};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Filter {
@@ -59,6 +60,14 @@ pub enum Action {
     Category {
         next: bool,
     },
+    /// While typing in the options menu: a character.
+    Type(char),
+    /// While typing: delete the last character.
+    Erase,
+    /// While typing: add what was typed.
+    Commit,
+    /// While typing: give up.
+    Cancel,
 }
 
 /// Which part of the screen the arrow keys move in.
@@ -77,6 +86,17 @@ pub struct Menu {
     /// The selected row, by what it changes, so the selection stays on it
     /// when usage windows come and go between reads.
     focus: Option<Target>,
+    /// An entry being typed.
+    pub edit: Option<Edit>,
+}
+
+/// A runner list entry being typed into the options menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edit {
+    pub list: RunnerList,
+    pub text: String,
+    /// Why the last attempt to add `text` failed.
+    pub error: Option<String>,
 }
 
 impl Menu {
@@ -85,6 +105,7 @@ impl Menu {
             category,
             selected: 0,
             focus: None,
+            edit: None,
         }
     }
 
@@ -133,6 +154,10 @@ pub struct App {
     pub thresholds: Thresholds,
     pub menu: Option<Menu>,
     pub config: ConfigStatus,
+    /// The firstmate home, which no configured runner path may be inside.
+    pub fm_home: Option<PathBuf>,
+    /// The home directory, for a path typed with `~`.
+    pub home: Option<PathBuf>,
     pub runner_thresholds: RunnerThresholds,
     pub focus: Focus,
     /// The selected runner, by its directory ([`runner_keys`]).
@@ -180,6 +205,8 @@ impl App {
             thresholds,
             menu: None,
             config: ConfigStatus::default(),
+            fm_home: None,
+            home: None,
             runner_thresholds: effective.runner_thresholds(),
             focus: Focus::Roster,
             runner: None,
@@ -316,14 +343,107 @@ impl App {
             Action::Bottom => menu.select(last, &items),
             Action::Change { up } => {
                 if let Some(item) = items.get(idx) {
-                    options::change(&item.target, &mut self.settings, &self.overrides, up);
+                    if let Target::RunnerAdd(list) = item.target {
+                        menu.edit = Some(Edit {
+                            list,
+                            text: String::new(),
+                            error: None,
+                        });
+                    } else {
+                        options::change(&item.target, &mut self.settings, &self.overrides, up);
+                    }
                     menu.select(idx, &items);
                 }
+            }
+            Action::Type(_) | Action::Erase | Action::Commit | Action::Cancel => {
+                self.apply_edit(action, &mut menu)
             }
             Action::Category { next } => menu = Menu::new(menu.category.cycle(next)),
             _ => {}
         }
         self.menu = Some(menu);
+    }
+
+    /// Keys while an entry is being typed.
+    fn apply_edit(&mut self, action: Action, menu: &mut Menu) {
+        let Some(edit) = menu.edit.as_mut() else {
+            return;
+        };
+        match action {
+            Action::Type(c) => {
+                edit.text.push(c);
+                edit.error = None;
+            }
+            Action::Erase => {
+                edit.text.pop();
+                edit.error = None;
+            }
+            Action::Cancel => menu.edit = None,
+            Action::Commit => match self.add_runner_entry(edit.list, &edit.text) {
+                Ok(()) => menu.edit = None,
+                Err(e) => edit.error = Some(e),
+            },
+            _ => {}
+        }
+    }
+
+    /// Add what was typed to a runner list, or say why it cannot be.
+    fn add_runner_entry(&mut self, list: RunnerList, text: &str) -> Result<(), String> {
+        let text = text.trim();
+        let guard = |path: &str| -> Result<(), String> {
+            if !config::valid_path(path) {
+                return Err("needs an absolute path, or one under ~/".into());
+            }
+            let expanded = match path.strip_prefix('~') {
+                None => Some(PathBuf::from(path)),
+                Some(rest) => self
+                    .home
+                    .as_deref()
+                    .map(|h| h.join(rest.trim_start_matches('/'))),
+            };
+            match (&self.fm_home, expanded) {
+                (Some(fm), Some(p)) if config::inside(&p, fm) => {
+                    Err("that is inside the firstmate home, which crowsnest does not read".into())
+                }
+                _ => Ok(()),
+            }
+        };
+        let r = &mut self.settings.runners;
+        match list {
+            RunnerList::Roots => {
+                guard(text)?;
+                if r.roots.iter().any(|x| x == text) {
+                    return Err("already searched".into());
+                }
+                r.roots.push(text.to_string());
+            }
+            RunnerList::Names => {
+                if !config::valid_glob(text) {
+                    return Err("needs a folder name, like actions-runner*".into());
+                }
+                if r.names.iter().any(|x| x == text) {
+                    return Err("already looked for".into());
+                }
+                r.names.push(text.to_string());
+            }
+            RunnerList::Units => {
+                let (dir, unit) = text
+                    .rsplit_once('=')
+                    .ok_or("needs DIR=UNIT, like ~/actions-runner-app=app.service")?;
+                let (dir, unit) = (dir.trim(), unit.trim());
+                guard(dir)?;
+                if !crate::exec::valid_unit(unit) {
+                    return Err("that is not a systemd unit name".into());
+                }
+                r.units.insert(dir.to_string(), unit.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether an entry is being typed in the options menu.
+    pub fn editing(&self) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.edit.is_some())
     }
 
     /// Keys on the dashboard, against the rows and runners on screen
@@ -851,6 +971,158 @@ mod tests {
         assert_eq!(app.menu.as_ref().unwrap().category, Category::Panels);
         app.apply(Action::Options, &s);
         assert!(app.menu.is_none());
+    }
+
+    /// Open the options menu on its runners category and select the row
+    /// labelled `row`.
+    fn runner_menu(app: &mut App, s: &Snapshot, row: &str) {
+        if app.menu.is_none() {
+            app.apply(Action::Options, s);
+        }
+        while app.menu.as_ref().unwrap().category != Category::Runners {
+            app.apply(Action::Category { next: true }, s);
+        }
+        app.apply(Action::Top, s);
+        for _ in 0..30 {
+            let items = app.menu_items(s);
+            let i = app.menu.as_ref().unwrap().index(&items).unwrap();
+            if items[i].label == row {
+                return;
+            }
+            app.apply(Action::Down, s);
+        }
+        panic!("no row {row}");
+    }
+
+    fn type_text(app: &mut App, s: &Snapshot, text: &str) {
+        for c in text.chars() {
+            app.apply(Action::Type(c), s);
+        }
+    }
+
+    #[test]
+    fn runner_entries_are_typed_into_the_menu() {
+        let s = snap();
+        let mut app = App {
+            fm_home: Some("/home/crew/firstmate".into()),
+            home: Some("/home/crew".into()),
+            ..App::default()
+        };
+        runner_menu(&mut app, &s, "add folder");
+        assert!(!app.editing());
+        app.apply(Action::Change { up: true }, &s);
+        assert!(app.editing(), "Enter on an add row starts typing");
+
+        // Keys that mean something elsewhere are text: no panel is hidden.
+        type_text(&mut app, &s, "2o");
+        assert!(app.settings.shown(Panel::Runners));
+        app.apply(Action::Erase, &s);
+        app.apply(Action::Erase, &s);
+        app.apply(Action::Erase, &s);
+        // A relative path is refused, and the text stays to be fixed.
+        type_text(&mut app, &s, "ci");
+        app.apply(Action::Commit, &s);
+        let edit = app.menu.as_ref().unwrap().edit.clone().unwrap();
+        assert_eq!(edit.text, "ci");
+        assert_eq!(
+            edit.error.as_deref(),
+            Some("needs an absolute path, or one under ~/")
+        );
+        assert!(app.settings.runners.roots.is_empty());
+        // Typing again clears the complaint.
+        app.apply(Action::Erase, &s);
+        assert_eq!(
+            app.menu.as_ref().unwrap().edit.as_ref().unwrap().error,
+            None
+        );
+        app.apply(Action::Erase, &s);
+        // The firstmate home is refused, however it is spelled.
+        type_text(&mut app, &s, "~/firstmate/state");
+        app.apply(Action::Commit, &s);
+        assert!(
+            app.menu
+                .as_ref()
+                .unwrap()
+                .edit
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("firstmate home")
+        );
+        for _ in 0.."~/firstmate/state".len() {
+            app.apply(Action::Erase, &s);
+        }
+        type_text(&mut app, &s, "~/ci");
+        app.apply(Action::Commit, &s);
+        assert!(!app.editing());
+        assert_eq!(app.settings.runners.roots, ["~/ci"]);
+        // The default row is gone and the folder has its own row.
+        let labels: Vec<String> = app.menu_items(&s).into_iter().map(|i| i.label).collect();
+        assert!(!labels.contains(&"folder ~".to_string()), "{labels:?}");
+        assert!(labels.contains(&"folder ~/ci".to_string()), "{labels:?}");
+
+        // Esc gives up without adding anything.
+        app.apply(Action::Change { up: true }, &s);
+        type_text(&mut app, &s, "/srv/x");
+        app.apply(Action::Cancel, &s);
+        assert!(!app.editing());
+        assert_eq!(app.settings.runners.roots, ["~/ci"]);
+        assert!(app.menu.is_some(), "the menu stays open");
+
+        // A name, then a unit.
+        runner_menu(&mut app, &s, "add name");
+        app.apply(Action::Change { up: true }, &s);
+        type_text(&mut app, &s, "gh-*");
+        app.apply(Action::Commit, &s);
+        assert_eq!(app.settings.runners.names, ["gh-*"]);
+        runner_menu(&mut app, &s, "add unit");
+        app.apply(Action::Change { up: true }, &s);
+        type_text(&mut app, &s, "~/ci/gh-one");
+        app.apply(Action::Commit, &s);
+        assert!(
+            app.menu
+                .as_ref()
+                .unwrap()
+                .edit
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("needs DIR=UNIT")
+        );
+        type_text(&mut app, &s, "=--now");
+        app.apply(Action::Commit, &s);
+        assert_eq!(
+            app.menu
+                .as_ref()
+                .unwrap()
+                .edit
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("that is not a systemd unit name")
+        );
+        for _ in 0.."--now".len() {
+            app.apply(Action::Erase, &s);
+        }
+        type_text(&mut app, &s, "gh-one.service");
+        app.apply(Action::Commit, &s);
+        assert_eq!(app.settings.runners.units["~/ci/gh-one"], "gh-one.service");
+
+        // Entries are removed from their own row, and the processes switch
+        // toggles.
+        runner_menu(&mut app, &s, "unit ~/ci/gh-one \u{2192} gh-one.service");
+        app.apply(Action::Change { up: true }, &s);
+        assert!(app.settings.runners.units.is_empty());
+        runner_menu(&mut app, &s, "from processes");
+        app.apply(Action::Change { up: false }, &s);
+        assert!(!app.settings.runners.processes);
+        app.apply(Action::Change { up: false }, &s);
+        assert!(app.settings.runners.processes);
     }
 
     #[test]

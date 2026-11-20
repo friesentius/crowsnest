@@ -192,13 +192,15 @@ esac
     );
 
     // A config file with one entry crowsnest does not know: reported on
-    // stderr, never rewritten by a read.
+    // stderr, never rewritten by a read. It also turns off finding runners
+    // from running listeners, so the real runners of the machine the test
+    // runs on stay out of the snapshot.
     let config_dir = root.join("config");
     let config = config_dir.join("crowsnest/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(
         &config,
-        "[thresholds]\nstale_minutes = 45\n[display]\ntheme = \"amber\"\n",
+        "[thresholds]\nstale_minutes = 45\n[display]\ntheme = \"amber\"\n[runners]\nprocesses = false\n",
     )
     .unwrap();
     let config_before = fingerprint(&config_dir);

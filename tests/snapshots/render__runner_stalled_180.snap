@@ -1,10 +1,9 @@
 ---
 source: tests/render.rs
-assertion_line: 1142
 expression: "draw(&s, &app_for(&s), 180, 44).backend()"
 ---
 "╭ ¹crowsnest firstmate @ deckhand ──────────────────────────────────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮╭ ²RUNNERS ✗ 1 stalled ───────────────── queue 1 ╮"
-"│  ? 1 asking you    ◐ 3 working   ✓ 0 done   ○ 2 idle   ⚑ 8 held calls (oldest 8d)                                              ││ ✗ pantry    STALLED · online             q1 6m │"
+"│  ? 1 asking you    ◐ 3 working   ✓ 0 done   ○ 2 idle   ⚑ 8 held calls (oldest 8d)                                              ││ ✗ pantry    STALLED · online 2 restarts  q1 6m │"
 "├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤│   ◐ Unit + e2e tests #122  24m ━━━━━━──── ~40m │"
 "│   STATE      TASK                             PROJECT        PIPELINE  STEP            PR · CI          AGE   KIND             ││     step 4/9 setup-node 23m · silent 14m       │"
 "│ ▸ ? CAPTAIN  fleet-tui-dashboard              crowsnest      ········· not run         -                47s   ship             ││   ○ Lint & typecheck #124      wait 6m blocked │"

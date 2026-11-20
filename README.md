@@ -88,18 +88,18 @@ The ones you are most likely to want:
 | `--wait-grace-minutes MIN` | 5 | How long after a worker's declared `until` time its row is flagged because nothing followed. |
 | `--fleet-interval SECS` | 60 | Seconds between fleet snapshots. |
 | `--pipeline-interval SECS` | 15 | Seconds between no-mistakes status reads for each live task. |
-| `--runner-root DIR` | your home | Where to look for `actions-runner*` directories (repeatable). |
+| `--runner-root DIR` | your home | Folders to search for runner directories (repeatable); replaces the config file's `[runners] roots`. Runners whose listener is running are found wherever they are (see [Finding runners](#finding-runners)). |
 | `--runner-silent-minutes MIN` | 10 | How long a busy runner's step output may stay still (with its job's processes idle) before it is shown as STALLED. |
 | `--runner-idle-cpu-seconds SECS` | 2 | CPU-seconds a silent job's processes may use over that window and still count as idle. |
 | `--runner-overdue-factor FACTOR` | 2.0 | A job running longer than this many times its typical duration is shown as SLOW. |
 | `--runner-pickup-minutes MIN` | 5 | How long a job may stay queued while its runner is idle before the runner is shown as NOT PICKING UP. |
-| `--runner-unit DIR=UNIT` | the unit `svc.sh install` recorded | The systemd unit that runs a runner directory, for the detail's service line (repeatable). |
+| `--runner-unit DIR=UNIT` | the running listener's unit, else the one `svc.sh install` recorded | The systemd unit that runs a runner directory, for the lane's restart count and the detail's service line (repeatable); wins over the config file's `[runners] units`. |
 | `--disk PATH` | `/` and your home | Filesystems shown in the host panel (repeatable). |
 | `--no-github`, `--no-quota` | | Skip the GitHub or quota-axi reads. |
 | `--ascii` | | ASCII borders and glyphs, for fonts without box drawing. |
 | `--once` | | Collect everything once, print it as JSON, and exit. |
 
-The stale, parked, wait and runner thresholds, the two intervals and `--ascii` are also [settings](#settings).
+The stale, parked, wait and runner thresholds, the two intervals, `--ascii`, and the runner folders and units are also [settings](#settings).
 A flag wins over the config file for the run it is given on, and the options menu shows that setting as locked.
 
 `NO_COLOR` is honoured.
@@ -127,12 +127,13 @@ To act on the fleet, talk to firstmate.
 ## Settings
 
 Press `o` (or `F2`) for the options menu.
-Like btop's, it lists categories on the left (panels, usage, thresholds, refresh, display), the selected category's settings on the right, and what the selected setting does underneath.
+Like btop's, it lists categories on the left (panels, usage, thresholds, refresh, runners, display), the selected category's settings on the right, and what the selected setting does underneath.
 
 | Key in the menu | Action |
 | --- | --- |
 | `↑` `↓` or `j` `k` | Select a setting (`g` and `G`: first and last) |
-| `←` `→` or `h` `l` | Change it (`Enter` and `Space` work like `→`) |
+| `←` `→` or `h` `l` | Change it (`Enter` and `Space` work like `→`); on a saved runner entry this removes it, on an `add` row it opens a line to type in |
+| while typing | `Enter` adds what you typed, `Esc` gives up, `Backspace` deletes; every other key, including `1` to `5` and `o`, is text |
 | `Tab`, `Shift-Tab` | Next or previous category |
 | `1` to `5` | Hide or show a panel, as on the dashboard |
 | `Esc`, `o`, `F2` or `q` | Close the menu (`Ctrl-C` still quits) |
@@ -165,6 +166,12 @@ pipeline_seconds = 15
 
 [display]
 ascii = false
+
+[runners]
+processes = true                          # find runners from running Runner.Listener processes
+roots = ["~/ci", "/srv/runners"]          # folders searched for runner folders (default: your home)
+names = ["actions-runner*", "gh-*"]       # folder name patterns, * and ? (default: actions-runner*)
+units = { "~/ci/actions-runner-app" = "actions-runner-app.service" }  # runner folder = systemd unit
 ```
 
 | Key | Default | What it does |
@@ -181,6 +188,10 @@ ascii = false
 | `refresh.fleet_seconds` | 60 | As `--fleet-interval`, 10 to 3600. |
 | `refresh.pipeline_seconds` | 15 | As `--pipeline-interval`, 5 to 3600. |
 | `display.ascii` | `false` | As `--ascii`. |
+| `runners.processes` | `true` | Find runners from the `Runner.Listener` processes that are running, and read each one's systemd unit from its cgroup. See [Finding runners](#finding-runners). |
+| `runners.roots` | `[]` | Folders whose subfolders are searched for runner folders. Empty: your home directory. `--runner-root` replaces it for a run. A path starts with `/` or `~/`; one inside the firstmate home is refused and reported. |
+| `runners.names` | `[]` | Patterns (`*` and `?`) a subfolder's name must match to be taken for a runner folder. Empty: `actions-runner*`. |
+| `runners.units` | `{}` | Runner folder to systemd unit. A folder named here is a runner even when it is under no `roots` folder and has stopped. `--runner-unit` wins for its folder. Written inline (`units = { "dir" = "unit" }`) or as a `[runners.units]` table. |
 
 Hiding a usage window is mostly for windows your plan does not have.
 quota-axi reports how much of each window is left, and a window with an allowance of 0 (for example premium interactions on a free plan) is 0 of 0 left, which crowsnest can only show as 100% used.
@@ -259,7 +270,30 @@ Stalled runners are not counted in the roster's `! stale` yet.
 
 Enter on a runner opens its detail: the verdict in a sentence, the run and job with every step (the running one against its typical time), the queue with the estimated start and drain, recent jobs on that runner with their duration and result plus its busy share and queue waits, and its health: the listener and its uptime, whether GitHub lists it online, its version and labels, and its systemd service with restarts.
 GitHub's runner list needs repository admin read; without it the detail says `online ?` and the rest still works.
-The service line needs a unit: the one `svc.sh install` recorded in the runner's `.service` file, or `--runner-unit DIR=UNIT`.
+The service line and the lane's restart count (`2 restarts`, or `↺2` in a narrow panel) need the runner's systemd unit; [Finding runners](#finding-runners) says where it comes from.
+
+### Finding runners
+
+Crowsnest finds runners and their units without being told, and the `[runners]` section of `config.toml` (also in the options menu, under `runners`) adds to that or narrows it. It only reads.
+
+A runner folder is a directory that holds the `.runner` file `config.sh` writes. They are collected from these places, in this order, each folder once:
+
+1. Folders under `runners.roots` (default: your home directory, or the `--runner-root` folders) whose name matches `runners.names` (default `actions-runner*`).
+2. Folders named in `runners.units`.
+3. The folders of running `Runner.Listener` processes, found from the process table when `runners.processes` is on (the default): the nearest folder above the listener's executable that holds `.runner`, so a runner installed anywhere is found without configuration.
+4. Folders whose listener ran earlier in this crowsnest run. A runner that stops stays on screen as `DOWN` and keeps its unit instead of vanishing.
+
+A runner's systemd unit is the first of these that has one:
+
+1. `--runner-unit DIR=UNIT`, then `runners.units`.
+2. The unit in the cgroup of its running listener (`/proc/<pid>/cgroup`, Linux only). Hand-written units, `svc.sh` units and user units all show up this way, with no setup. A listener started from a terminal is under no runner unit and has none.
+3. The `.service` file `svc.sh install` writes in the runner folder.
+4. The unit its listener was last seen in during this run.
+
+A unit is read with `systemctl [--user] show`, in your user's systemd first and then the system's.
+The limits: a runner whose listener is not running is found only by steps 1 and 2 (a folder under `roots`, or a `units` entry); a runner registered to an organization shows no GitHub queue, because the queue is read per repository; and on a system without `/proc` (macOS), folders still come from the process table but no unit is read from a cgroup, so give those a `units` entry.
+
+When nothing is found, the RUNNERS panel says so and names what it looked at, for example `listeners: none running` and `~ for actions-runner*`, and points at the options menu.
 
 ## Is it updating?
 
@@ -281,7 +315,8 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Roster, held calls | `bin/fm-fleet-snapshot.sh --json`, schema `fm-fleet-snapshot.v1` | 60 s (`--fleet-interval`), or at once on `r`; crowsnest never reads firstmate's state files, so nothing else speeds it up |
 | Pipeline strip and steps | `no-mistakes axi status`, inside each no-mistakes task's worktree | 15 s |
 | PR checks | one `gh api graphql` read query for every PR on screen | 60 s while anything is active, otherwise 5 min |
-| Runners | `actions-runner*/.runner` files; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s |
+| Runners | `.runner` files in runner folders; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s (folders re-listed every 60 s, and when a listener starts or stops) |
+| Runner units | `/proc/<pid>/cgroup` of each running `Runner.Listener` (Linux), and the `.service` file `svc.sh install` writes | when folders are listed |
 | Runner services | `systemctl [--user] show --property=LoadState,ActiveState,SubState,NRestarts` for a runner with a known unit | 30 s |
 | Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress` and each run's `.../jobs` | with PR checks, and every 60 s while a job is queued |
 | Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
@@ -308,6 +343,7 @@ When one is missing, its source is marked with `!` and the rest keeps working.
 - Crowsnest takes no firstmate locks, moves no inbox files, and never runs the `steer` or `watch` commands the snapshot lists.
 - `tests/readonly.rs` runs the real binary against a scratch firstmate home with logging shims for every command, and fails if any file under the home changes or any command was not a read.
 - The only file crowsnest writes is its own `config.toml`, and only when you change a setting; a config path inside the firstmate home is refused, and `--once` never writes it.
+- Runner folders and units in `config.toml` that lie inside the firstmate home are refused and reported, so crowsnest never reads there on a config file's say-so.
 
 There is no telemetry, and crowsnest makes no network calls of its own.
 

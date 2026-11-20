@@ -298,10 +298,44 @@ pub struct Runner {
     /// The running job runs its steps through `docker` or `podman`, whose
     /// CPU is not in the job's process tree.
     pub job_in_container: bool,
-    /// The systemd unit that runs it, from `--runner-unit` or the `.service`
-    /// file `svc.sh install` writes.
+    /// The systemd unit that runs it: from `--runner-unit` or the config
+    /// file's `[runners] units`, from the running listener's cgroup, or from
+    /// the `.service` file `svc.sh install` writes.
     pub unit: Option<String>,
+    /// Where `unit` came from.
+    pub unit_source: Option<UnitSource>,
     pub service: Option<Service>,
+}
+
+/// Where a runner's systemd unit was learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitSource {
+    /// `--runner-unit` or `[runners] units` in the config file.
+    Configured,
+    /// The cgroup of the runner's running `Runner.Listener`.
+    Listener,
+    /// The `.service` file `svc.sh install` wrote in the runner directory.
+    Recorded,
+}
+
+/// Where the last runner discovery looked, so an empty runner panel can say
+/// so.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RunnerSearch {
+    /// Running `Runner.Listener` processes were read for their directory.
+    pub processes: bool,
+    /// How many of them there were.
+    pub listeners: usize,
+    /// How many of those had no runner directory (`.runner`) above their
+    /// executable.
+    pub unlocated: usize,
+    /// The folders searched, and the names looked for in them.
+    pub roots: Vec<PathBuf>,
+    pub names: Vec<String>,
+    /// Runner directories named in `units`, searched whether or not they
+    /// are under a folder.
+    pub pinned: usize,
 }
 
 impl Runner {
@@ -624,6 +658,8 @@ pub struct Snapshot {
     pub pipelines: BTreeMap<String, Pipeline>,
     pub prs: BTreeMap<String, PrChecks>,
     pub runners: Vec<Runner>,
+    /// Where the runner discovery looked; `None` before its first read.
+    pub runner_search: Option<RunnerSearch>,
     /// Queued and running jobs of the repositories with a local runner.
     pub jobs: Vec<Job>,
     /// Unix time `jobs` was read.
