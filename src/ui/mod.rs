@@ -1595,7 +1595,7 @@ pub fn render(buf: &mut Buffer, area: Rect, view: &View, host: &str) {
         help(view, buf, area);
     }
     if view.app.menu.is_some() {
-        menu::draw(view, buf, menu_area, main);
+        menu::draw(view, buf, menu_area);
     }
     if view.theme.ascii {
         ascii_fold(buf, area);

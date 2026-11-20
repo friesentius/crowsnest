@@ -22,15 +22,14 @@ const MAX_ABOUT: usize = 4;
 /// How long "saved" shows after a save, in seconds.
 const SAVED_FOR: i64 = 3;
 
-/// Draw the menu in `area`, a panel or column it may cover whole, or in
-/// `fallback` (the whole body) when that is too small to hold it.
-pub fn draw(view: &View, buf: &mut Buffer, area: Rect, fallback: Rect) {
+/// Draw the menu in `area`, a panel or column it may cover whole.
+pub fn draw(view: &View, buf: &mut Buffer, area: Rect) {
     if view.app.menu.is_none() {
         return;
     }
-    match geometry(view, area).or_else(|| geometry(view, fallback)) {
+    match geometry(view, area) {
         Some(g) => draw_in(view, buf, &g),
-        None => too_small(&view.theme, buf, fallback),
+        None => too_small(&view.theme, buf, area),
     }
 }
 
