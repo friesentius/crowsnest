@@ -1,8 +1,9 @@
 ---
 source: tests/render.rs
+assertion_line: 271
 expression: "draw(&s, &app, 100, 34).backend()"
 ---
-"╭ crowsnest firstmate @ deckhand ─────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮"
+"╭ ¹crowsnest firstmate @ deckhand ────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮"
 "│  ? 1 asking you    ◐ 3 working   ✓ 0 done   ○ 2 idle   ⚑ 8 held calls (oldest 8d)                │"
 "├──────────────────────────────────────────────────────────────────────────────────────────────────┤"
 "│   STATE      TASK                  PROJECT        PIPELINE  STEP            PR · CI          AGE │"
@@ -28,11 +29,11 @@ expression: "draw(&s, &app, 100, 34).backend()"
 "├──────────────────────────────────────────────────────────────────────────────────────────────────┤"
 "│ next pantry-release-0-4-0 - Next: pantry release 0 4 0                                           │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────╯"
-"╭ RUNNERS ✓ moving ───────── q1 ╮╭ HOST ──────────────────────────╮╭ USAGE ────────────────────────╮"
+"╭ ²RUNNERS ✓ moving ──────── q1 ╮╭ ³HOST ─────────────────────────╮╭ ⁴USAGE ───────────────────────╮"
 "│ ◐ pantry   ✓ moving 8m/40m    ││ load 3.42 2.95 2.71  16 cpu    ││ copilot premium … ━━━━━━ 100% │"
 "│   └ Lint wait 6m → 14:58      ││ mem  ━━━━━━──  72% 9.0G avail  ││ claude session    ━━────  41% │"
 "│ ○ bookshop idle               ││ swap ━━──────  25% 6.0G free   ││ claude week       ━━────  35% │"
 "│                               ││ disk / 61%  /home 78%          ││ claude Fable week ━─────  11% │"
 "│                               ││ psi  mem 0.4%  cpu 6.1%        ││ +2 more windows               │"
 "╰───────────────────────────────╯╰────────────────────────────────╯╰───────────────────────────────╯"
-" ↑↓  select  ⏎  detail  tab  runners  f  filter  ?  help  q  quit             nm 9s gh 25s quota 2m "
+" ↑↓  select  ⏎  detail  tab  runners  o  options  ?  help  q  quit            nm 9s gh 25s quota 2m "

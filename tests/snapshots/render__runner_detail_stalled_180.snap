@@ -1,5 +1,6 @@
 ---
 source: tests/render.rs
+assertion_line: 1160
 expression: "draw(&s, &app, 180, 44).backend()"
 ---
 "╭ RUNNER pantry-local-runner · acme/pantry ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Esc back ╮"
@@ -45,4 +46,4 @@ expression: "draw(&s, &app, 180, 44).backend()"
 "│                                                                                                                                                                                  │"
 "│                                                                                                                                                                                  │"
 "╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯"
-" ↑↓  runner  ⏎  detail  esc  back  tab  roster  r  refresh  p  pause  ?  help  q  quit                                                                        nm 9s gh 25s quota 2m "
+" ↑↓  runner  ⏎  detail  esc  back  tab  roster  r  refresh  p  pause  o  options  1-5  panels  ?  help  q  quit                                               nm 9s gh 25s quota 2m "

@@ -5,7 +5,7 @@ Run it in a pane beside firstmate to see, at a glance, every crewmate, its no-mi
 It is written in Rust with [ratatui](https://ratatui.rs), and it is a single binary.
 
 ```text
-╭ crowsnest firstmate @ deckhand ─────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮
+╭ ¹crowsnest firstmate @ deckhand ────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮
 │  ? 1 asking you    ! 2 stale   ◆ 1 at gate   ◐ 4 working   ✓ 0 done   ○ 2 idle   ⚑ 8 held calls  │
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │   STATE      TASK                  PROJECT        PIPELINE  STEP            PR · CI          AGE │
@@ -43,14 +43,14 @@ It is written in Rust with [ratatui](https://ratatui.rs), and it is a single bin
 ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
 │ next pantry-release-0-4-0 - Next: pantry release 0 4 0                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭ RUNNERS ✓ moving ───────── q1 ╮╭ HOST ──────────────────────────╮╭ USAGE ────────────────────────╮
+╭ ²RUNNERS ✓ moving ──────── q1 ╮╭ ³HOST ─────────────────────────╮╭ ⁴USAGE ───────────────────────╮
 │ ◐ pantry   ✓ moving 8m/40m    ││ load 3.42 2.95 2.71  16 cpu    ││ copilot premium … ━━━━━━ 100% │
 │   └ Lint wait 6m → 14:58      ││ mem  ━━━━━━──  72% 9.0G avail  ││ claude session    ━━────  41% │
 │ ○ bookshop idle               ││ swap ━━──────  25% 6.0G free   ││ claude week       ━━────  35% │
 │                               ││ disk / 61%  /home 78%          ││ claude Fable week ━─────  11% │
 │                               ││ psi  mem 0.4%  cpu 6.1%        ││ +2 more windows               │
 ╰───────────────────────────────╯╰────────────────────────────────╯╰───────────────────────────────╯
- ↑↓  select  ⏎  detail  tab  runners  f  filter  ?  help  q  quit             nm 9s gh 25s quota 2m 
+ ↑↓  select  ⏎  detail  tab  runners  o  options  ?  help  q  quit            nm 9s gh 25s quota 2m 
 ```
 
 Workers that need you sort to the top and stand out.
@@ -58,6 +58,8 @@ The USAGE panel shows how much of each window is used (quota-axi reports what is
 Press Enter on a row to open its detail: every pipeline step with its duration, each PR check, the last status line, and the worktree.
 Press Tab to move to the runner panel, pick a runner with the arrows, and press Enter for its detail (see [Runners](#runners)).
 At 140 columns or more the panels move to a right-hand column, and the held captain calls get their own box.
+The small number before each panel's title is its key: press `1` to `5` to hide or show that panel, and the others take its room.
+Press `o` for the options menu, where you can also hide single usage providers or windows and change the thresholds and refresh intervals (see [Settings](#settings)).
 
 ## Install
 
@@ -85,6 +87,7 @@ The ones you are most likely to want:
 | `--parked-minutes MIN` | 10 | How long a no-mistakes gate may wait on its worker before the row is flagged stale and counted in the header. |
 | `--wait-grace-minutes MIN` | 5 | How long after a worker's declared `until` time its row is flagged because nothing followed. |
 | `--fleet-interval SECS` | 60 | Seconds between fleet snapshots. |
+| `--pipeline-interval SECS` | 15 | Seconds between no-mistakes status reads for each live task. |
 | `--runner-root DIR` | your home | Where to look for `actions-runner*` directories (repeatable). |
 | `--runner-silent-minutes MIN` | 10 | How long a busy runner's step output may stay still (with its job's processes idle) before it is shown as STALLED. |
 | `--runner-idle-cpu-seconds SECS` | 2 | CPU-seconds a silent job's processes may use over that window and still count as idle. |
@@ -95,6 +98,9 @@ The ones you are most likely to want:
 | `--no-github`, `--no-quota` | | Skip the GitHub or quota-axi reads. |
 | `--ascii` | | ASCII borders and glyphs, for fonts without box drawing. |
 | `--once` | | Collect everything once, print it as JSON, and exit. |
+
+The stale, parked, wait and runner thresholds, the two intervals and `--ascii` are also [settings](#settings).
+A flag wins over the config file for the run it is given on, and the options menu shows that setting as locked.
 
 `NO_COLOR` is honoured.
 Colours are the terminal's 16 ANSI colours, so they follow your dark or light theme, and every colour is paired with a glyph and a word.
@@ -110,11 +116,79 @@ Colours are the terminal's 16 ANSI colours, so they follow your dark or light th
 | `f` | Filter: all, active, needs you |
 | `r` | Refresh everything now |
 | `p` | Pause or resume automatic refresh |
+| `o` or `F2` | Options menu |
+| `1` to `5` | Hide or show the roster, runners, host, usage or held calls panel |
 | `?` | Help |
 | `q` or `Ctrl-C` | Quit |
 
 There are deliberately no action keys.
 To act on the fleet, talk to firstmate.
+
+## Settings
+
+Press `o` (or `F2`) for the options menu.
+Like btop's, it lists categories on the left (panels, usage, thresholds, refresh, display), the selected category's settings on the right, and what the selected setting does underneath.
+
+| Key in the menu | Action |
+| --- | --- |
+| `↑` `↓` or `j` `k` | Select a setting (`g` and `G`: first and last) |
+| `←` `→` or `h` `l` | Change it (`Enter` and `Space` work like `→`) |
+| `Tab`, `Shift-Tab` | Next or previous category |
+| `1` to `5` | Hide or show a panel, as on the dashboard |
+| `Esc`, `o`, `F2` or `q` | Close the menu (`Ctrl-C` still quits) |
+
+Every change applies at once and is saved to `$XDG_CONFIG_HOME/crowsnest/config.toml`, or `~/.config/crowsnest/config.toml` when `XDG_CONFIG_HOME` is not set (a relative `XDG_CONFIG_HOME` is ignored).
+That is the only place settings are read from; crowsnest refuses to start if it is inside the firstmate home.
+If `config.toml` is a symlink, as dotfile managers make it, the change is written to the file it points to, which keeps its permissions.
+The file is created the first time you change something, including when you hide a panel with `1` to `5`, so panel visibility is remembered.
+You can also write it by hand; every key is optional:
+
+```toml
+[panels]
+hidden = ["runners"]                     # roster, runners, host, usage, held
+
+[usage]
+hidden = ["copilot/premium_interactions"] # a provider, or provider/window-id
+
+[thresholds]
+stale_minutes = 30
+parked_minutes = 10
+wait_grace_minutes = 5
+runner_silent_minutes = 10
+runner_overdue_factor = 2.0
+runner_pickup_minutes = 5
+runner_idle_cpu_seconds = 2.0
+
+[refresh]
+fleet_seconds = 60
+pipeline_seconds = 15
+
+[display]
+ascii = false
+```
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `panels.hidden` | `[]` | Panels to hide: `roster`, `runners`, `host`, `usage`, `held`. The others take their room; with the roster hidden, the panels fill the screen. |
+| `usage.hidden` | `[]` | Usage entries to hide: a whole provider (`copilot`), or one window as `provider/window-id` (`copilot/premium_interactions`), using quota-axi's provider names and window ids. The USAGE title counts what is hidden. |
+| `thresholds.stale_minutes` | 30 | As `--stale-minutes`, 1 to 1440. |
+| `thresholds.parked_minutes` | 10 | As `--parked-minutes`, 1 to 1440. |
+| `thresholds.wait_grace_minutes` | 5 | As `--wait-grace-minutes`, 0 to 1440. |
+| `thresholds.runner_silent_minutes` | 10 | As `--runner-silent-minutes`, 1 to 1440. |
+| `thresholds.runner_overdue_factor` | 2.0 | As `--runner-overdue-factor`, 1.0 to 100.0. |
+| `thresholds.runner_pickup_minutes` | 5 | As `--runner-pickup-minutes`, 1 to 1440. |
+| `thresholds.runner_idle_cpu_seconds` | 2.0 | As `--runner-idle-cpu-seconds`, 0 to 3600. |
+| `refresh.fleet_seconds` | 60 | As `--fleet-interval`, 10 to 3600. |
+| `refresh.pipeline_seconds` | 15 | As `--pipeline-interval`, 5 to 3600. |
+| `display.ascii` | `false` | As `--ascii`. |
+
+Hiding a usage window is mostly for windows your plan does not have.
+quota-axi reports how much of each window is left, and a window with an allowance of 0 (for example premium interactions on a free plan) is 0 of 0 left, which crowsnest can only show as 100% used.
+
+An unknown key or a value of the wrong type or range is ignored, and the rest of the file still applies.
+The footer says what was ignored (`! config: unknown key display.theme`), help (`?`) lists every ignored entry, and `--once` prints them to stderr.
+A file that is not valid TOML is ignored as a whole and never overwritten; fix it by hand.
+Saving rewrites only the entries whose setting you changed, so your comments, any other keys and any ignored entries stay exactly as written (and are still reported) until you change that setting in the menu; a list crowsnest changes is rewritten, along with anything ignored or commented inside it.
 
 ## States
 
@@ -232,6 +306,7 @@ When one is missing, its source is marked with `!` and the rest keeps working.
 - The fleet snapshot's optional summary cache is pointed at crowsnest's own cache directory (`$XDG_CACHE_HOME/crowsnest`), never at the firstmate home.
 - Crowsnest takes no firstmate locks, moves no inbox files, and never runs the `steer` or `watch` commands the snapshot lists.
 - `tests/readonly.rs` runs the real binary against a scratch firstmate home with logging shims for every command, and fails if any file under the home changes or any command was not a read.
+- The only file crowsnest writes is its own `config.toml`, and only when you change a setting; a config path inside the firstmate home is refused, and `--once` never writes it.
 
 There is no telemetry, and crowsnest makes no network calls of its own.
 
@@ -248,6 +323,7 @@ The code is split so the data layer can be reused without the UI:
 - `sources/` turns each command's output into the types in `model.rs`, and knows nothing about the screen.
 - `collector.rs` schedules the sources.
 - `app.rs` holds UI state and key handling, with no I/O, including noticing which rows changed.
+- `config.rs` reads and writes the settings file, `options.rs` lists what the options menu shows, and `keys.rs` maps keys to actions.
 - `ui/` draws a `Snapshot`.
 
 The fixtures in `tests/fixtures` are real outputs with names, paths and accounts replaced.

@@ -191,6 +191,18 @@ esac
         &format!("{logger}cat \"$CN_FIXTURES/quota.json\"\n"),
     );
 
+    // A config file with one entry crowsnest does not know: reported on
+    // stderr, never rewritten by a read.
+    let config_dir = root.join("config");
+    let config = config_dir.join("crowsnest/config.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        &config,
+        "[thresholds]\nstale_minutes = 45\n[display]\ntheme = \"amber\"\n",
+    )
+    .unwrap();
+    let config_before = fingerprint(&config_dir);
+
     let before = fingerprint(&home);
     let path = format!(
         "{}:{}",
@@ -212,6 +224,7 @@ esac
         .args(["--disk", "/"])
         .env("PATH", path)
         .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", &config_dir)
         .env("CN_LOG", &log)
         .env("CN_FIXTURES", FIXTURES)
         .env("CN_WORKTREES", &worktrees)
@@ -223,6 +236,15 @@ esac
         String::from_utf8_lossy(&out.stderr)
     );
     let snap: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("crowsnest: config: unknown key display.theme"),
+        "{stderr}"
+    );
+    assert!(
+        config_before == fingerprint(&config_dir),
+        "--once wrote config"
+    );
 
     // Everything was read.
     for tier in ["host", "runners", "fleet", "nm", "gh", "quota"] {

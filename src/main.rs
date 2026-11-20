@@ -1,14 +1,15 @@
 //! `crowsnest`: run it in a pane beside firstmate. It only reads.
 
 use clap::Parser;
-use crowsnest::app::{Action, App, DEFAULT_READ_OVERDUE_SECS, runner_keys, visible_rows};
+use crowsnest::app::{App, ConfigStatus, DEFAULT_READ_OVERDUE_SECS};
 use crowsnest::collector::{self, Config};
-use crowsnest::model::{RunnerThresholds, Thresholds};
+use crowsnest::config::{self, Loaded, Overrides, Setting, Settings};
+use crowsnest::keys;
 use crowsnest::timefmt::now_epoch;
 use crowsnest::ui::{self, View, theme::Theme};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::{execute, terminal::SetTitle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -18,6 +19,11 @@ use std::time::{Duration, Instant};
 ///
 /// Crowsnest never writes firstmate state, steers workers, or runs anything
 /// that changes the fleet. To act, talk to firstmate.
+///
+/// Settings changed in the options menu (press o) are saved to
+/// $XDG_CONFIG_HOME/crowsnest/config.toml (or ~/.config/crowsnest/config.toml),
+/// which must be outside the firstmate home. The options below that also have
+/// a setting win over the file for the run they are given on.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about)]
 struct Args {
@@ -26,27 +32,31 @@ struct Args {
     fm_home: PathBuf,
 
     /// Minutes without a status line or pipeline activity before a working
-    /// task is shown as stale.
-    #[arg(long, default_value_t = 30, value_name = "MIN")]
-    stale_minutes: u64,
+    /// task is shown as stale [default: 30, or the config file's].
+    #[arg(long, value_name = "MIN")]
+    stale_minutes: Option<u64>,
 
     /// Minutes a no-mistakes gate may wait on its worker before the row is
-    /// flagged and counted as needing attention.
-    #[arg(long, default_value_t = 10, value_name = "MIN")]
-    parked_minutes: u64,
+    /// flagged and counted as needing attention [default: 10, or the config
+    /// file's].
+    #[arg(long, value_name = "MIN")]
+    parked_minutes: Option<u64>,
 
     /// Minutes after a worker's declared "until" time before the row is
-    /// flagged because nothing followed it.
-    #[arg(long, default_value_t = 5, value_name = "MIN")]
-    wait_grace_minutes: u64,
+    /// flagged because nothing followed it [default: 5, or the config
+    /// file's].
+    #[arg(long, value_name = "MIN")]
+    wait_grace_minutes: Option<u64>,
 
-    /// Seconds between fleet snapshots (each one costs a few CPU-seconds).
-    #[arg(long, default_value_t = 60, value_name = "SECS")]
-    fleet_interval: u64,
+    /// Seconds between fleet snapshots, each of which costs a few CPU-seconds
+    /// [default: 60, or the config file's; at least 10].
+    #[arg(long, value_name = "SECS")]
+    fleet_interval: Option<u64>,
 
-    /// Seconds between no-mistakes status reads for each live task.
-    #[arg(long, default_value_t = 15, value_name = "SECS")]
-    pipeline_interval: u64,
+    /// Seconds between no-mistakes status reads for each live task
+    /// [default: 15, or the config file's; at least 5].
+    #[arg(long, value_name = "SECS")]
+    pipeline_interval: Option<u64>,
 
     /// Directory to search for actions-runner* directories (repeatable;
     /// default: your home directory).
@@ -59,25 +69,26 @@ struct Args {
     runner_units: Vec<(PathBuf, String)>,
 
     /// Minutes a busy runner's step output (or, without it, its worker log)
-    /// may stay still before the runner is shown as STALLED.
-    #[arg(long, default_value_t = 10, value_name = "MIN")]
-    runner_silent_minutes: u64,
+    /// may stay still before the runner is shown as STALLED [default: 10, or
+    /// the config file's].
+    #[arg(long, value_name = "MIN")]
+    runner_silent_minutes: Option<u64>,
 
     /// A job running longer than this many times its typical duration is
-    /// shown as SLOW.
-    #[arg(long, default_value_t = 2.0, value_name = "FACTOR", value_parser = parse_factor)]
-    runner_overdue_factor: f64,
+    /// shown as SLOW [default: 2.0, or the config file's].
+    #[arg(long, value_name = "FACTOR", value_parser = parse_factor)]
+    runner_overdue_factor: Option<f64>,
 
     /// CPU-seconds a silent job's processes may use over the silent window
     /// and still count as idle (STALLED); more means the job is busy but
-    /// quiet, and it is not flagged.
-    #[arg(long, default_value_t = 2.0, value_name = "SECS")]
-    runner_idle_cpu_seconds: f64,
+    /// quiet, and it is not flagged [default: 2.0, or the config file's].
+    #[arg(long, value_name = "SECS")]
+    runner_idle_cpu_seconds: Option<f64>,
 
     /// Minutes a job may stay queued while its runner is idle before the
-    /// runner is shown as NOT PICKING UP.
-    #[arg(long, default_value_t = 5, value_name = "MIN")]
-    runner_pickup_minutes: u64,
+    /// runner is shown as NOT PICKING UP [default: 5, or the config file's].
+    #[arg(long, value_name = "MIN")]
+    runner_pickup_minutes: Option<u64>,
 
     /// Path whose filesystem use is shown (repeatable; default: / and your
     /// home directory).
@@ -97,7 +108,8 @@ struct Args {
     #[arg(long = "quota-provider", value_name = "NAME")]
     quota_providers: Vec<String>,
 
-    /// Use ASCII glyphs and borders instead of Unicode.
+    /// Use ASCII glyphs and borders instead of Unicode [default: the config
+    /// file's].
     #[arg(long)]
     ascii: bool,
 
@@ -131,7 +143,54 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-fn config(args: &Args) -> Result<Config, String> {
+/// The settings given on the command line.
+fn overrides(args: &Args) -> Overrides {
+    let mut o = Overrides::default();
+    for (setting, value) in [
+        (Setting::StaleMinutes, args.stale_minutes),
+        (Setting::ParkedMinutes, args.parked_minutes),
+        (Setting::WaitGraceMinutes, args.wait_grace_minutes),
+        (Setting::RunnerSilentMinutes, args.runner_silent_minutes),
+        (
+            Setting::RunnerOverdueFactor,
+            args.runner_overdue_factor.map(hundredths),
+        ),
+        (Setting::RunnerPickupMinutes, args.runner_pickup_minutes),
+        (
+            Setting::RunnerIdleCpuSeconds,
+            args.runner_idle_cpu_seconds.map(|s| hundredths(s.max(0.0))),
+        ),
+        (Setting::FleetSeconds, args.fleet_interval),
+        (Setting::PipelineSeconds, args.pipeline_interval),
+        (Setting::Ascii, args.ascii.then_some(1)),
+    ] {
+        if let Some(v) = value {
+            o.set(setting, v);
+        }
+    }
+    o
+}
+
+/// A decimal flag in the hundredths its setting keeps.
+fn hundredths(v: f64) -> u64 {
+    (v * 100.0).round() as u64
+}
+
+fn fleet_interval(s: &Settings) -> Duration {
+    Duration::from_secs(s.fleet_seconds.max(10))
+}
+
+fn pipeline_interval(s: &Settings) -> Duration {
+    Duration::from_secs(s.pipeline_seconds.max(5))
+}
+
+/// A fleet read is overdue after three missed reads, and never sooner than
+/// the default.
+fn read_overdue_secs(s: &Settings) -> i64 {
+    (fleet_interval(s).as_secs() as i64 * 3).max(DEFAULT_READ_OVERDUE_SECS)
+}
+
+fn config(args: &Args, settings: &Settings, config_file: Option<&Path>) -> Result<Config, String> {
     let snapshot = args.fm_home.join("bin").join("fm-fleet-snapshot.sh");
     if !snapshot.is_file() {
         return Err(format!(
@@ -151,6 +210,11 @@ fn config(args: &Args) -> Result<Config, String> {
     if cache_dir.starts_with(&fm_home) {
         return Err("the cache directory must be outside the firstmate home".into());
     }
+    if let Some(file) = config_file
+        && inside(file, &fm_home)
+    {
+        return Err("the config file must be outside the firstmate home".into());
+    }
     let runner_roots = if args.runner_roots.is_empty() {
         home().into_iter().collect()
     } else {
@@ -167,56 +231,57 @@ fn config(args: &Args) -> Result<Config, String> {
         runner_roots,
         runner_units: args.runner_units.clone(),
         disk_paths,
-        fleet_interval: Duration::from_secs(args.fleet_interval.max(10)),
+        fleet_interval: fleet_interval(settings),
         fleet_min_gap: Duration::from_secs(20),
-        pipeline_interval: Duration::from_secs(args.pipeline_interval.max(5)),
+        pipeline_interval: pipeline_interval(settings),
         github: !args.no_github,
         quota: !args.no_quota,
         quota_providers: args.quota_providers.clone(),
     })
 }
 
-fn key_action(code: KeyCode, mods: KeyModifiers) -> Option<Action> {
-    Some(match code {
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => Action::Quit,
-        KeyCode::Up | KeyCode::Char('k') => Action::Up,
-        KeyCode::Down | KeyCode::Char('j') => Action::Down,
-        KeyCode::Home | KeyCode::Char('g') => Action::Top,
-        KeyCode::End | KeyCode::Char('G') => Action::Bottom,
-        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => Action::Toggle,
-        KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => Action::Collapse,
-        KeyCode::Char('f') => Action::Filter,
-        KeyCode::Char('r') => Action::Refresh,
-        KeyCode::Char('p') => Action::Pause,
-        KeyCode::Char('?') => Action::Help,
-        KeyCode::Tab | KeyCode::BackTab => Action::Focus,
-        KeyCode::Char('q') => Action::Quit,
-        _ => return None,
-    })
+/// Whether `file` is under `dir`, following symlinks in its existing parents.
+fn inside(file: &Path, dir: &Path) -> bool {
+    let real = file
+        .ancestors()
+        .find_map(|a| {
+            let rest = file.strip_prefix(a).ok()?;
+            Some(a.canonicalize().ok()?.join(rest))
+        })
+        .unwrap_or_else(|| file.to_path_buf());
+    real.starts_with(dir) || file.starts_with(dir)
 }
 
-fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
-    let theme = Theme::new(
-        std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty()),
-        args.ascii,
-    );
-    let thresholds = Thresholds {
-        stale_secs: (args.stale_minutes * 60) as i64,
-        parked_secs: (args.parked_minutes * 60) as i64,
-        wait_grace_secs: (args.wait_grace_minutes * 60) as i64,
-    };
+/// `path` with the home directory shown as `~`.
+fn display_path(path: &Path) -> String {
+    match home().and_then(|h| path.strip_prefix(h).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+fn run_tui(
+    cfg: Config,
+    loaded: Loaded,
+    overrides: Overrides,
+    config_file: Option<PathBuf>,
+) -> std::io::Result<()> {
+    let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let host = sysinfo::System::host_name().unwrap_or_default();
     let (tx, rx) = mpsc::channel();
     let (shared, handle) = collector::start(cfg, tx);
-    let mut app = App::new(thresholds);
-    app.runner_thresholds = RunnerThresholds {
-        silent_secs: (args.runner_silent_minutes * 60) as i64,
-        overdue_factor: args.runner_overdue_factor,
-        pickup_secs: (args.runner_pickup_minutes * 60) as i64,
-        idle_cpu_ms: (args.runner_idle_cpu_seconds.max(0.0) * 1000.0) as u64,
+    let mut app = App::new(loaded.settings, overrides);
+    app.config = ConfigStatus {
+        path: config_file.as_deref().map(display_path).unwrap_or_default(),
+        problems: loaded.problems,
+        saved: None,
     };
-    // Three missed fleet reads, and never sooner than the default.
-    app.read_overdue_secs = (args.fleet_interval.max(10) as i64 * 3).max(DEFAULT_READ_OVERDUE_SECS);
+    app.read_overdue_secs = read_overdue_secs(&app.effective());
+    // The settings as last written to (or read from) the file. A save
+    // writes every key that differs from these, so a change whose save
+    // failed is written by the next save that works.
+    let mut saved = app.settings.clone();
+    let mut theme = Theme::new(color, app.effective().ascii);
     let mut terminal = ratatui::init();
     let mut last_title = usize::MAX;
     let mut last_draw = Instant::now() - Duration::from_secs(10);
@@ -230,7 +295,7 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
             snap.now = now_epoch();
             app.paused = handle.paused();
             app.observe(&snap);
-            let asking = ui::asking(&snap, &thresholds);
+            let asking = ui::asking(&snap, &app.thresholds);
             if asking != last_title {
                 let title = if asking > 0 {
                     format!("crowsnest ({asking})")
@@ -254,17 +319,20 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
         match event::poll(Duration::from_millis(200)) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
-                    if let Some(action) = key_action(k.code, k.modifiers) {
+                    if let Some(action) = keys::action(k.code, k.modifiers, app.menu.is_some()) {
                         let mut snap = shared.lock().unwrap().clone();
                         snap.now = now_epoch();
-                        let rows = visible_rows(&snap, &app);
-                        let runners = runner_keys(&snap);
                         let was_paused = app.paused;
-                        if app.apply(action, &rows, &runners) {
+                        let before = app.settings.clone();
+                        if app.apply(action, &snap) {
                             handle.refresh();
                         }
                         if app.paused != was_paused {
                             handle.set_paused(app.paused);
+                        }
+                        if app.settings != before {
+                            settings_changed(&mut app, &handle, config_file.as_deref(), &mut saved);
+                            theme = Theme::new(color, app.effective().ascii);
                         }
                         dirty = true;
                     }
@@ -285,9 +353,35 @@ fn run_tui(cfg: Config, args: &Args) -> std::io::Result<()> {
     result
 }
 
+/// Put changed settings into effect and save them. A failed save is shown in
+/// the footer; the change still holds for this run.
+fn settings_changed(
+    app: &mut App,
+    handle: &collector::Handle,
+    file: Option<&Path>,
+    saved: &mut Settings,
+) {
+    let effective = app.effective();
+    handle.set_intervals(fleet_interval(&effective), pipeline_interval(&effective));
+    app.read_overdue_secs = read_overdue_secs(&effective);
+    let result = match file {
+        Some(path) => config::save(path, saved, &app.settings).map(|()| {
+            *saved = app.settings.clone();
+            // What is left of the file's problems after the save.
+            app.config.problems = config::load(path).problems;
+        }),
+        None => Err("no config directory: set XDG_CONFIG_HOME or HOME".into()),
+    };
+    app.config.saved = Some((now_epoch(), result.err()));
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
-    let cfg = match config(&args) {
+    let config_file = config::default_path();
+    let loaded = config_file.as_deref().map(config::load).unwrap_or_default();
+    let overrides = overrides(&args);
+    let settings = overrides.apply(&loaded.settings);
+    let cfg = match config(&args, &settings, config_file.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("crowsnest: {e}");
@@ -295,6 +389,10 @@ fn main() -> ExitCode {
         }
     };
     if args.once {
+        // stdout is the JSON; the config file's problems go to stderr.
+        for p in &loaded.problems {
+            eprintln!("crowsnest: config: {p}");
+        }
         let snap = collector::collect_once(&cfg);
         println!(
             "{}",
@@ -302,11 +400,56 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    match run_tui(cfg, &args) {
+    match run_tui(cfg, loaded, overrides, config_file) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("crowsnest: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_flags_given_override_the_config() {
+        let args = Args::try_parse_from(["crowsnest", "--fm-home", "/fm"]).unwrap();
+        assert_eq!(overrides(&args), Overrides::default());
+        let args = Args::try_parse_from([
+            "crowsnest",
+            "--fm-home",
+            "/fm",
+            "--stale-minutes",
+            "45",
+            "--fleet-interval",
+            "5",
+            "--ascii",
+            "--runner-overdue-factor",
+            "1.25",
+            "--runner-idle-cpu-seconds=-1",
+        ])
+        .unwrap();
+        let o = overrides(&args);
+        assert_eq!(o.get(Setting::StaleMinutes), Some(45));
+        assert_eq!(o.get(Setting::ParkedMinutes), None);
+        assert_eq!(o.get(Setting::Ascii), Some(1));
+        assert_eq!(o.get(Setting::RunnerOverdueFactor), Some(125));
+        assert_eq!(o.get(Setting::RunnerIdleCpuSeconds), Some(0));
+        assert_eq!(o.get(Setting::RunnerSilentMinutes), None);
+        let s = o.apply(&Settings::default());
+        assert_eq!(fleet_interval(&s), Duration::from_secs(10), "still clamped");
+        assert_eq!(read_overdue_secs(&s), DEFAULT_READ_OVERDUE_SECS);
+    }
+
+    #[test]
+    fn a_config_file_in_the_firstmate_home_is_refused() {
+        let fm = Path::new("/srv/fm");
+        assert!(inside(Path::new("/srv/fm/state/config.toml"), fm));
+        assert!(!inside(
+            Path::new("/home/x/.config/crowsnest/config.toml"),
+            fm
+        ));
     }
 }

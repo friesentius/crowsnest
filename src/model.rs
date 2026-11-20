@@ -600,6 +600,8 @@ fn pct(part: u64, whole: u64) -> f64 {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QuotaWindow {
     pub provider: String,
+    /// quota-axi's stable window id (`five_hour`, `premium_interactions`).
+    pub id: String,
     pub label: String,
     pub pct_used: f64,
     pub resets_at: Option<i64>,

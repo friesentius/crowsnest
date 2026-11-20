@@ -2,6 +2,7 @@
 //! runner detail view.
 
 use super::{Content, View, draw_box, fit, rpad, span, width_of};
+use crate::config::Panel;
 use crate::lanes::{
     self, Current, Fleet, JobCpu, Lane, Online, QueueState, Queued, Signal, Verdict, Why,
     short_name, step_name, tiny_name,
@@ -409,8 +410,13 @@ fn panel_lines(view: &View, lanes: &[Lane], w: usize, wide: bool) -> Vec<(u8, Li
     }
     if wide && !lanes.is_empty() {
         let hint = if focused {
+            let back = if view.app.settings.shown(Panel::Roster) {
+                " \u{b7} Esc back"
+            } else {
+                ""
+            };
             format!(
-                "    {} runner \u{b7} Enter detail \u{b7} Esc back",
+                "    {} runner \u{b7} Enter detail{back}",
                 t.g("\u{2191}\u{2193}", "j/k")
             )
         } else {
@@ -451,7 +457,10 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
             .into_iter()
             .map(Content::Line),
     );
-    let mut title = vec![span("RUNNERS", t.bold())];
+    let mut title = vec![
+        span(super::panel_mark(t, Panel::Runners), t.bold()),
+        span("RUNNERS", t.bold()),
+    ];
     match lanes::fleet(&lanes) {
         Fleet::Stuck(n) => title.push(span(
             format!(" {} {n} stalled", t.verdict(Verdict::Stalled).0),

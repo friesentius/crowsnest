@@ -22,6 +22,7 @@ struct Provider {
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct Window {
+    id: String,
     label: String,
     percent_remaining: Option<f64>,
     resets_at: Option<String>,
@@ -46,8 +47,15 @@ pub fn parse(json: &str) -> Result<Vec<QuotaWindow>, String> {
         .flat_map(|p| {
             let provider = p.provider;
             p.windows.into_iter().filter_map(move |w| {
+                // An older quota-axi without ids: the label is the next best name.
+                let id = if w.id.is_empty() {
+                    w.label.clone()
+                } else {
+                    w.id
+                };
                 Some(QuotaWindow {
                     provider: provider.clone(),
+                    id,
                     label: w.label,
                     pct_used: used_from_remaining(w.percent_remaining?),
                     resets_at: w.resets_at.as_deref().and_then(timefmt::parse_iso),
@@ -76,14 +84,21 @@ mod tests {
         let w = parse(include_str!("../../tests/fixtures/quota.json")).unwrap();
         assert_eq!(w.len(), 6);
         assert_eq!(w[0].provider, "claude");
+        assert_eq!(w[0].id, "five_hour");
         assert_eq!(w[0].label, "session");
         assert_eq!(w[0].pct_used, 41.0);
         assert_eq!(w[0].pace.as_deref(), Some("behind"));
         assert!(w[0].resets_at.is_some());
         assert_eq!(w[3].provider, "copilot");
         assert_eq!(w[3].pace, None, "unknown pace is dropped");
+        assert_eq!(w[5].id, "premium_interactions");
         assert_eq!(w[5].pct_used, 100.0);
         let none = parse("{\"providers\": [{\"provider\": \"codex\", \"windows\": []}]}").unwrap();
         assert!(none.is_empty());
+        let old = parse("{\"providers\": [{\"provider\": \"x\", \"windows\": [{\"label\": \"day\", \"percentRemaining\": 5}]}]}").unwrap();
+        assert_eq!(
+            old[0].id, "day",
+            "a window without an id is named by its label"
+        );
     }
 }
