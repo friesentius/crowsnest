@@ -703,6 +703,9 @@ pub struct GhBudget {
     /// (those between the newest and the oldest page), from GitHub's
     /// `total_count`.
     pub runs_unread: BTreeMap<String, u64>,
+    /// Jobs per repository that were not read: those past the first page of
+    /// a run's job list.
+    pub jobs_unread: BTreeMap<String, u64>,
 }
 
 /// What the newest lines of a runner's `_diag` log say, from its tail.

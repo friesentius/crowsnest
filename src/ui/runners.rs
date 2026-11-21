@@ -684,15 +684,22 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
     } else {
         vec![span(format!("q{queued}"), t.warn())]
     };
-    // Runs between the newest and the oldest page were not read, so the
-    // queue is short by their jobs.
-    let unread: u64 = snap.gh_budget.runs_unread.values().sum();
-    if unread > 0 {
+    // Runs between the newest and the oldest page, and jobs past a run's
+    // first page, were not read, so the queue is short by their jobs.
+    let runs: u64 = snap.gh_budget.runs_unread.values().sum();
+    let jobs: u64 = snap.gh_budget.jobs_unread.values().sum();
+    if runs + jobs > 0 {
         right.push(span(
-            if wide {
-                format!(" +{unread} runs unread")
+            if !wide {
+                format!("+{}?", runs + jobs)
             } else {
-                format!("+{unread}?")
+                let count =
+                    |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+                match (runs, jobs) {
+                    (_, 0) => format!(" +{} unread", count(runs, "run")),
+                    (0, _) => format!(" +{} unread", count(jobs, "job")),
+                    _ => format!(" +{}, {} unread", count(runs, "run"), count(jobs, "job")),
+                }
             },
             t.warn(),
         ));
@@ -1196,7 +1203,8 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
 }
 
 /// What the lane's repository left unread: active runs between the newest
-/// and the oldest page. The queue above is missing their jobs.
+/// and the oldest page, and jobs past the first page of a run's job list.
+/// The queue above is missing them. Each is a sentence of its own.
 fn unread_lines(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
     let Some(repo) = lane.runner.repo.as_ref() else {
         return Vec::new();
@@ -1211,6 +1219,19 @@ fn unread_lines(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             LABEL,
             &format!(
                 "+{n} more active run{} not read: of the queued runs and of the running runs, only the {page} newest and the {page} oldest are read",
+                plural(n)
+            ),
+            view.theme.warn(),
+            w,
+        ));
+    }
+    if let Some(&n) = budget.jobs_unread.get(repo) {
+        let page = crate::sources::JOBS_PAGE;
+        out.extend(wrap_words(
+            vec![pad()],
+            LABEL,
+            &format!(
+                "+{n} more job{} not read: only the first {page} jobs of a run are read",
                 plural(n)
             ),
             view.theme.warn(),

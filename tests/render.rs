@@ -2261,7 +2261,13 @@ fn runs_past_one_page_are_disclosed() {
         ),
         "{detail}"
     );
-    // The sentence is whole at a narrow width too.
+    // Jobs past a run's first page are counted the same way, and the
+    // sentence is whole at a narrow width too.
+    s.gh_budget.jobs_unread.insert("acme/pantry".into(), 1);
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(wide.contains("+3 runs, 1 job unread"), "{wide}");
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
     let narrow = draw_light(&s, &app, 100, 44);
     let flat = narrow
         .replace(['\u{2502}', '"'], " ")
@@ -2270,6 +2276,10 @@ fn runs_past_one_page_are_disclosed() {
         .join(" ");
     assert!(
         flat.contains("only the 100 newest and the 100 oldest are read"),
+        "{narrow}"
+    );
+    assert!(
+        flat.contains("+1 more job not read: only the first 100 jobs of a run are read"),
         "{narrow}"
     );
 }

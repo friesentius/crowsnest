@@ -105,6 +105,12 @@ pub fn runner_repos(runners: &[Runner]) -> Vec<String> {
     repos
 }
 
+/// The most jobs of one run that are read: one page, GitHub's largest.
+pub const JOBS_PAGE: usize = 100;
+
+/// One run's jobs, and how many more it has than were read.
+type RunJobs = Result<(Vec<Job>, u64), GhError>;
+
 /// The jobs of `runs` of their repositories, each carrying the run it
 /// belongs to, read in parallel. An unchanged list is GitHub's 304, which
 /// costs nothing; a finished run's jobs never change and keep no ETag.
@@ -112,12 +118,15 @@ fn read_runs_jobs(
     gh: &mut Client,
     runs: &[(String, crate::model::RunInfo)],
     finished: bool,
-) -> Vec<Result<Vec<Job>, GhError>> {
+) -> Vec<RunJobs> {
     let reads: Vec<(String, bool)> = runs
         .iter()
         .map(|(repo, run)| {
             (
-                format!("repos/{repo}/actions/runs/{}/jobs?per_page=50", run.id),
+                format!(
+                    "repos/{repo}/actions/runs/{}/jobs?per_page={JOBS_PAGE}",
+                    run.id
+                ),
                 !finished,
             )
         })
@@ -126,11 +135,15 @@ fn read_runs_jobs(
         .into_iter()
         .zip(runs)
         .map(|(out, (repo, run))| {
-            let mut jobs = gh::parse_jobs(repo, &out?).map_err(GhError::Failed)?;
+            let out = out?;
+            let mut jobs = gh::parse_jobs(repo, &out).map_err(GhError::Failed)?;
+            let unread = gh::total_count(&out)
+                .unwrap_or(0)
+                .saturating_sub(jobs.len() as u64);
             for j in &mut jobs {
                 j.run = Some(run.clone());
             }
-            Ok(jobs)
+            Ok((jobs, unread))
         })
         .collect()
 }
@@ -152,6 +165,8 @@ pub struct Queue {
     /// Active runs per repository that were not read: those between the
     /// newest and the oldest page of each state.
     pub unread: BTreeMap<String, u64>,
+    /// Jobs per repository beyond the first page of their run's job list.
+    pub jobs_unread: BTreeMap<String, u64>,
     /// How each repository's queue was read: when it was last read in full,
     /// and what failed this turn. A repository that failed keeps the jobs
     /// of its last good read in `jobs`.
@@ -167,6 +182,7 @@ pub struct Queue {
 pub struct KeptQueue {
     pub jobs: Vec<Job>,
     pub unread: u64,
+    pub jobs_unread: u64,
     pub read_at: Option<i64>,
 }
 
@@ -316,11 +332,15 @@ pub fn read_queue(
         if mine.unread > 0 {
             q.unread.insert(repo.clone(), mine.unread);
         }
+        if mine.jobs_unread > 0 {
+            q.jobs_unread.insert(repo.clone(), mine.jobs_unread);
+        }
         kept.insert(
             repo.clone(),
             KeptQueue {
                 jobs: mine.jobs.clone(),
                 unread: mine.unread,
+                jobs_unread: mine.jobs_unread,
                 read_at: mine.read.read_at,
             },
         );
@@ -343,6 +363,7 @@ pub fn read_queue(
 struct Merged {
     jobs: Vec<Job>,
     unread: u64,
+    jobs_unread: u64,
     read: QueueRead,
     /// Everything answered: the queue was read in full.
     whole: bool,
@@ -359,12 +380,13 @@ struct Merged {
 fn merge_repo(
     old: &KeptQueue,
     list: Result<(Vec<crate::model::RunInfo>, u64), GhError>,
-    jobs: Vec<Result<Vec<Job>, GhError>>,
+    jobs: Vec<RunJobs>,
     now: i64,
 ) -> Merged {
     let mut m = Merged {
         jobs: Vec::new(),
         unread: old.unread,
+        jobs_unread: old.jobs_unread,
         read: QueueRead {
             read_at: old.read_at,
             error: None,
@@ -381,10 +403,14 @@ fn merge_repo(
     match list {
         Ok((runs, unread)) => {
             m.unread = unread;
+            m.jobs_unread = 0;
             m.whole = true;
             for (run, answer) in runs.iter().zip(jobs) {
                 match answer {
-                    Ok(j) => m.jobs.extend(j),
+                    Ok((j, more)) => {
+                        m.jobs.extend(j);
+                        m.jobs_unread += more;
+                    }
                     Err(e) => {
                         m.whole = false;
                         m.jobs
@@ -427,7 +453,7 @@ pub fn read_history(
     let mut failure = None;
     for ((_, run), jobs) in new.iter().zip(read_runs_jobs(gh, &new, true)) {
         match jobs {
-            Ok(jobs) => {
+            Ok((jobs, _)) => {
                 cache.insert(run.clone(), jobs);
                 added += 1;
             }
@@ -690,6 +716,26 @@ mod tests {
     }
 
     #[test]
+    fn jobs_past_the_first_hundred_of_a_run_are_counted() {
+        let (fake, asked) = backlog(2, 130);
+        let q = queue_of(fake);
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.ends_with("/runs/1/jobs?per_page=100")),
+            "{:?}",
+            asked.lock().unwrap()
+        );
+        assert_eq!(q.jobs.len(), 200, "100 of each run's 130");
+        assert_eq!(q.jobs_unread["a/a"], 60);
+        // A run whose jobs all fit counts nothing.
+        let (fake, _) = backlog(2, 100);
+        assert!(queue_of(fake).jobs_unread.is_empty());
+    }
+
+    #[test]
     fn a_failing_list_does_not_misplace_the_answers_of_the_others() {
         let fake = Fake(Arc::new(move |cmd| {
             let p = path(cmd);
@@ -741,6 +787,7 @@ mod tests {
         KeptQueue {
             jobs: vec![job(1, "old a"), job(2, "old b")],
             unread: 4,
+            jobs_unread: 0,
             read_at: Some(100),
         }
     }
@@ -750,7 +797,10 @@ mod tests {
         let m = merge_repo(
             &kept(),
             Ok((vec![run(2), run(3)], 0)),
-            vec![Ok(vec![job(2, "new b")]), Ok(vec![job(3, "new c")])],
+            vec![
+                Ok((vec![job(2, "new b")], 0)),
+                Ok((vec![job(3, "new c")], 0)),
+            ],
             200,
         );
         assert_eq!(names(&m), ["new b", "new c"]);
@@ -792,7 +842,7 @@ mod tests {
             Ok((vec![run(1), run(2)], 0)),
             vec![
                 Err(GhError::Failed("gh: HTTP 502".into())),
-                Ok(vec![job(2, "new b")]),
+                Ok((vec![job(2, "new b")], 0)),
             ],
             200,
         );

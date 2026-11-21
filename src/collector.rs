@@ -226,6 +226,7 @@ fn apply_gh(
             }
             s.queue_reads = q.reads;
             s.gh_budget.runs_unread = q.unread;
+            s.gh_budget.jobs_unread = q.jobs_unread;
         }
         Err(GhError::Paused { .. }) => paused += 1,
         Err(GhError::Failed(e)) => failed.push(e),
