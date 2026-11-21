@@ -164,26 +164,47 @@ pub struct KeptQueue {
     pub read_at: Option<i64>,
 }
 
-/// One repository's queued and running runs, or why they were not read.
-fn read_run_lists(
-    gh: &mut Client,
-    repo: &str,
-) -> Result<(Vec<crate::model::RunInfo>, u64), GhError> {
-    let mut runs = Vec::new();
-    let mut unread = 0;
-    for status in ["queued", "in_progress"] {
-        let out = gh.get(&format!(
-            "repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}"
-        ))?;
-        let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
-        unread += gh::total_count(&out)
-            .unwrap_or(0)
-            .saturating_sub(page.len() as u64);
-        runs.extend(page);
-    }
-    runs.sort_by_key(|r| r.id);
-    runs.dedup_by_key(|r| r.id);
-    Ok((runs, unread))
+/// The run states the queue lists.
+const ACTIVE: [&str; 2] = ["queued", "in_progress"];
+
+/// What reading one repository's queued and running runs found.
+type RunList = Result<(Vec<crate::model::RunInfo>, u64), GhError>;
+
+/// Each repository's queued and running runs, or why they were not read.
+/// The lists of every repository and state are asked together, 8 at a time,
+/// not one `gh` process after another.
+fn read_run_lists(gh: &mut Client, repos: &[String]) -> Vec<RunList> {
+    let reads: Vec<(String, bool)> = repos
+        .iter()
+        .flat_map(|repo| {
+            ACTIVE.map(|status| {
+                (
+                    format!("repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}"),
+                    true,
+                )
+            })
+        })
+        .collect();
+    let mut answers = gh.get_many(&reads).into_iter();
+    repos
+        .iter()
+        .map(|_| {
+            let outs: Vec<_> = answers.by_ref().take(ACTIVE.len()).collect();
+            let mut runs = Vec::new();
+            let mut unread = 0;
+            for out in outs {
+                let out = out?;
+                let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
+                unread += gh::total_count(&out)
+                    .unwrap_or(0)
+                    .saturating_sub(page.len() as u64);
+                runs.extend(page);
+            }
+            runs.sort_by_key(|r| r.id);
+            runs.dedup_by_key(|r| r.id);
+            Ok((runs, unread))
+        })
+        .collect()
 }
 
 /// Every job of the queued and running workflow runs of each repository
@@ -202,7 +223,7 @@ pub fn read_queue(
 ) -> Result<Queue, GhError> {
     let repos = runner_repos(runners);
     kept.retain(|repo, _| repos.contains(repo));
-    let lists: Vec<_> = repos.iter().map(|repo| read_run_lists(gh, repo)).collect();
+    let lists = read_run_lists(gh, &repos);
     // The jobs of every repository's runs, 8 at a time.
     let active: Vec<(String, crate::model::RunInfo)> = repos
         .iter()
@@ -397,7 +418,105 @@ pub fn read_quota(providers: &[String]) -> Result<Vec<QuotaWindow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::{ExecError, Output};
     use crate::model::RunInfo;
+    use ghapi::Fake;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn answer(body: &str) -> Result<Output, ExecError> {
+        Ok(Output {
+            stdout: body.to_string(),
+            stderr: String::new(),
+            success: true,
+        })
+    }
+
+    fn path(cmd: &crate::exec::ReadCommand) -> String {
+        match cmd {
+            crate::exec::ReadCommand::GhApiGet { path, .. } => path.clone(),
+            other => panic!("not a read: {other:?}"),
+        }
+    }
+
+    fn runner_of(repo: &str) -> Runner {
+        Runner {
+            repo: Some(repo.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A stand-in for `gh` where every read waits for `peers` reads to be
+    /// under way at once (or gives up after 2 s), and then answers with
+    /// `body`. Returns it and a counter of reads that met all their peers.
+    fn rendezvous(
+        peers: usize,
+        body: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (Fake, Arc<AtomicUsize>) {
+        let (arrived, met) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let met2 = met.clone();
+        let fake = Fake(Arc::new(move |cmd| {
+            let p = path(cmd);
+            arrived.fetch_add(1, Ordering::SeqCst);
+            let start = Instant::now();
+            while arrived.load(Ordering::SeqCst) < peers && start.elapsed() < Duration::from_secs(2)
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if arrived.load(Ordering::SeqCst) >= peers {
+                met2.fetch_add(1, Ordering::SeqCst);
+            }
+            answer(&body(&p))
+        }));
+        (fake, met)
+    }
+
+    #[test]
+    fn the_queue_lists_of_every_repository_are_read_together() {
+        // 4 repositories, a queued and a running list each: 8 reads that
+        // can only all meet if they run at once, not one after another.
+        let (fake, met) = rendezvous(8, |_| r#"{"total_count":0,"workflow_runs":[]}"#.into());
+        let mut gh = Client::with_fake(fake);
+        let runners: Vec<Runner> = ["a/a", "b/b", "c/c", "d/d"].map(runner_of).into();
+        let q = read_queue(&mut gh, &runners, &mut BTreeMap::new()).unwrap();
+        assert_eq!(
+            met.load(Ordering::SeqCst),
+            8,
+            "all 8 lists were in flight at once"
+        );
+        assert!(q.jobs.is_empty());
+        assert_eq!(q.reads.len(), 4);
+        assert!(q.reads.values().all(|r| r.error.is_none()));
+    }
+
+    #[test]
+    fn a_failing_list_does_not_misplace_the_answers_of_the_others() {
+        let fake = Fake(Arc::new(move |cmd| {
+            let p = path(cmd);
+            if p.starts_with("repos/a/a/") && p.contains("status=queued") {
+                return answer("HTTP/2.0 404 Not Found\r\n\r\n{\"message\":\"Not Found\"}");
+            }
+            if p.contains("status=queued") && p.starts_with("repos/b/b/") {
+                return answer(
+                    r#"{"total_count":1,"workflow_runs":[{"id":7,"name":"CI","status":"queued"}]}"#,
+                );
+            }
+            if p.contains("/runs/7/jobs") {
+                return answer(
+                    r#"{"total_count":1,"jobs":[{"id":70,"run_id":7,"name":"Unit","status":"queued","labels":["self-hosted"]}]}"#,
+                );
+            }
+            answer(r#"{"total_count":0,"workflow_runs":[]}"#)
+        }));
+        let mut gh = Client::with_fake(fake);
+        let runners = [runner_of("a/a"), runner_of("b/b")];
+        let q = read_queue(&mut gh, &runners, &mut BTreeMap::new()).unwrap();
+        assert_eq!(q.jobs.len(), 1);
+        assert_eq!(q.jobs[0].name, "Unit");
+        assert!(q.reads["a/a"].error.is_some(), "{:?}", q.reads);
+        assert!(q.reads["b/b"].error.is_none(), "{:?}", q.reads);
+    }
 
     fn run(id: u64) -> RunInfo {
         RunInfo {
