@@ -768,6 +768,8 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     )
                 };
                 gh_read.lock().unwrap().clone_from(&urls);
+                // Every path this turn asks for keeps its stored answer.
+                state.client.begin_turn();
                 let prs = sources::read_pr_checks(&mut state.client, &urls);
                 let queue = sources::read_queue(&mut state.client, &runner_list, &mut state.queue);
                 // Show the checks and the queue first: the first history
@@ -948,6 +950,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
         let mut state = GhState::default();
+        state.client.begin_turn();
         let prs = sources::read_pr_checks(&mut state.client, &urls);
         let queue = sources::read_queue(&mut state.client, &s.runners, &mut state.queue);
         let (history, gh_runners) = state.read(&s.runners, &queue);

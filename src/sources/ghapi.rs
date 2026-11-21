@@ -142,6 +142,9 @@ pub struct Client {
     /// body of its last 200 answer.
     etags: BTreeMap<String, (u64, String, String)>,
     asked: u64,
+    /// The counter value at which the current turn's reads began (see
+    /// [`Client::begin_turn`]): entries asked since are never evicted.
+    turn_start: Option<u64>,
     pub budget: GhBudget,
     /// Reads that counted against the REST budget (not 304s) since
     /// [`Client::take_calls`] was last asked.
@@ -149,7 +152,9 @@ pub struct Client {
 }
 
 /// How many ETag answers are kept. Job lists of active runs are added as
-/// runs come and go; the path asked for longest ago is dropped past this.
+/// runs come and go; past this the path asked for longest ago is dropped,
+/// but never one asked in the current turn: a turn that asks for more paths
+/// than this keeps them all, so that none of its 304s loses its body.
 const MAX_ETAGS: usize = 400;
 
 /// How many `gh` reads [`Client::get_many`] runs at once.
@@ -181,6 +186,19 @@ impl Client {
     /// Reads made against the REST budget since the last call, reset to 0.
     pub fn take_calls(&mut self) -> u32 {
         std::mem::take(&mut self.calls)
+    }
+
+    /// Start a turn of reads (the queue, history and runner lists read
+    /// together). Every path asked until the next turn is kept, however many
+    /// there are; the answers of paths that went unasked for a whole turn
+    /// are dropped once the store is past its size.
+    pub fn begin_turn(&mut self) {
+        if self.etags.len() > MAX_ETAGS
+            && let Some(last) = self.turn_start
+        {
+            self.etags.retain(|_, (at, _, _)| *at >= last);
+        }
+        self.turn_start = Some(self.asked + 1);
     }
 
     fn paused(&self, graphql: bool, now: i64) -> Option<i64> {
@@ -272,7 +290,7 @@ impl Client {
             .map(|((path, keep), cmd)| {
                 cmd?;
                 match outs.next().expect("one answer per command run") {
-                    Some(out) => self.answer(path, *keep, now, out),
+                    Some(out) => self.answer(path, *keep, now, out, &run, false),
                     None => Err(GhError::Paused {
                         until: self.paused(false, now).unwrap_or(refused_until),
                     }),
@@ -283,11 +301,11 @@ impl Client {
 
     fn get_at<F>(&mut self, path: &str, keep: bool, now: i64, run: F) -> Result<String, GhError>
     where
-        F: FnOnce(&ReadCommand) -> Result<crate::exec::Output, ExecError>,
+        F: Fn(&ReadCommand) -> Result<crate::exec::Output, ExecError>,
     {
         let cmd = self.request(path, now)?;
         let out = run(&cmd);
-        self.answer(path, keep, now, out)
+        self.answer(path, keep, now, out, &run, false)
     }
 
     /// The command for one GET, asked with the last answer's ETag.
@@ -306,13 +324,16 @@ impl Client {
         })
     }
 
-    /// Take in the answer to the GET of `path`.
+    /// Take in the answer to the GET of `path`. A 304 whose body is no
+    /// longer stored is asked again, once, without the ETag (`run` asks).
     fn answer(
         &mut self,
         path: &str,
         keep: bool,
         now: i64,
         out: Result<crate::exec::Output, ExecError>,
+        run: &dyn Fn(&ReadCommand) -> Result<crate::exec::Output, ExecError>,
+        reasked: bool,
     ) -> Result<String, GhError> {
         let (out, failure) = match out {
             Ok(o) => (o.stdout, None),
@@ -326,12 +347,24 @@ impl Client {
             return Err(GhError::Paused { until });
         }
         if r.status == 304 {
-            return match self.etags.get(path) {
-                Some((_, _, body)) => Ok(body.clone()),
-                None => Err(GhError::Failed(
+            if let Some((_, _, body)) = self.etags.get(path) {
+                return Ok(body.clone());
+            }
+            // Nothing changed, but the last answer is gone: ask for it again
+            // without the ETag, unless that has been done or GitHub refuses.
+            if reasked {
+                return Err(GhError::Failed(
                     "gh: HTTP 304 without a cached answer".into(),
-                )),
-            };
+                ));
+            }
+            if let Some(until) = self.paused(false, now) {
+                return Err(GhError::Paused { until });
+            }
+            let again = run(&ReadCommand::GhApiGet {
+                path: path.to_string(),
+                etag: None,
+            });
+            return self.answer(path, keep, now, again, run, true);
         }
         self.calls += 1;
         if failure.is_some() || !(200..300).contains(&r.status) {
@@ -340,9 +373,12 @@ impl Client {
         match r.header("etag") {
             Some(etag) if keep && crate::exec::valid_etag(etag) => {
                 if self.etags.len() >= MAX_ETAGS && !self.etags.contains_key(path) {
+                    // Not one asked in this turn: its 304 may be waiting.
+                    let turn = self.turn_start;
                     let oldest = self
                         .etags
                         .iter()
+                        .filter(|(_, (at, _, _))| turn.is_none_or(|t| *at < t))
                         .min_by_key(|(_, (at, _, _))| *at)
                         .map(|(k, _)| k.clone());
                     if let Some(k) = oldest {
@@ -503,7 +539,7 @@ mod tests {
         );
         let body = c.get_at("repos/o/r/actions/runs/1/jobs", true, NOW, |cmd| {
             assert!(matches!(cmd, ReadCommand::GhApiGet { etag: None, .. }));
-            ok(first)
+            ok(first.clone())
         });
         assert_eq!(body.unwrap(), "{\"jobs\":[1]}");
         assert_eq!(c.take_calls(), 1);
@@ -556,6 +592,134 @@ mod tests {
         assert_eq!(c.etags.len(), MAX_ETAGS);
         assert!(c.etags.contains_key("repos/o/r/actions/runs/0/jobs"));
         assert!(!c.etags.contains_key("repos/o/r/actions/runs/1/jobs"));
+    }
+
+    /// The job-list paths of a repository's runs.
+    fn jobs_of(repo: &str, n: usize) -> Vec<(String, bool)> {
+        (0..n)
+            .map(|i| {
+                (
+                    format!("repos/o/{repo}/actions/runs/{i}/jobs?per_page=50"),
+                    true,
+                )
+            })
+            .collect()
+    }
+
+    /// A GitHub where every list answers 200 with its ETag the first time
+    /// and 304 when asked again with that ETag.
+    fn github(h: &[(&'static str, String)]) -> impl Fn(&ReadCommand) -> Result<Output, ExecError> {
+        let h = h.to_vec();
+        move |cmd| {
+            let ReadCommand::GhApiGet { path, etag } = cmd else {
+                panic!()
+            };
+            let tag = format!("\"{path}\"");
+            if etag.as_deref() == Some(tag.as_str()) {
+                return failed(
+                    answer("304 Not Modified", &with(&[], &h), ""),
+                    "gh: HTTP 304",
+                );
+            }
+            ok(answer(
+                "200 OK",
+                &with(&[("Etag", tag.as_str())], &h),
+                &format!("{{\"path\": \"{path}\"}}"),
+            ))
+        }
+    }
+
+    #[test]
+    fn a_turn_never_evicts_what_it_asked_and_keeps_every_304_whole() {
+        // UNIT, the review's scenario: 400 cached job lists of repository b,
+        // then a turn where repository a, which sorts first, has 30 new runs
+        // and b is unchanged. The new answers used to evict b's entries that
+        // the same batch had asked and not yet taken in: 30 reads failed.
+        let mut c = Client::default();
+        let h = counters("4000");
+        let gh = github(&h);
+        let b = jobs_of("b", MAX_ETAGS);
+        c.begin_turn();
+        assert!(c.get_many_at(&b, NOW, &gh).iter().all(Result::is_ok));
+        assert_eq!(c.etags.len(), MAX_ETAGS);
+        c.begin_turn();
+        let turn: Vec<_> = jobs_of("a", 30).into_iter().chain(b.clone()).collect();
+        let answers = c.get_many_at(&turn, NOW + 60, &gh);
+        assert_eq!(
+            answers.iter().filter(|a| a.is_err()).count(),
+            0,
+            "{:?}",
+            answers.iter().find(|a| a.is_err())
+        );
+        for ((path, _), a) in turn.iter().zip(&answers) {
+            assert_eq!(a.as_ref().unwrap(), &format!("{{\"path\": \"{path}\"}}"));
+        }
+        // The store grew to hold the whole turn, and every 304 of b was free:
+        // 400 reads of the first turn and the 30 new ones were counted.
+        assert_eq!(c.etags.len(), MAX_ETAGS + 30);
+        assert_eq!(c.take_calls(), (MAX_ETAGS + 30) as u32);
+    }
+
+    #[test]
+    fn paths_unasked_for_a_whole_turn_are_dropped_once_the_store_is_past_its_size() {
+        let mut c = Client::default();
+        let h = counters("4000");
+        let gh = github(&h);
+        c.begin_turn();
+        c.get_many_at(&jobs_of("b", MAX_ETAGS + 30), NOW, &gh);
+        assert_eq!(c.etags.len(), MAX_ETAGS + 30);
+        // A turn that asks for none of them: each new path takes the place
+        // of an old one, down to the size.
+        c.begin_turn();
+        c.get_many_at(&jobs_of("c", 5), NOW, &gh);
+        assert_eq!(c.etags.len(), MAX_ETAGS + 30);
+        // Once a whole turn has passed without them, the rest are dropped.
+        c.begin_turn();
+        c.get_many_at(&jobs_of("c", 5), NOW, &gh);
+        assert_eq!(c.etags.len(), 5);
+    }
+
+    #[test]
+    fn a_304_whose_body_is_gone_is_asked_again_without_its_etag() {
+        let mut c = Client::default();
+        let h = counters("4000");
+        let asked = std::cell::RefCell::new(Vec::new());
+        let body = c.get_at("repos/o/r/actions/runs/1/jobs", true, NOW, |cmd| {
+            let ReadCommand::GhApiGet { etag, .. } = cmd else {
+                panic!()
+            };
+            asked.borrow_mut().push(etag.clone());
+            if asked.borrow().len() == 1 {
+                // GitHub says nothing changed to a path nothing is stored for.
+                failed(
+                    answer("304 Not Modified", &with(&[], &h), ""),
+                    "gh: HTTP 304",
+                )
+            } else {
+                ok(answer(
+                    "200 OK",
+                    &with(&[("Etag", "W/\"v2\"")], &h),
+                    "{\"jobs\":[2]}",
+                ))
+            }
+        });
+        assert_eq!(body.unwrap(), "{\"jobs\":[2]}");
+        assert_eq!(asked.borrow().len(), 2, "one more ask, no more");
+        assert_eq!(asked.borrow()[1], None, "without the ETag");
+        assert_eq!(c.take_calls(), 1, "the re-ask is a counted read");
+        assert!(c.etags.contains_key("repos/o/r/actions/runs/1/jobs"));
+        // A second 304 for the re-ask is a failure, not a loop.
+        let mut c = Client::default();
+        let n = std::cell::Cell::new(0);
+        let e = c.get_at("repos/o/r/actions/runs/1/jobs", true, NOW, |_| {
+            n.set(n.get() + 1);
+            failed(
+                answer("304 Not Modified", &with(&[], &h), ""),
+                "gh: HTTP 304",
+            )
+        });
+        assert_eq!(n.get(), 2);
+        assert!(matches!(e, Err(GhError::Failed(m)) if m.contains("304")));
     }
 
     #[test]
@@ -657,7 +821,7 @@ mod tests {
             "{\"message\":\"API rate limit exceeded for user ID 1.\"}",
         );
         let e = c.get_at("repos/o/r/actions/runs?status=queued", true, NOW, |_| {
-            failed(refused, "gh: API rate limit exceeded (HTTP 403)")
+            failed(refused.clone(), "gh: API rate limit exceeded (HTTP 403)")
         });
         assert_eq!(e, Err(GhError::Paused { until: NOW + 1200 }));
         assert_eq!(c.budget.core.paused_until, Some(NOW + 1200));
