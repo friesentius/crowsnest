@@ -838,7 +838,9 @@ fn summary(view: &View, rows: &[Row], w: usize) -> Vec<Span<'static>> {
 /// The footer's gh marker when the rate-limit budget is the news: reads
 /// paused until GitHub's reset (`gh limit → 14:48`), or under a tenth of
 /// the REST budget left (`gh 7% left`), when reads slow down by themselves.
-fn gh_budget_chip(view: &View) -> Option<String> {
+/// The second says nothing of how old the data is, so the footer keeps the
+/// age beside it (`gh 7% left 4m`): the `bool` is whether it does.
+fn gh_budget_chip(view: &View) -> Option<(String, bool)> {
     let t = &view.theme;
     let (b, now) = (&view.snap.gh_budget, view.snap.now);
     let paused = [b.core.paused(now), b.graphql.paused(now)]
@@ -846,15 +848,18 @@ fn gh_budget_chip(view: &View) -> Option<String> {
         .flatten()
         .max();
     if let Some(until) = paused {
-        return Some(format!(
-            "gh limit {} {} ",
-            t.g("\u{2192}", "->"),
-            timefmt::short_when(until, now)
+        return Some((
+            format!(
+                "gh limit {} {} ",
+                t.g("\u{2192}", "->"),
+                timefmt::short_when(until, now)
+            ),
+            false,
         ));
     }
     let c = &b.core;
     (c.limit > 0 && c.reset_at > now && c.remaining * 10 < c.limit)
-        .then(|| format!("gh {}% left ", c.remaining * 100 / c.limit))
+        .then(|| (format!("gh {}% left ", c.remaining * 100 / c.limit), true))
 }
 
 fn age_of(snap: &Snapshot, tier: &str) -> Option<i64> {
@@ -1424,9 +1429,12 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         if f.error.is_some() {
             right.push(span(format!("{tier} ! "), t.warn()));
         } else if tier == "gh"
-            && let Some(chip) = gh_budget_chip(view)
+            && let Some((chip, with_age)) = gh_budget_chip(view)
         {
             right.push(span(chip, t.warn()));
+            if with_age && let Some(a) = age_of(view.snap, tier) {
+                right.push(span(format!("{} ", timefmt::dur(a)), t.dim()));
+            }
         } else if let Some(a) = age_of(view.snap, tier)
             && !matches!(tier, "host" | "runners")
         {

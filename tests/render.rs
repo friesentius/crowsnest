@@ -2126,11 +2126,75 @@ fn a_low_budget_is_shown_in_the_footer() {
         ..Default::default()
     };
     let text = draw_light(&s, &app_for(&s), 180, 50);
-    assert!(text.contains("gh 7% left"), "{text}");
+    assert!(text.contains("gh 7% left 25s"), "{text}");
+    // The age stays beside the chip when the footer is narrow too.
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(narrow.contains("gh 7% left 25s"), "{narrow}");
     s.gh_budget.core.remaining = 600;
     let text = draw_light(&s, &app_for(&s), 180, 50);
     assert!(!text.contains("% left"), "{text}");
     assert!(text.contains("gh 25s"), "{text}");
+}
+
+/// SIMULATED: the budget is low, so the gh tier waits 14 minutes between
+/// reads instead of the configured 60 s.
+fn slowed() -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.gh_budget.core = crowsnest::model::RateLimit {
+        limit: 5000,
+        remaining: 380,
+        reset_at: now + 3000,
+        ..Default::default()
+    };
+    s.gh_budget.slowed = Some(crowsnest::model::Slowed {
+        every: 14 * 60,
+        next_at: now + 10 * 60,
+    });
+    s.jobs_read_at = Some(now - 4 * 60 - 25);
+    s.fresh.get_mut("gh").unwrap().ok_at = Some(now - 4 * 60 - 25);
+    s
+}
+
+#[test]
+fn slowed_reads_say_when_the_next_is_due_and_how_old_the_queue_is() {
+    utc();
+    let s = slowed();
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        wide.contains("\u{25b2} GitHub reads slowed: next 14:37, data 4m old"),
+        "{wide}"
+    );
+    assert!(wide.contains("gh 7% left 4m"), "{wide}");
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(narrow.contains("GitHub slowed, next 14:37"), "{narrow}");
+    assert!(narrow.contains("gh 7% left 4m"), "{narrow}");
+    // Once the next read is due the row is gone, and a pause says its own.
+    let mut due = s.clone();
+    due.gh_budget.slowed.as_mut().unwrap().next_at = due.now - 1;
+    assert!(!draw_light(&due, &app_for(&due), 180, 50).contains("reads slowed"));
+    let mut off = s.clone();
+    off.gh_budget.slowed = None;
+    assert!(!draw_light(&off, &app_for(&off), 180, 50).contains("reads slowed"));
+    let mut paused = rate_limited();
+    paused.gh_budget.slowed = s.gh_budget.slowed;
+    let text = draw_light(&paused, &app_for(&paused), 180, 50);
+    assert!(text.contains("GitHub limit: resumes"), "{text}");
+    assert!(!text.contains("reads slowed"), "{text}");
+}
+
+#[test]
+fn slowed_100() {
+    utc();
+    let s = slowed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn slowed_180() {
+    utc();
+    let s = slowed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
 }
 
 #[test]

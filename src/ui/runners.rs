@@ -575,6 +575,47 @@ fn empty_state(view: &View) -> bool {
             .is_some_and(|f| f.error.is_some())
 }
 
+/// The row for GitHub reads that are paused (the rate limit, with when they
+/// resume) or slowed (the budget is low, with when the next one is due),
+/// each with how old the queue is.
+fn github_notice(view: &View, wide: bool) -> Option<String> {
+    let t = &view.theme;
+    let snap = view.snap;
+    let old = snap
+        .jobs_read_at
+        .map(|r| format!(", data {} old", dur((snap.now - r).max(0))))
+        .unwrap_or_default();
+    if let Some(until) = snap.gh_budget.core.paused(snap.now) {
+        return Some(if wide {
+            format!(
+                "{} GitHub limit: resumes {}{old}",
+                t.warn_glyph(),
+                at(until, snap.now)
+            )
+        } else {
+            format!(
+                "{} GitHub limit, resumes {}",
+                t.warn_glyph(),
+                at(until, snap.now)
+            )
+        });
+    }
+    let slowed = snap.gh_budget.slowed.filter(|s| s.next_at > snap.now)?;
+    Some(if wide {
+        format!(
+            "{} GitHub reads slowed: next {}{old}",
+            t.warn_glyph(),
+            at(slowed.next_at, snap.now)
+        )
+    } else {
+        format!(
+            "{} GitHub slowed, next {}",
+            t.warn_glyph(),
+            at(slowed.next_at, snap.now)
+        )
+    })
+}
+
 /// Rows the wide panel wants, borders included.
 pub fn wide_height(view: &View, w: u16) -> u16 {
     let w = w.saturating_sub(4) as usize;
@@ -583,7 +624,8 @@ pub fn wide_height(view: &View, w: u16) -> u16 {
     }
     let lanes = lanes::lanes(view.snap, &view.app.runner_thresholds);
     let n = (panel_lines(view, &lanes, w, true).len()
-        + super::tier_error_lines(view, "runners", w, 0).len())
+        + super::tier_error_lines(view, "runners", w, 0).len()
+        + usize::from(github_notice(view, true).is_some()))
     .max(1);
     n as u16 + 2
 }
@@ -606,27 +648,11 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
             .into_iter()
             .map(|l| (0, l))
             .collect();
-    // GitHub refused for rate limit: the queue, steps and verdicts below
-    // stopped updating, so say until when and how old they are.
-    if let Some(until) = snap.gh_budget.core.paused(snap.now) {
-        let old = snap
-            .jobs_read_at
-            .map(|r| format!(", data {} old", dur((snap.now - r).max(0))))
-            .unwrap_or_default();
-        let text = if wide {
-            format!(
-                "{} GitHub limit: resumes {}{old}",
-                t.warn_glyph(),
-                at(until, snap.now)
-            )
-        } else {
-            format!(
-                "{} GitHub limit, resumes {}",
-                t.warn_glyph(),
-                at(until, snap.now)
-            )
-        };
-        lines.insert(0, (0, fit(vec![span(text, t.warn())], w)));
+    // GitHub refused for rate limit, or the budget stretched the wait
+    // between reads: the queue, steps and verdicts below update late or not
+    // at all, so say until when and how old they are.
+    if let Some(notice) = github_notice(view, wide) {
+        lines.insert(0, (0, fit(vec![span(notice, t.warn())], w)));
     }
     lines.extend(body);
     content.extend(keep(lines, avail, t).into_iter().map(Content::Line));

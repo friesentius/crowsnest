@@ -676,11 +676,25 @@ impl RateLimit {
     }
 }
 
+/// The GitHub reads waiting longer than the settings say, because the REST
+/// budget would not last to its reset at the pace they ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Slowed {
+    /// The wait between reads now, in seconds.
+    pub every: i64,
+    /// When the next read is due.
+    pub next_at: i64,
+}
+
 /// The REST and GraphQL budgets, and what the queue read had to leave out.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct GhBudget {
     pub core: RateLimit,
     pub graphql: RateLimit,
+    /// Set after a read while the wait to the next one is stretched past the
+    /// configured cadence (the active one, or the 5 minutes of an idle one)
+    /// by the budget, and no rate-limit pause is on.
+    pub slowed: Option<Slowed>,
     /// Queued or running workflow runs per repository that were not read
     /// (beyond the page size), from GitHub's `total_count`.
     pub runs_unread: BTreeMap<String, u64>,

@@ -20,7 +20,7 @@
 
 use crate::model::{
     Fleet, Freshness, Job, PrChecks, RepoHistory, RepoRunners, Runner, RunnerSearch, Service,
-    Snapshot,
+    Slowed, Snapshot,
 };
 use crate::sources::{
     self, Queue,
@@ -232,6 +232,19 @@ fn apply_gh(
         return Read::Paused;
     }
     Read::from_errors(failed, partial)
+}
+
+/// The gh tier's wait between reads as the settings give it (`base`: the
+/// configured cadence while something is live, at least 5 minutes otherwise)
+/// and as the REST budget allows it (`every`).
+fn gh_cadence(s: &Snapshot, intervals: &Intervals, calls: u32, now: i64) -> (Duration, Duration) {
+    let live = Intervals::get(&intervals.github);
+    let base = if gh_active(s) {
+        live
+    } else {
+        live.max(Duration::from_secs(300))
+    };
+    (base, ghapi::cadence(&s.gh_budget.core, base, calls, now))
 }
 
 /// How often the completed runs of a repository are listed.
@@ -723,17 +736,11 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let resume = Arc::new(AtomicI64::new(0));
         let resume2 = resume.clone();
         let intervals = intervals.clone();
+        let intervals2 = intervals.clone();
         let interval = move || {
             let s = shared2.lock().unwrap();
             let now = now_epoch();
-            let live = Intervals::get(&intervals.github);
-            let base = if gh_active(&s) {
-                live
-            } else {
-                live.max(Duration::from_secs(300))
-            };
-            let every =
-                ghapi::cadence(&s.gh_budget.core, base, calls2.load(Ordering::Relaxed), now);
+            let (_, every) = gh_cadence(&s, &intervals, calls2.load(Ordering::Relaxed), now);
             // Paused for rate limit: try again as soon as the pause ends.
             let b = &s.gh_budget;
             match [b.core.paused(now), b.graphql.paused(now)]
@@ -801,6 +808,18 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 s.gh_runners = gh_runners;
                 s.gh_budget.core = state.client.budget.core.clone();
                 s.gh_budget.graphql = state.client.budget.graphql.clone();
+                // Say when the next read is due if the budget stretched it.
+                let now = now_epoch();
+                let (base, every) = gh_cadence(&s, &intervals2, calls.load(Ordering::Relaxed), now);
+                let paused = s
+                    .gh_budget
+                    .core
+                    .paused(now)
+                    .or(s.gh_budget.graphql.paused(now));
+                s.gh_budget.slowed = (every > base && paused.is_none()).then(|| Slowed {
+                    every: every.as_secs() as i64,
+                    next_at: now + every.as_secs() as i64,
+                });
                 read
             },
         );
@@ -1255,6 +1274,41 @@ mod tests {
         );
         assert!(matches!(r, Read::Failed(_)), "{r:?}");
         assert_eq!(s.jobs_read_at, Some(4_060), "nothing was read in full");
+    }
+
+    #[test]
+    fn reads_are_slowed_only_past_the_cadence_the_settings_give() {
+        let iv = Intervals::default();
+        Intervals::set(&iv.github, Duration::from_secs(60));
+        let now = 1_000_000;
+        let mut s = Snapshot::default();
+        s.gh_budget.core = crate::model::RateLimit {
+            limit: 5000,
+            remaining: 4000,
+            reset_at: now + 3600,
+            ..Default::default()
+        };
+        // Nothing live: the settings give 5 minutes, and a budget that
+        // lasts leaves it.
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!((base, every), (Duration::from_secs(300), base));
+        // Something live: the configured minute.
+        s.jobs.push(Job {
+            status: "queued".into(),
+            ..Default::default()
+        });
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!((base, every), (Duration::from_secs(60), base));
+        // Half of 100 left is 5 turns of 10 reads until the reset in an hour.
+        s.gh_budget.core.remaining = 100;
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!(base, Duration::from_secs(60));
+        assert_eq!(every, Duration::from_secs(720));
+        // Idle, a stretch to 3 minutes is still under the 5 the settings give.
+        s.jobs.clear();
+        s.gh_budget.core.remaining = 600;
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!((base, every), (Duration::from_secs(300), base));
     }
 
     #[test]
