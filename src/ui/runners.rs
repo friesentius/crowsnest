@@ -181,20 +181,23 @@ fn head(
         .last_ran
         .map(|r| (now - r).max(0))
         .map(|a| format!("{:>3}", dur(a)));
+    // What follows the verdict word, last to go first: when the line is
+    // short each piece is dropped whole, never cut in the middle.
+    let mut opt: Spans = Vec::new();
     match (lane.verdict, wide) {
         (Verdict::Idle, false) => {
             l.push(span("idle", t.dim()));
             if let Some(r) = ran {
-                l.push(span(format!(" \u{b7} ran {r}"), t.dim()));
+                opt.push(span(format!(" \u{b7} ran {r}"), t.dim()));
             }
         }
         (Verdict::Idle, true) => {
             l.push(span("idle", t.dim()));
             if let Some(o) = online_text(lane.online) {
-                l.push(span(format!(" \u{b7} {o}"), t.dim()));
+                opt.push(span(format!(" \u{b7} {o}"), t.dim()));
             }
             if let Some(r) = ran {
-                l.push(span(format!(" \u{b7} ran {r} ago"), t.dim()));
+                opt.push(span(format!(" \u{b7} ran {r} ago"), t.dim()));
             }
         }
         (v, false) => {
@@ -206,10 +209,10 @@ fn head(
                     } else {
                         " no listener"
                     };
-                    l.push(span(why, t.dim()));
+                    opt.push(span(why, t.dim()));
                 }
                 (Verdict::NotPickingUp, _) => {}
-                (_, Some(c)) => l.push(span(format!(" {}", elapsed_of(c)), t.plain())),
+                (_, Some(c)) => opt.push(span(format!(" {}", elapsed_of(c)), t.plain())),
                 _ => {}
             }
         }
@@ -220,7 +223,7 @@ fn head(
                 _ => online_text(lane.online),
             };
             if let Some(o) = o {
-                l.push(span(
+                opt.push(span(
                     format!(" \u{b7} {o}"),
                     if lane.online == Online::No {
                         t.bad()
@@ -242,7 +245,7 @@ fn head(
     if let Some(n) = restarts(lane.runner) {
         let words = format!("{n} restart{}", if n == 1 { "" } else { "s" });
         let gap = if right.is_empty() { 0 } else { 2 };
-        let room = w.saturating_sub(width_of(&l) + width_of(&right) + gap + 1);
+        let room = w.saturating_sub(width_of(&l) + width_of(&opt) + width_of(&right) + gap + 1);
         let text = if wide && words.width() <= room {
             words
         } else {
@@ -255,6 +258,13 @@ fn head(
         chip.extend(right);
         right = chip;
     }
+    // The count and the queue wait come first: of what follows the verdict,
+    // the last piece goes whole until the rest fits.
+    let gap = usize::from(!right.is_empty());
+    while !opt.is_empty() && width_of(&l) + width_of(&opt) + width_of(&right) + gap > w {
+        opt.pop();
+    }
+    l.extend(opt);
     lr(l, right, w)
 }
 
@@ -661,8 +671,18 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
         span("RUNNERS", t.bold()),
     ];
     match lanes::fleet(&lanes) {
-        Fleet::Stuck(n) => title.push(span(
-            format!(" {} {n} stalled", t.verdict(Verdict::Stalled).0),
+        // Say what is wrong: a runner that is down is not stalled.
+        Fleet::Stuck { n, kind } => title.push(span(
+            format!(
+                " {} {n} {}",
+                t.verdict(kind.unwrap_or(Verdict::Stalled)).0,
+                match kind {
+                    Some(Verdict::Down) => "down",
+                    Some(Verdict::Stalled) => "stalled",
+                    Some(Verdict::NotPickingUp) => "not picking up",
+                    _ => "stuck",
+                }
+            ),
             t.bad(),
         )),
         Fleet::Slow(n) => title.push(span(format!(" {} {n} slow", t.warn_glyph()), t.warn())),
@@ -684,14 +704,22 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
     } else {
         vec![span(format!("q{queued}"), t.warn())]
     };
-    // Runs past one page were not read, so the queue is short by their jobs.
-    let unread: u64 = snap.gh_budget.runs_unread.values().sum();
-    if unread > 0 {
+    // Runs between the newest and the oldest page, and jobs past a run's
+    // first page, were not read, so the queue is short by their jobs.
+    let runs: u64 = snap.gh_budget.runs_unread.values().sum();
+    let jobs: u64 = snap.gh_budget.jobs_unread.values().sum();
+    if runs + jobs > 0 {
         right.push(span(
-            if wide {
-                format!(" +{unread} runs unread")
+            if !wide {
+                format!("+{}?", runs + jobs)
             } else {
-                format!("+{unread}?")
+                let count =
+                    |n: u64, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+                match (runs, jobs) {
+                    (_, 0) => format!(" +{} unread", count(runs, "run")),
+                    (0, _) => format!(" +{} unread", count(jobs, "job")),
+                    _ => format!(" +{}, {} unread", count(runs, "run"), count(jobs, "job")),
+                }
             },
             t.warn(),
         ));
@@ -1102,7 +1130,7 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
                 wrap_words(vec![label(t, "QUEUE")], LABEL, &text, st, w)
             }
         };
-        out.extend(unread_line(view, lane, w));
+        out.extend(unread_lines(view, lane, w));
         return out;
     }
     let mut out = Vec::new();
@@ -1190,29 +1218,47 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             w,
         ));
     }
-    out.extend(unread_line(view, lane, w));
+    out.extend(unread_lines(view, lane, w));
     out
 }
 
-/// Active runs of the lane's repository that were not read: more than one
-/// page of queued or running runs. The queue above is missing their jobs.
-fn unread_line(view: &View, lane: &Lane, w: usize) -> Option<Line<'static>> {
-    let repo = lane.runner.repo.as_ref()?;
-    let n = *view.snap.gh_budget.runs_unread.get(repo)?;
-    let page = crate::sources::RUNS_PAGE;
-    Some(fit(
-        vec![
-            pad(),
-            span(
-                format!(
-                    "+{n} more active run{} not read: only the {page} newest queued and {page} newest running are",
-                    if n == 1 { "" } else { "s" }
-                ),
-                view.theme.warn(),
+/// What the lane's repository left unread: active runs between the newest
+/// and the oldest page, and jobs past the first page of a run's job list.
+/// The queue above is missing them. Each is a sentence of its own.
+fn unread_lines(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
+    let Some(repo) = lane.runner.repo.as_ref() else {
+        return Vec::new();
+    };
+    let budget = &view.snap.gh_budget;
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let mut out = Vec::new();
+    if let Some(&n) = budget.runs_unread.get(repo) {
+        let page = crate::sources::RUNS_PAGE;
+        out.extend(wrap_words(
+            vec![pad()],
+            LABEL,
+            &format!(
+                "+{n} more active run{} not read: of the queued runs and of the running runs, only the {page} newest and the {page} oldest are read",
+                plural(n)
             ),
-        ],
-        w,
-    ))
+            view.theme.warn(),
+            w,
+        ));
+    }
+    if let Some(&n) = budget.jobs_unread.get(repo) {
+        let page = crate::sources::JOBS_PAGE;
+        out.extend(wrap_words(
+            vec![pad()],
+            LABEL,
+            &format!(
+                "+{n} more job{} not read: only the first {page} jobs of a run are read",
+                plural(n)
+            ),
+            view.theme.warn(),
+            w,
+        ));
+    }
+    out
 }
 
 fn recent_section(view: &View, lane: &Lane, w: usize, rows: usize) -> Vec<Line<'static>> {
@@ -1375,41 +1421,69 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             t.dim(),
         )),
     }
+    // What the listener's console says: trouble, which is judged now, or the
+    // last line it wrote, which can be much older than the log file.
+    enum Console<'a> {
+        Trouble(String),
+        State(i64, &'a str),
+    }
     let console = r.runner_tail.as_ref().and_then(|rt| {
         rt.trouble(now)
             .map(|trouble| {
-                let text = match trouble {
+                Console::Trouble(match trouble {
                     Trouble::ConsoleError { msg, .. } => {
                         format!("{}: {msg}", trouble_head(trouble, now))
                     }
                     Trouble::Retrying { .. } => trouble_head(trouble, now),
-                };
-                (text, t.warn())
+                })
             })
-            .or_else(|| rt.state.as_ref().map(|(_, s)| (s.clone(), t.dim())))
+            .or_else(|| {
+                rt.state
+                    .as_ref()
+                    .map(|(at, s)| Console::State(*at, s.as_str()))
+            })
     });
+    let log_age = |a: i64| dur((now - a).max(0));
     match (r.runner_log_at, console) {
         // What the listener last wrote to its console, on a line of its own.
-        (Some(a), Some((text, st))) => {
+        (Some(a), Some(Console::Trouble(text))) => {
             out.push(fit(l, w));
             // A long message wraps under the label, as the verdict does.
             out.extend(wrap_words(
                 vec![
                     pad(),
-                    span(
-                        format!("runner log {} ago: ", dur((now - a).max(0))),
-                        t.dim(),
-                    ),
+                    span(format!("runner log {} ago: ", log_age(a)), t.dim()),
                 ],
                 LABEL,
                 &text,
-                st,
+                t.warn(),
+                w,
+            ));
+            return out;
+        }
+        // The line says when it was written; the file's age is another
+        // thing, so the two are never joined into one "ago".
+        (Some(a), Some(Console::State(when, text))) => {
+            let lasting =
+                text.starts_with("Listening for Jobs") || text.starts_with("Running job:");
+            let word = if lasting { "since" } else { "at" };
+            let text = text.strip_suffix('.').unwrap_or(text);
+            out.push(fit(l, w));
+            out.extend(wrap_words(
+                vec![pad()],
+                LABEL,
+                &format!(
+                    "{text} {word} {} \u{b7} log {} ago",
+                    at(when, now),
+                    log_age(a)
+                ),
+                t.dim(),
                 w,
             ));
             return out;
         }
         (Some(a), None) => l.push(span(
-            format!(" \u{b7} runner log {} ago", dur((now - a).max(0))),
+            format!(" \u{b7} runner log {} ago", log_age(a)),
             t.dim(),
         )),
         (None, _) => {}

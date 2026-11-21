@@ -2,7 +2,7 @@
 //! reads them, so a different collector can replace the sources without
 //! touching the UI.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -386,7 +386,8 @@ pub struct Service {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JobStep {
     pub number: u32,
     pub name: String,
@@ -398,7 +399,8 @@ pub struct JobStep {
 }
 
 /// What a workflow run is for, from the runs list.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunInfo {
     pub id: u64,
     pub attempt: u32,
@@ -428,7 +430,8 @@ impl RunInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Job {
     pub repo: String,
     pub name: String,
@@ -666,8 +669,6 @@ pub struct RateLimit {
     pub read_at: Option<i64>,
     /// GitHub refused for rate limit: nothing is asked until then.
     pub paused_until: Option<i64>,
-    /// When that pause began, so the screen can say how old its data is.
-    pub paused_at: Option<i64>,
 }
 
 impl RateLimit {
@@ -697,8 +698,12 @@ pub struct GhBudget {
     /// by the budget, and no rate-limit pause is on.
     pub slowed: Option<Slowed>,
     /// Queued or running workflow runs per repository that were not read
-    /// (beyond the page size), from GitHub's `total_count`.
+    /// (those between the newest and the oldest page), from GitHub's
+    /// `total_count`.
     pub runs_unread: BTreeMap<String, u64>,
+    /// Jobs per repository that were not read: those past the first page of
+    /// a run's job list.
+    pub jobs_unread: BTreeMap<String, u64>,
 }
 
 /// What the newest lines of a runner's `_diag` log say, from its tail.
@@ -714,9 +719,8 @@ pub struct LogTail {
     /// for Jobs`, `Running job: ...`, `Job ... completed with result: ...`).
     pub state: Option<(i64, String)>,
     /// Runner log: the console errors written since that line (`Runner
-    /// connect error: ...`): how many, the first one's time, and the last
-    /// (its message without the listener's own framing).
-    pub errors: usize,
+    /// connect error: ...`): the first one's time, and the last (its
+    /// message without the listener's own framing).
     pub error_since: Option<i64>,
     pub error: Option<(i64, String)>,
     /// Runner log: lines that show the listener failing to reach GitHub

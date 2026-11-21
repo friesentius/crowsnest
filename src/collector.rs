@@ -8,7 +8,7 @@
 //! | pipelines| 15 s per live no-mistakes task                               |
 //! | fleet    | 60 s                                                         |
 //! | github   | 60 s (`github_seconds`) while a PR, runner or queued job is active, otherwise 5 min; slower when the rate-limit budget would not last to its reset, paused while GitHub refuses for rate limit |
-//! | ↳ history| completed runs every 10 min, or when a watched run finishes; each run's jobs once |
+//! | ↳ history| completed runs every 10 min, or when a watched run finishes; each run's jobs once, kept on disk between starts |
 //! | ↳ runners API | 5 min per repository                                    |
 //! | quota    | 5 min                                                        |
 //!
@@ -43,6 +43,8 @@ pub struct Config {
     pub fm_home: PathBuf,
     /// Crowsnest's own cache directory (never inside the firstmate home).
     pub cache_dir: PathBuf,
+    /// Where the finished runs of each repository are kept between starts.
+    pub history_dir: Option<PathBuf>,
     /// Where to look for runners and their units.
     pub runners: Discovery,
     pub disk_paths: Vec<PathBuf>,
@@ -189,17 +191,21 @@ fn apply_gh(
     queue: Result<Queue, GhError>,
 ) -> Read {
     let (mut failed, mut partial) = (Vec::new(), Vec::new());
-    let mut paused = 0;
+    // Whether anything was asked of GitHub and answered: a pause that left
+    // nothing to read (no PR on screen, no repository) is not a read.
+    let (mut paused, mut read_any) = (false, false);
     match prs {
         Ok((prs, errors)) => {
+            read_any |= !prs.is_empty() || !errors.is_empty();
             s.prs = prs.into_iter().map(|p| (p.url.clone(), p)).collect();
             partial = errors;
         }
-        Err(GhError::Paused { .. }) => paused += 1,
+        Err(GhError::Paused { .. }) => paused = true,
         Err(GhError::Failed(e)) => failed.push(e),
     }
     match queue {
         Ok(q) => {
+            read_any |= !q.reads.is_empty();
             // A repository that failed reads as a partial error, and keeps
             // the jobs of its last good read; every one failing is outright.
             let errors: Vec<String> = q
@@ -224,11 +230,12 @@ fn apply_gh(
             }
             s.queue_reads = q.reads;
             s.gh_budget.runs_unread = q.unread;
+            s.gh_budget.jobs_unread = q.jobs_unread;
         }
-        Err(GhError::Paused { .. }) => paused += 1,
+        Err(GhError::Paused { .. }) => paused = true,
         Err(GhError::Failed(e)) => failed.push(e),
     }
-    if paused == 2 {
+    if paused && !read_any && failed.is_empty() {
         return Read::Paused;
     }
     Read::from_errors(failed, partial)
@@ -247,6 +254,37 @@ fn gh_cadence(s: &Snapshot, intervals: &Intervals, calls: u32, now: i64) -> (Dur
     (base, ghapi::cadence(&s.gh_budget.core, base, calls, now))
 }
 
+/// How long the gh tier waits, from the end of its last turn (`turned`), for
+/// its next one while GitHub refuses for rate limit, at a time that is fixed
+/// once the pause is known. The cadence shrinks with the time to the reset,
+/// and the tier compares the time since its last turn with it every half
+/// second, so waiting for that would meet it ever sooner (about 6 turns in
+/// the last 30 s), each a GraphQL read when only REST is paused. `base` is
+/// the cadence the settings give, `every` what the REST budget allows, and
+/// `prs` whether a PR is on screen:
+///
+/// - REST paused alone: PR checks (GraphQL) go on at `base` when there is a
+///   PR, else nothing can be read until the pause ends, one second after;
+/// - GraphQL paused alone: the REST reads keep their cadence, `every`;
+/// - both: the first pause to end.
+fn pause_wait(
+    b: &crate::model::GhBudget,
+    base: Duration,
+    every: Duration,
+    prs: bool,
+    now: i64,
+    turned: i64,
+) -> Duration {
+    let to_end = |until: i64| Duration::from_secs((until + 1 - turned).max(0) as u64);
+    match (b.core.paused(now), b.graphql.paused(now)) {
+        (Some(until), None) if prs => base.min(to_end(until)),
+        (Some(until), None) => to_end(until),
+        (Some(core), Some(graphql)) => to_end(core.min(graphql)),
+        (None, Some(until)) => every.min(to_end(until)),
+        (None, None) => every,
+    }
+}
+
 /// How often the completed runs of a repository are listed.
 const HISTORY_EVERY: Duration = Duration::from_secs(600);
 /// How often GitHub's runner list of a repository is read.
@@ -261,6 +299,9 @@ const SERVICE_EVERY: Duration = Duration::from_secs(30);
 struct GhState {
     /// Runs `gh`, keeping ETags and the rate-limit budget between reads.
     client: Client,
+    /// Where `cache` is kept on disk, so a start does not read every
+    /// finished run's jobs again.
+    history_dir: Option<PathBuf>,
     cache: BTreeMap<String, RepoCache>,
     history_at: BTreeMap<String, Instant>,
     history_error: BTreeMap<String, String>,
@@ -273,6 +314,18 @@ struct GhState {
 }
 
 impl GhState {
+    fn new(history_dir: Option<PathBuf>) -> GhState {
+        GhState {
+            history_dir,
+            ..Default::default()
+        }
+    }
+
+    /// The file `repo`'s finished runs are kept in.
+    fn history_file(&self, repo: &str) -> Option<PathBuf> {
+        sources::history::cache_file(self.history_dir.as_deref()?, repo)
+    }
+
     /// Read what is due for the repositories of `runner_list`, given the
     /// queue just read. Returns the history and runner lists to show.
     fn read(
@@ -297,8 +350,18 @@ impl GhState {
         for repo in &repos {
             let due = |at: Option<&Instant>, every| at.is_none_or(|t| t.elapsed() >= every);
             if finished || due(self.history_at.get(repo), HISTORY_EVERY) {
-                let cache = self.cache.entry(repo.clone()).or_default();
-                match sources::read_history(&mut self.client, repo, cache) {
+                let file = self.history_file(repo);
+                let cache = self
+                    .cache
+                    .entry(repo.clone())
+                    .or_insert_with(|| file.as_deref().map(RepoCache::load).unwrap_or_default());
+                let read = sources::read_history(&mut self.client, repo, cache);
+                // What was read stays read, whatever else failed. A cache
+                // that cannot be written costs only a longer next start.
+                if let Some(file) = &file {
+                    let _ = cache.save(file);
+                }
+                match read {
                     Ok(_) => {
                         self.history_at.insert(repo.clone(), Instant::now());
                         self.history_error.remove(repo);
@@ -496,8 +559,8 @@ impl RunnerTier {
         }
         self.scan.apply(&mut self.list, now_epoch());
         for r in &mut self.list {
-            runners::read_diag(r);
-            self.tails.read(r);
+            let logs = runners::read_diag(r);
+            self.tails.read(r, &logs);
         }
         self.tails.keep_only(&self.list);
         self.services.update(&mut self.list);
@@ -726,7 +789,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     // GitHub.
     if cfg.github {
         let (shared, shared2) = (shared.clone(), shared.clone());
-        let mut state = GhState::default();
+        let mut state = GhState::new(cfg.history_dir.clone());
         let mut first = true;
         let changed_gh = changed.clone();
         // Reads the last turn made that counted against the budget.
@@ -735,12 +798,16 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         // The end of the last rate-limit pause seen, until a turn runs after it.
         let resume = Arc::new(AtomicI64::new(0));
         let resume2 = resume.clone();
+        // When the last turn ended, so that a pause is waited out to a fixed
+        // time, not to one that moves with the clock.
+        let turned = Arc::new(AtomicI64::new(0));
+        let turned2 = turned.clone();
         let intervals = intervals.clone();
         let intervals2 = intervals.clone();
         let interval = move || {
             let s = shared2.lock().unwrap();
             let now = now_epoch();
-            let (_, every) = gh_cadence(&s, &intervals, calls2.load(Ordering::Relaxed), now);
+            let (base, every) = gh_cadence(&s, &intervals, calls2.load(Ordering::Relaxed), now);
             // Paused for rate limit: try again as soon as the pause ends.
             let b = &s.gh_budget;
             match [b.core.paused(now), b.graphql.paused(now)]
@@ -750,7 +817,15 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             {
                 Some(until) => {
                     resume2.store(until, Ordering::Relaxed);
-                    every.min(Duration::from_secs((until - now + 1) as u64))
+                    let prs = !sources::pr_urls(s.fleet.as_ref(), &s.pipelines).is_empty();
+                    pause_wait(
+                        &s.gh_budget,
+                        base,
+                        every,
+                        prs,
+                        now,
+                        turned2.load(Ordering::Relaxed),
+                    )
                 }
                 // The pause just ended: read at once, not a full interval
                 // after the last paused turn.
@@ -803,6 +878,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 if !std::mem::replace(&mut first, false) {
                     calls.store(made, Ordering::Relaxed);
                 }
+                turned.store(now_epoch(), Ordering::Relaxed);
                 let mut s = shared.lock().unwrap();
                 s.history = history;
                 s.gh_runners = gh_runners;
@@ -938,8 +1014,8 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     scan.apply(&mut list, now_epoch());
     let mut tails = runners::LogTails::default();
     for r in &mut list {
-        runners::read_diag(r);
-        tails.read(r);
+        let logs = runners::read_diag(r);
+        tails.read(r, &logs);
     }
     Services::default().update(&mut list);
     let r = runners_read(&list, &list_errors, &scan);
@@ -972,7 +1048,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     note(&mut s, "nm", item_read(errors, total));
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
-        let mut state = GhState::default();
+        let mut state = GhState::new(cfg.history_dir.clone());
         state.client.begin_turn();
         let prs = sources::read_pr_checks(&mut state.client, &urls);
         let queue = sources::read_queue(&mut state.client, &s.runners, &mut state.queue);
@@ -1165,6 +1241,213 @@ mod tests {
         idle.fm_state = "no_active_work".into();
         s.fleet = Some(fleet(vec![idle]));
         assert!(!gh_active(&s));
+    }
+
+    /// A stand-in for `gh` serving the recorded finished runs of one
+    /// repository; counts the job lists it is asked for.
+    fn history_gh(jobs_asked: &Arc<AtomicU32>) -> Client {
+        let asked = jobs_asked.clone();
+        let fixture = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/tests/fixtures/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        Client::with_fake(ghapi::Fake(Arc::new(move |cmd| {
+            let crate::exec::ReadCommand::GhApiGet { path, .. } = cmd else {
+                panic!("{cmd:?}");
+            };
+            let body = if path.contains("status=completed") {
+                fixture("gh-runs-completed.json")
+            } else if let Some(id) = path
+                .split("/runs/")
+                .nth(1)
+                .and_then(|r| r.split('/').next())
+            {
+                asked.fetch_add(1, Ordering::SeqCst);
+                fixture(&format!("gh-jobs-{id}.json"))
+            } else {
+                r#"{"total_count":0,"runners":[]}"#.to_string()
+            };
+            Ok(crate::exec::Output {
+                stdout: body,
+                stderr: String::new(),
+                success: true,
+            })
+        })))
+    }
+
+    #[test]
+    fn a_restart_does_not_read_the_finished_runs_jobs_again() {
+        let dir = std::env::temp_dir().join(format!("crowsnest-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runners = [Runner {
+            repo: Some("acme/pantry".into()),
+            ..Default::default()
+        }];
+        let queue = || Ok(Queue::default());
+        let start = || {
+            let asked = Arc::new(AtomicU32::new(0));
+            let mut state = GhState::new(Some(dir.clone()));
+            state.client = history_gh(&asked);
+            let (history, _) = state.read(&runners, &queue());
+            (history, asked.load(Ordering::SeqCst))
+        };
+        let (first, jobs_read) = start();
+        assert_eq!(jobs_read, 4, "a first start reads each finished run's jobs");
+        // A second start finds them on disk and reads only the listing.
+        let (second, jobs_read) = start();
+        assert_eq!(jobs_read, 0);
+        let (a, b) = (&first["acme/pantry"], &second["acme/pantry"]);
+        assert_eq!(a.jobs.len(), 16);
+        assert_eq!(a.jobs.len(), b.jobs.len());
+        assert_eq!(a.typical, b.typical);
+        assert_eq!(a.covered_since, b.covered_since);
+        // Without a directory nothing is kept: every start reads again.
+        let asked = Arc::new(AtomicU32::new(0));
+        let mut state = GhState::new(None);
+        state.client = history_gh(&asked);
+        state.read(&runners, &queue());
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The seconds, from a turn at `from`, at which the gh tier would run
+    /// again before `to` while it waits `wait(now, last_turn)` and looks every
+    /// second (it looks every half second).
+    fn turns_between(from: i64, to: i64, wait: impl Fn(i64, i64) -> Duration) -> Vec<i64> {
+        let mut last = from;
+        let mut turns = Vec::new();
+        for now in from + 1..to {
+            if now - last >= wait(now, last).as_secs() as i64 {
+                turns.push(now);
+                last = now;
+            }
+        }
+        turns
+    }
+
+    #[test]
+    fn a_rest_pause_is_waited_out_in_one_turn_not_in_shrinking_ones() {
+        let (t0, until) = (1_795_000_000, 1_795_000_000 + 120);
+        let b = crate::model::GhBudget {
+            core: crate::model::RateLimit {
+                limit: 5000,
+                remaining: 0,
+                reset_at: until,
+                paused_until: Some(until),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let base = Duration::from_secs(60);
+        // What the cadence says shrinks with the time to the reset.
+        let every = |now| ghapi::cadence(&b.core, base, 10, now);
+        // The old rule: the turns come ever sooner, about 6 in the last 30 s.
+        let shrinking = turns_between(t0, until, |now, _| {
+            every(now).min(Duration::from_secs((until - now + 1) as u64))
+        });
+        assert!(
+            shrinking.iter().filter(|t| **t > until - 30).count() >= 4,
+            "{shrinking:?}"
+        );
+        // With no PR on screen nothing can be read: no turn while the pause
+        // lasts. (From its end the tier resumes at once, by its own rule,
+        // which this does not model.)
+        let turns = turns_between(t0, until + 5, |now, last| {
+            pause_wait(&b, base, every(now), false, now, last)
+        });
+        assert!(turns.iter().all(|t| *t >= until), "{turns:?}");
+        // The wait itself is fixed while the pause lasts.
+        let w = |now| pause_wait(&b, base, every(now), false, now, t0);
+        assert_eq!(w(t0 + 1), Duration::from_secs(121));
+        assert_eq!(w(t0 + 100), Duration::from_secs(121));
+    }
+
+    #[test]
+    fn pr_checks_go_on_at_their_cadence_during_a_rest_pause_without_shrinking_waits() {
+        let (t0, until) = (1_795_000_000, 1_795_000_000 + 290);
+        let b = crate::model::GhBudget {
+            core: crate::model::RateLimit {
+                limit: 5000,
+                remaining: 0,
+                reset_at: until,
+                paused_until: Some(until),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let base = Duration::from_secs(60);
+        let every = |now| ghapi::cadence(&b.core, base, 10, now);
+        // A PR is on screen: its GraphQL read every minute, evenly, and not
+        // ever sooner towards the end.
+        let turns = turns_between(t0, until, |now, last| {
+            pause_wait(&b, base, every(now), true, now, last)
+        });
+        assert_eq!(turns, [t0 + 60, t0 + 120, t0 + 180, t0 + 240]);
+        // Near the end the wait is to the end of the pause, once.
+        assert_eq!(
+            pause_wait(&b, base, every(t0 + 270), true, t0 + 270, t0 + 250),
+            Duration::from_secs(41)
+        );
+        // Both budgets paused: nothing to ask until the first one is over.
+        let mut both = b.clone();
+        both.graphql.paused_until = Some(t0 + 100);
+        assert_eq!(
+            pause_wait(&both, base, every(t0), true, t0 + 1, t0),
+            Duration::from_secs(101)
+        );
+    }
+
+    #[test]
+    fn a_graphql_pause_leaves_the_rest_reads_their_cadence() {
+        let (t0, until) = (1_795_000_000, 1_795_000_000 + 600);
+        let mut b = crate::model::GhBudget::default();
+        b.graphql.paused_until = Some(until);
+        let (base, every) = (Duration::from_secs(60), Duration::from_secs(60));
+        let wait =
+            |b: &crate::model::GhBudget, now, turned| pause_wait(b, base, every, true, now, turned);
+        // Under a minute to go: the wait ends with the pause, not after it.
+        assert_eq!(wait(&b, until - 10, until - 20), Duration::from_secs(21));
+        assert_eq!(wait(&b, t0, t0), every);
+        // No pause: the cadence.
+        assert_eq!(wait(&crate::model::GhBudget::default(), t0, t0), every);
+    }
+
+    #[test]
+    fn a_pause_with_nothing_to_read_is_not_a_good_read() {
+        let mut s = Snapshot::default();
+        let no_prs = || Ok((vec![], vec![]));
+        let prs_paused = || Err(GhError::Paused { until: 2_000 });
+        let queue_paused = || Err(GhError::Paused { until: 2_000 });
+        // REST paused and no PR on screen: nothing was read.
+        assert_eq!(apply_gh(&mut s, no_prs(), queue_paused()), Read::Paused);
+        // GraphQL paused and no repository to read: likewise.
+        assert_eq!(
+            apply_gh(&mut s, prs_paused(), Ok(Queue::default())),
+            Read::Paused
+        );
+        // One part read, even an empty queue of a repository, is a read.
+        let queue = Queue {
+            reads: [("acme/pantry".to_string(), QueueRead::default())].into(),
+            ..Default::default()
+        };
+        assert_eq!(apply_gh(&mut s, prs_paused(), Ok(queue)), Read::Ok);
+        // Nothing to read and nothing paused is as before: fine.
+        assert_eq!(
+            apply_gh(&mut s, Ok((vec![], vec![])), Ok(Queue::default())),
+            Read::Ok
+        );
+        // A failure is not hidden by the pause beside it.
+        assert!(matches!(
+            apply_gh(
+                &mut s,
+                Err(GhError::Failed("gh: HTTP 502".into())),
+                queue_paused()
+            ),
+            Read::Failed(_)
+        ));
     }
 
     #[test]

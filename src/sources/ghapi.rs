@@ -149,6 +149,24 @@ pub struct Client {
     /// Reads that counted against the REST budget (not 304s) since
     /// [`Client::take_calls`] was last asked.
     calls: u32,
+    /// Stands in for `gh` in tests.
+    #[cfg(test)]
+    fake: Option<Fake>,
+}
+
+/// A stand-in for running `gh`, so a source's reads can be tested whole.
+#[cfg(test)]
+pub type FakeRun = dyn Fn(&ReadCommand) -> Result<crate::exec::Output, ExecError> + Send + Sync;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub struct Fake(pub std::sync::Arc<FakeRun>);
+
+#[cfg(test)]
+impl std::fmt::Debug for Fake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Fake")
+    }
 }
 
 /// How many ETag answers are kept. Job lists of active runs are added as
@@ -183,6 +201,30 @@ fn bounded<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 }
 
 impl Client {
+    /// A client whose reads are answered by `fake` instead of `gh`.
+    #[cfg(test)]
+    pub fn with_fake(fake: Fake) -> Client {
+        Client {
+            fake: Some(fake),
+            ..Default::default()
+        }
+    }
+
+    /// Runs one command: `gh`, or the stand-in of a test.
+    fn runner(
+        &self,
+    ) -> impl Fn(&ReadCommand) -> Result<crate::exec::Output, ExecError> + Sync + use<> {
+        #[cfg(test)]
+        let fake = self.fake.clone();
+        move |cmd: &ReadCommand| {
+            #[cfg(test)]
+            if let Some(f) = &fake {
+                return (f.0)(cmd);
+            }
+            cmd.run()
+        }
+    }
+
     /// Reads made against the REST budget since the last call, reset to 0.
     pub fn take_calls(&mut self) -> u32 {
         std::mem::take(&mut self.calls)
@@ -230,28 +272,28 @@ impl Client {
         } else {
             &mut self.budget.core
         };
-        if slot.paused_until.is_none_or(|u| u <= now) {
-            slot.paused_at = Some(now);
-        }
         slot.paused_until = Some(until);
         Some(until)
     }
 
     /// `gh api --method GET <path>`, asked with the last answer's ETag.
     pub fn get(&mut self, path: &str) -> Result<String, GhError> {
-        self.get_at(path, true, now_epoch(), |cmd| cmd.run())
+        let run = self.runner();
+        self.get_at(path, true, now_epoch(), run)
     }
 
     /// `gh api --method GET <path>` for an answer that is read only once
     /// (a finished run's jobs never change): no ETag is kept for it.
     pub fn get_once(&mut self, path: &str) -> Result<String, GhError> {
-        self.get_at(path, false, now_epoch(), |cmd| cmd.run())
+        let run = self.runner();
+        self.get_at(path, false, now_epoch(), run)
     }
 
     /// `gh api --method GET` for each `(path, keep)` of `reads`, at most
     /// [`PARALLEL`] at a time, answered in the order asked.
     pub fn get_many(&mut self, reads: &[(String, bool)]) -> Vec<Result<String, GhError>> {
-        self.get_many_at(reads, now_epoch(), |cmd| cmd.run())
+        let run = self.runner();
+        self.get_many_at(reads, now_epoch(), run)
     }
 
     fn get_many_at<F>(
@@ -400,7 +442,8 @@ impl Client {
     /// One GraphQL read query. An answer `gh` reported as failed is still
     /// returned with the failure, so the parts that resolved can be shown.
     pub fn graphql(&mut self, query: String) -> Result<GraphqlAnswer, GhError> {
-        self.graphql_at(query, now_epoch(), |cmd| cmd.run())
+        let run = self.runner();
+        self.graphql_at(query, now_epoch(), run)
     }
 
     fn graphql_at<F>(&mut self, query: String, now: i64, run: F) -> Result<GraphqlAnswer, GhError>
@@ -878,7 +921,6 @@ mod tests {
         });
         assert_eq!(e, Err(GhError::Paused { until: NOW + 1200 }));
         assert_eq!(c.budget.core.paused_until, Some(NOW + 1200));
-        assert_eq!(c.budget.core.paused_at, Some(NOW));
         // Nothing is asked while paused.
         let e = c.get_at(
             "repos/o/r/actions/runs?status=queued",

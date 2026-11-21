@@ -105,6 +105,12 @@ pub fn runner_repos(runners: &[Runner]) -> Vec<String> {
     repos
 }
 
+/// The most jobs of one run that are read: one page, GitHub's largest.
+pub const JOBS_PAGE: usize = 100;
+
+/// One run's jobs, and how many more it has than were read.
+type RunJobs = Result<(Vec<Job>, u64), GhError>;
+
 /// The jobs of `runs` of their repositories, each carrying the run it
 /// belongs to, read in parallel. An unchanged list is GitHub's 304, which
 /// costs nothing; a finished run's jobs never change and keep no ETag.
@@ -112,12 +118,15 @@ fn read_runs_jobs(
     gh: &mut Client,
     runs: &[(String, crate::model::RunInfo)],
     finished: bool,
-) -> Vec<Result<Vec<Job>, GhError>> {
+) -> Vec<RunJobs> {
     let reads: Vec<(String, bool)> = runs
         .iter()
         .map(|(repo, run)| {
             (
-                format!("repos/{repo}/actions/runs/{}/jobs?per_page=50", run.id),
+                format!(
+                    "repos/{repo}/actions/runs/{}/jobs?per_page={JOBS_PAGE}",
+                    run.id
+                ),
                 !finished,
             )
         })
@@ -126,26 +135,38 @@ fn read_runs_jobs(
         .into_iter()
         .zip(runs)
         .map(|(out, (repo, run))| {
-            let mut jobs = gh::parse_jobs(repo, &out?).map_err(GhError::Failed)?;
+            let out = out?;
+            let mut jobs = gh::parse_jobs(repo, &out).map_err(GhError::Failed)?;
+            let unread = gh::total_count(&out)
+                .unwrap_or(0)
+                .saturating_sub(jobs.len() as u64);
             for j in &mut jobs {
                 j.run = Some(run.clone());
             }
-            Ok(jobs)
+            Ok((jobs, unread))
         })
         .collect()
 }
 
 /// How many queued, and how many running, workflow runs of a repository
-/// are read: one page of each, GitHub's largest. Unchanged lists and job
-/// lists are 304s, which cost nothing, so reading them all stays cheap.
+/// are read from each end of the list: one page of the newest and one of
+/// the oldest, GitHub's largest. Unchanged lists and job lists are 304s,
+/// which cost nothing, so reading them all stays cheap.
 pub const RUNS_PAGE: usize = 100;
+
+/// How far into a run list GitHub reads: a list filtered by status returns
+/// at most 1000 runs. Past that the last page is the last one reachable.
+const RUNS_REACH: usize = 1000;
 
 /// What the queue read found.
 #[derive(Debug, Default)]
 pub struct Queue {
     pub jobs: Vec<Job>,
-    /// Active runs per repository beyond the page that were not read.
+    /// Active runs per repository that were not read: those between the
+    /// newest and the oldest page of each state.
     pub unread: BTreeMap<String, u64>,
+    /// Jobs per repository beyond the first page of their run's job list.
+    pub jobs_unread: BTreeMap<String, u64>,
     /// How each repository's queue was read: when it was last read in full,
     /// and what failed this turn. A repository that failed keeps the jobs
     /// of its last good read in `jobs`.
@@ -161,29 +182,114 @@ pub struct Queue {
 pub struct KeptQueue {
     pub jobs: Vec<Job>,
     pub unread: u64,
+    pub jobs_unread: u64,
     pub read_at: Option<i64>,
 }
 
-/// One repository's queued and running runs, or why they were not read.
-fn read_run_lists(
-    gh: &mut Client,
-    repo: &str,
-) -> Result<(Vec<crate::model::RunInfo>, u64), GhError> {
-    let mut runs = Vec::new();
-    let mut unread = 0;
-    for status in ["queued", "in_progress"] {
-        let out = gh.get(&format!(
-            "repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}"
-        ))?;
-        let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
-        unread += gh::total_count(&out)
-            .unwrap_or(0)
-            .saturating_sub(page.len() as u64);
-        runs.extend(page);
+/// The run states the queue lists.
+const ACTIVE: [&str; 2] = ["queued", "in_progress"];
+
+/// What reading one repository's queued and running runs found.
+type RunList = Result<(Vec<crate::model::RunInfo>, u64), GhError>;
+
+/// The path of a page of a repository's runs in one state.
+fn runs_path(repo: &str, status: &str, page: u64) -> String {
+    let base = format!("repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}");
+    if page > 1 {
+        format!("{base}&page={page}")
+    } else {
+        base
     }
-    runs.sort_by_key(|r| r.id);
-    runs.dedup_by_key(|r| r.id);
-    Ok((runs, unread))
+}
+
+/// One state of one repository's runs.
+type Cell<'a> = (&'a str, &'a str);
+
+/// The answers to reading page `pages[i]` of each cell `i` that has one,
+/// all together, 8 reads at a time.
+fn read_pages(
+    gh: &mut Client,
+    cells: &[Cell],
+    pages: &[Option<u64>],
+) -> Vec<Option<Result<String, GhError>>> {
+    let asked: Vec<usize> = (0..cells.len()).filter(|i| pages[*i].is_some()).collect();
+    let reads: Vec<(String, bool)> = asked
+        .iter()
+        .map(|&i| {
+            (
+                runs_path(cells[i].0, cells[i].1, pages[i].unwrap_or(1)),
+                true,
+            )
+        })
+        .collect();
+    let mut out: Vec<_> = cells.iter().map(|_| None).collect();
+    for (i, answer) in asked.into_iter().zip(gh.get_many(&reads)) {
+        out[i] = Some(answer);
+    }
+    out
+}
+
+/// Each repository's queued and running runs, or why they were not read,
+/// and how many were left unread. GitHub lists newest first, so the first
+/// page holds the newest runs and the last the oldest, which have waited
+/// longest: when a state has more runs than one page, its last page is read
+/// too, and only the runs between the two are unread. Everything is asked
+/// together: first the first pages, then the last ones that are needed.
+fn read_run_lists(gh: &mut Client, repos: &[String]) -> Vec<RunList> {
+    let cells: Vec<Cell> = repos
+        .iter()
+        .flat_map(|repo| ACTIVE.map(|status| (repo.as_str(), status)))
+        .collect();
+    let firsts: Vec<Result<(Vec<crate::model::RunInfo>, u64), GhError>> =
+        read_pages(gh, &cells, &vec![Some(1); cells.len()])
+            .into_iter()
+            .map(|out| {
+                let out = out.expect("every cell is asked")?;
+                let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
+                Ok((page, gh::total_count(&out).unwrap_or(0)))
+            })
+            .collect();
+    // The last page of each state that has more runs than the first held.
+    let last_pages: Vec<Option<u64>> = firsts
+        .iter()
+        .map(|first| {
+            let (page, total) = first.as_ref().ok()?;
+            (*total > page.len() as u64)
+                .then(|| (*total).min(RUNS_REACH as u64).div_ceil(RUNS_PAGE as u64))
+        })
+        .collect();
+    let lasts = read_pages(gh, &cells, &last_pages);
+    let mut states = firsts.into_iter().zip(lasts).map(|(first, last)| {
+        let (mut runs, total) = first?;
+        // The oldest page is best effort: when it cannot be read the first
+        // page still stands, and those runs are counted as unread.
+        if let Some(Ok(out)) = last
+            && let Ok(page) = gh::parse_runs(&out)
+        {
+            runs.extend(page);
+        }
+        runs.sort_by_key(|r| r.id);
+        runs.dedup_by_key(|r| r.id);
+        let unread = total.saturating_sub(runs.len() as u64);
+        Ok::<_, GhError>((runs, unread))
+    });
+    repos
+        .iter()
+        .map(|_| {
+            // Both states of a repository are taken before either's error.
+            let both: Vec<_> = states.by_ref().take(ACTIVE.len()).collect();
+            let mut runs = Vec::new();
+            let mut unread = 0;
+            for state in both {
+                let (r, u) = state?;
+                runs.extend(r);
+                unread += u;
+            }
+            runs.sort_by_key(|r| r.id);
+            runs.dedup_by_key(|r| r.id);
+            Ok((runs, unread))
+        })
+        .collect()
 }
 
 /// Every job of the queued and running workflow runs of each repository
@@ -202,7 +308,7 @@ pub fn read_queue(
 ) -> Result<Queue, GhError> {
     let repos = runner_repos(runners);
     kept.retain(|repo, _| repos.contains(repo));
-    let lists: Vec<_> = repos.iter().map(|repo| read_run_lists(gh, repo)).collect();
+    let lists = read_run_lists(gh, &repos);
     // The jobs of every repository's runs, 8 at a time.
     let active: Vec<(String, crate::model::RunInfo)> = repos
         .iter()
@@ -226,11 +332,15 @@ pub fn read_queue(
         if mine.unread > 0 {
             q.unread.insert(repo.clone(), mine.unread);
         }
+        if mine.jobs_unread > 0 {
+            q.jobs_unread.insert(repo.clone(), mine.jobs_unread);
+        }
         kept.insert(
             repo.clone(),
             KeptQueue {
                 jobs: mine.jobs.clone(),
                 unread: mine.unread,
+                jobs_unread: mine.jobs_unread,
                 read_at: mine.read.read_at,
             },
         );
@@ -253,6 +363,7 @@ pub fn read_queue(
 struct Merged {
     jobs: Vec<Job>,
     unread: u64,
+    jobs_unread: u64,
     read: QueueRead,
     /// Everything answered: the queue was read in full.
     whole: bool,
@@ -269,12 +380,13 @@ struct Merged {
 fn merge_repo(
     old: &KeptQueue,
     list: Result<(Vec<crate::model::RunInfo>, u64), GhError>,
-    jobs: Vec<Result<Vec<Job>, GhError>>,
+    jobs: Vec<RunJobs>,
     now: i64,
 ) -> Merged {
     let mut m = Merged {
         jobs: Vec::new(),
         unread: old.unread,
+        jobs_unread: old.jobs_unread,
         read: QueueRead {
             read_at: old.read_at,
             error: None,
@@ -291,10 +403,14 @@ fn merge_repo(
     match list {
         Ok((runs, unread)) => {
             m.unread = unread;
+            m.jobs_unread = 0;
             m.whole = true;
             for (run, answer) in runs.iter().zip(jobs) {
                 match answer {
-                    Ok(j) => m.jobs.extend(j),
+                    Ok((j, more)) => {
+                        m.jobs.extend(j);
+                        m.jobs_unread += more;
+                    }
                     Err(e) => {
                         m.whole = false;
                         m.jobs
@@ -326,8 +442,9 @@ pub fn read_history(
         "repos/{repo}/actions/runs?status=completed&per_page={}",
         history::LIST_RUNS
     ))?;
-    let new: Vec<_> = gh::parse_runs(&out)
-        .map_err(GhError::Failed)?
+    let listed = gh::parse_runs(&out).map_err(GhError::Failed)?;
+    cache.gap_before(&listed);
+    let new: Vec<_> = listed
         .into_iter()
         .filter(|run| !cache.has(run))
         .map(|run| (repo.to_string(), run))
@@ -336,7 +453,7 @@ pub fn read_history(
     let mut failure = None;
     for ((_, run), jobs) in new.iter().zip(read_runs_jobs(gh, &new, true)) {
         match jobs {
-            Ok(jobs) => {
+            Ok((jobs, _)) => {
                 cache.insert(run.clone(), jobs);
                 added += 1;
             }
@@ -397,7 +514,254 @@ pub fn read_quota(providers: &[String]) -> Result<Vec<QuotaWindow>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::exec::{ExecError, Output};
     use crate::model::RunInfo;
+    use ghapi::Fake;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn answer(body: &str) -> Result<Output, ExecError> {
+        Ok(Output {
+            stdout: body.to_string(),
+            stderr: String::new(),
+            success: true,
+        })
+    }
+
+    fn path(cmd: &crate::exec::ReadCommand) -> String {
+        match cmd {
+            crate::exec::ReadCommand::GhApiGet { path, .. } => path.clone(),
+            other => panic!("not a read: {other:?}"),
+        }
+    }
+
+    fn runner_of(repo: &str) -> Runner {
+        Runner {
+            repo: Some(repo.into()),
+            ..Default::default()
+        }
+    }
+
+    /// A stand-in for `gh` where every read waits for `peers` reads to be
+    /// under way at once (or gives up after 2 s), and then answers with
+    /// `body`. Returns it and a counter of reads that met all their peers.
+    fn rendezvous(
+        peers: usize,
+        body: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> (Fake, Arc<AtomicUsize>) {
+        let (arrived, met) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let met2 = met.clone();
+        let fake = Fake(Arc::new(move |cmd| {
+            let p = path(cmd);
+            arrived.fetch_add(1, Ordering::SeqCst);
+            let start = Instant::now();
+            while arrived.load(Ordering::SeqCst) < peers && start.elapsed() < Duration::from_secs(2)
+            {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            if arrived.load(Ordering::SeqCst) >= peers {
+                met2.fetch_add(1, Ordering::SeqCst);
+            }
+            answer(&body(&p))
+        }));
+        (fake, met)
+    }
+
+    #[test]
+    fn the_queue_lists_of_every_repository_are_read_together() {
+        // 4 repositories, a queued and a running list each: 8 reads that
+        // can only all meet if they run at once, not one after another.
+        let (fake, met) = rendezvous(8, |_| r#"{"total_count":0,"workflow_runs":[]}"#.into());
+        let mut gh = Client::with_fake(fake);
+        let runners: Vec<Runner> = ["a/a", "b/b", "c/c", "d/d"].map(runner_of).into();
+        let q = read_queue(&mut gh, &runners, &mut BTreeMap::new()).unwrap();
+        assert_eq!(
+            met.load(Ordering::SeqCst),
+            8,
+            "all 8 lists were in flight at once"
+        );
+        assert!(q.jobs.is_empty());
+        assert_eq!(q.reads.len(), 4);
+        assert!(q.reads.values().all(|r| r.error.is_none()));
+    }
+
+    /// A repository whose `queued` state holds `total` runs numbered
+    /// 1..=total, oldest first, listed newest first a page at a time, as
+    /// GitHub does. Each run has one queued job, created at its own number.
+    /// Records the paths asked.
+    fn backlog(total: u64, jobs_per_run: u64) -> (Fake, Arc<std::sync::Mutex<Vec<String>>>) {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let fake = Fake(Arc::new(move |cmd| {
+            let p = path(cmd);
+            log.lock().unwrap().push(p.clone());
+            if p.contains("status=queued") {
+                let page: u64 = p
+                    .split("&page=")
+                    .nth(1)
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(1);
+                // The newest first: page 1 holds `total` down to `total-99`.
+                let runs: Vec<String> = (1..=total)
+                    .rev()
+                    .skip(100 * (page as usize - 1))
+                    .take(100)
+                    .map(|id| format!(r#"{{"id":{id},"name":"CI","status":"queued"}}"#))
+                    .collect();
+                return answer(&format!(
+                    r#"{{"total_count":{total},"workflow_runs":[{}]}}"#,
+                    runs.join(",")
+                ));
+            }
+            if let Some(id) = p
+                .split("/runs/")
+                .nth(1)
+                .and_then(|r| r.split('/').next())
+                .and_then(|n| n.parse::<u64>().ok())
+            {
+                let jobs: Vec<String> = (0..jobs_per_run.min(100))
+                    .map(|n| {
+                        format!(
+                            r#"{{"id":{},"run_id":{id},"name":"job {n}","status":"queued","labels":["self-hosted"],"created_at":"2026-11-01T00:{:02}:{:02}Z"}}"#,
+                            id * 1000 + n,
+                            id / 60,
+                            id % 60
+                        )
+                    })
+                    .collect();
+                return answer(&format!(
+                    r#"{{"total_count":{jobs_per_run},"jobs":[{}]}}"#,
+                    jobs.join(",")
+                ));
+            }
+            answer(r#"{"total_count":0,"workflow_runs":[]}"#)
+        }));
+        (fake, asked)
+    }
+
+    fn queue_of(fake: Fake) -> Queue {
+        let mut gh = Client::with_fake(fake);
+        read_queue(&mut gh, &[runner_of("a/a")], &mut BTreeMap::new()).unwrap()
+    }
+
+    #[test]
+    fn a_backlog_reads_the_oldest_runs_too_and_counts_those_between() {
+        let (fake, asked) = backlog(250, 1);
+        let q = queue_of(fake);
+        let asked = asked.lock().unwrap();
+        // The newest 100 from the first page, the oldest 50 from page 3 of 3.
+        assert!(
+            asked
+                .iter()
+                .any(|p| p.ends_with("status=queued&per_page=100"))
+        );
+        assert!(
+            asked
+                .iter()
+                .any(|p| p.ends_with("status=queued&per_page=100&page=3"))
+        );
+        assert!(!asked.iter().any(|p| p.contains("&page=2")), "{asked:?}");
+        assert_eq!(q.jobs.len(), 150);
+        assert_eq!(q.unread["a/a"], 100, "the runs between are not read");
+        // The run that has waited longest is among them: its job is the
+        // oldest created.
+        let oldest = q.jobs.iter().filter_map(|j| j.created_at).min();
+        let first = q.jobs.iter().find(|j| j.run_id == 1).unwrap();
+        assert_eq!(first.created_at, oldest);
+        assert!(q.jobs.iter().any(|j| j.run_id == 250), "and the newest");
+    }
+
+    #[test]
+    fn a_state_that_fits_one_page_is_read_once_and_a_short_last_page_leaves_nothing_unread() {
+        let (fake, asked) = backlog(100, 1);
+        let q = queue_of(fake);
+        assert!(q.unread.is_empty());
+        assert_eq!(q.jobs.len(), 100);
+        assert!(!asked.lock().unwrap().iter().any(|p| p.contains("&page=")));
+        // 103: the last page holds the 3 oldest and nothing is left between.
+        let (fake, asked) = backlog(103, 1);
+        let q = queue_of(fake);
+        assert!(q.unread.is_empty(), "{:?}", q.unread);
+        assert_eq!(q.jobs.len(), 103);
+        assert!(asked.lock().unwrap().iter().any(|p| p.ends_with("&page=2")));
+    }
+
+    #[test]
+    fn the_last_page_is_never_past_what_github_lists() {
+        // A status filter lists at most 1000 runs: page 10 is the last.
+        let (fake, asked) = backlog(1500, 1);
+        let q = queue_of(fake);
+        let asked = asked.lock().unwrap();
+        assert!(asked.iter().any(|p| p.ends_with("&page=10")), "{asked:?}");
+        assert!(!asked.iter().any(|p| p.contains("&page=15")), "{asked:?}");
+        assert_eq!(q.jobs.len(), 200);
+        assert_eq!(q.unread["a/a"], 1300);
+    }
+
+    #[test]
+    fn an_oldest_page_that_fails_leaves_the_first_page_and_counts_the_rest() {
+        let (inner, _) = backlog(250, 1);
+        let fake = Fake(Arc::new(move |cmd| {
+            if path(cmd).contains("&page=3") {
+                return answer("HTTP/2.0 502 Bad Gateway\r\n\r\n{}");
+            }
+            (inner.0)(cmd)
+        }));
+        let q = queue_of(fake);
+        assert_eq!(q.jobs.len(), 100, "the newest page stands");
+        assert_eq!(q.unread["a/a"], 150);
+        assert!(q.reads["a/a"].error.is_none());
+        assert!(q.read_at.is_some());
+    }
+
+    #[test]
+    fn jobs_past_the_first_hundred_of_a_run_are_counted() {
+        let (fake, asked) = backlog(2, 130);
+        let q = queue_of(fake);
+        assert!(
+            asked
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p.ends_with("/runs/1/jobs?per_page=100")),
+            "{:?}",
+            asked.lock().unwrap()
+        );
+        assert_eq!(q.jobs.len(), 200, "100 of each run's 130");
+        assert_eq!(q.jobs_unread["a/a"], 60);
+        // A run whose jobs all fit counts nothing.
+        let (fake, _) = backlog(2, 100);
+        assert!(queue_of(fake).jobs_unread.is_empty());
+    }
+
+    #[test]
+    fn a_failing_list_does_not_misplace_the_answers_of_the_others() {
+        let fake = Fake(Arc::new(move |cmd| {
+            let p = path(cmd);
+            if p.starts_with("repos/a/a/") && p.contains("status=queued") {
+                return answer("HTTP/2.0 404 Not Found\r\n\r\n{\"message\":\"Not Found\"}");
+            }
+            if p.contains("status=queued") && p.starts_with("repos/b/b/") {
+                return answer(
+                    r#"{"total_count":1,"workflow_runs":[{"id":7,"name":"CI","status":"queued"}]}"#,
+                );
+            }
+            if p.contains("/runs/7/jobs") {
+                return answer(
+                    r#"{"total_count":1,"jobs":[{"id":70,"run_id":7,"name":"Unit","status":"queued","labels":["self-hosted"]}]}"#,
+                );
+            }
+            answer(r#"{"total_count":0,"workflow_runs":[]}"#)
+        }));
+        let mut gh = Client::with_fake(fake);
+        let runners = [runner_of("a/a"), runner_of("b/b")];
+        let q = read_queue(&mut gh, &runners, &mut BTreeMap::new()).unwrap();
+        assert_eq!(q.jobs.len(), 1);
+        assert_eq!(q.jobs[0].name, "Unit");
+        assert!(q.reads["a/a"].error.is_some(), "{:?}", q.reads);
+        assert!(q.reads["b/b"].error.is_none(), "{:?}", q.reads);
+    }
 
     fn run(id: u64) -> RunInfo {
         RunInfo {
@@ -423,6 +787,7 @@ mod tests {
         KeptQueue {
             jobs: vec![job(1, "old a"), job(2, "old b")],
             unread: 4,
+            jobs_unread: 0,
             read_at: Some(100),
         }
     }
@@ -432,7 +797,10 @@ mod tests {
         let m = merge_repo(
             &kept(),
             Ok((vec![run(2), run(3)], 0)),
-            vec![Ok(vec![job(2, "new b")]), Ok(vec![job(3, "new c")])],
+            vec![
+                Ok((vec![job(2, "new b")], 0)),
+                Ok((vec![job(3, "new c")], 0)),
+            ],
             200,
         );
         assert_eq!(names(&m), ["new b", "new c"]);
@@ -474,7 +842,7 @@ mod tests {
             Ok((vec![run(1), run(2)], 0)),
             vec![
                 Err(GhError::Failed("gh: HTTP 502".into())),
-                Ok(vec![job(2, "new b")]),
+                Ok((vec![job(2, "new b")], 0)),
             ],
             200,
         );

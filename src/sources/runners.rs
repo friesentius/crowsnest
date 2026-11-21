@@ -352,27 +352,55 @@ fn mtime(p: &Path) -> Option<i64> {
     Some(t.duration_since(UNIX_EPOCH).ok()?.as_secs() as i64)
 }
 
-/// The newest `<prefix>*.log` in `dir`, by its name: the runner names its
-/// logs by their start time, so the newest name is the live log.
-fn newest_log(dir: &Path, prefix: &str) -> Option<PathBuf> {
-    let newest = std::fs::read_dir(dir)
-        .ok()?
+/// The newest listener and worker logs of a runner's `_diag`. The runner
+/// names its logs by their start time, so the newest name is the live log.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DiagLogs {
+    pub runner: Option<PathBuf>,
+    pub worker: Option<PathBuf>,
+}
+
+/// The newest `Runner_*.log` and `Worker_*.log` of `dir`, from one listing:
+/// a busy runner's `_diag` holds thousands of files.
+fn list_diag(dir: &Path) -> DiagLogs {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return DiagLogs::default();
+    };
+    let (mut runner, mut worker): (Option<String>, Option<String>) = (None, None);
+    for name in entries
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.starts_with(prefix) && n.ends_with(".log"))
-        .max()?;
-    Some(dir.join(newest))
+    {
+        let slot = if name.starts_with("Runner_") {
+            &mut runner
+        } else if name.starts_with("Worker_") {
+            &mut worker
+        } else {
+            continue;
+        };
+        if name.ends_with(".log") && slot.as_ref().is_none_or(|n| name > *n) {
+            *slot = Some(name);
+        }
+    }
+    DiagLogs {
+        runner: runner.map(|n| dir.join(n)),
+        worker: worker.map(|n| dir.join(n)),
+    }
 }
 
 /// When the runner last wrote its listener log, its worker log and a
-/// running step's output (`_diag/pages`). Only file times are read.
-pub fn read_diag(r: &mut Runner) {
+/// running step's output (`_diag/pages`). Only file times are read. Returns
+/// the logs found, for [`LogTails::read`] to follow in the same turn: `_diag`
+/// is listed once per turn, not once per question.
+pub fn read_diag(r: &mut Runner) -> DiagLogs {
     let diag = r.dir.join("_diag");
-    r.runner_log_at = newest_log(&diag, "Runner_").and_then(|p| mtime(&p));
-    r.worker_log_at = newest_log(&diag, "Worker_").and_then(|p| mtime(&p));
+    let logs = list_diag(&diag);
+    r.runner_log_at = logs.runner.as_deref().and_then(mtime);
+    r.worker_log_at = logs.worker.as_deref().and_then(mtime);
     r.step_output_at = std::fs::read_dir(diag.join("pages"))
         .ok()
         .and_then(|d| d.flatten().filter_map(|e| mtime(&e.path())).max());
+    logs
 }
 
 /// The size of one block read when a log is first looked at, and the most
@@ -490,8 +518,26 @@ pub fn parse_worker_tail(text: &str) -> LogTail {
 /// nothing.
 fn console(msg: &str, kind: &str) -> Option<String> {
     let m = msg.strip_prefix(kind)?;
-    let m = m.split_once("Z:").map_or(m, |(_, m)| m).trim();
+    // Only the listener's own time stamp is dropped: a "Z:" further in is
+    // part of the message.
+    let m = match m.split_once("Z:") {
+        Some((stamp, rest)) if is_stamp(stamp) => rest,
+        _ => m,
+    }
+    .trim();
     (!m.is_empty()).then(|| m.to_string())
+}
+
+/// Whether `s` is a time stamp as the listener writes it before its message,
+/// `2026-11-20 18:28:06` (the `Z:` that follows is cut off by the caller).
+fn is_stamp(s: &str) -> bool {
+    s.len() == 19
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b' ',
+            13 | 16 => b == b':',
+            _ => b.is_ascii_digit(),
+        })
 }
 
 /// A console error without the listener's own framing, which only repeats
@@ -540,7 +586,6 @@ fn note_failure(t: &mut LogTail, at: i64) {
     if t.failure_at
         .is_some_and(|f| at - f > crate::model::FAILURE_LIVE_SECS)
     {
-        t.errors = 0;
         t.error_since = None;
         t.error = None;
         t.failure_since = None;
@@ -561,14 +606,12 @@ pub fn fold_runner(t: &mut LogTail, text: &str) {
                     continue;
                 }
                 t.state = Some((at, m));
-                t.errors = 0;
                 t.error_since = None;
                 t.error = None;
                 t.failure_since = None;
                 t.failure_at = None;
             } else if let Some(m) = console(msg, "WRITE ERROR: ") {
                 note_failure(t, at);
-                t.errors += 1;
                 t.error_since.get_or_insert(at);
                 t.error = Some((at, console_error_text(&m)));
             }
@@ -607,12 +650,13 @@ pub struct LogTails {
 }
 
 impl LogTails {
-    pub fn read(&mut self, r: &mut Runner) {
-        let diag = r.dir.join("_diag");
-        r.worker_tail = self.tail(newest_log(&diag, "Worker_"), fold_worker, |text| {
+    /// Follow the logs `logs` that this turn's listing of `r`'s `_diag`
+    /// found (see [`read_diag`]).
+    pub fn read(&mut self, r: &mut Runner, logs: &DiagLogs) {
+        r.worker_tail = self.tail(logs.worker.clone(), fold_worker, |text| {
             text.contains(STEP_LINE)
         });
-        r.runner_tail = self.tail(newest_log(&diag, "Runner_"), fold_runner, has_console_state);
+        r.runner_tail = self.tail(logs.runner.clone(), fold_runner, has_console_state);
     }
 
     /// `fold` sums up the lines of the log at `path`; `enough` says whether
@@ -1359,8 +1403,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_diag_directory_is_listed_once_and_the_newest_of_each_kind_found() {
+        let dir = std::env::temp_dir().join(format!("crowsnest-diag-once-{}", std::process::id()));
+        let diag = dir.join("_diag");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&diag).unwrap();
+        let line = "[2026-11-19 14:18:42Z INFO StepsRunner] hello\n";
+        for f in [
+            "Runner_20261119-090000-utc.log",
+            "Runner_20261119-141834-utc.log",
+            "Runner_20261119-141834-utc.log.1",
+            "Worker_20261119-090000-utc.log",
+            "Worker_20261119-100000-utc.log",
+            "Other_20261120-000000-utc.log",
+            "Worker_notes.txt",
+        ] {
+            std::fs::write(diag.join(f), line).unwrap();
+        }
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let logs = read_diag(&mut r);
+        assert_eq!(
+            logs,
+            DiagLogs {
+                runner: Some(diag.join("Runner_20261119-141834-utc.log")),
+                worker: Some(diag.join("Worker_20261119-100000-utc.log")),
+            }
+        );
+        // The tails follow what that one listing found: a newer log that
+        // appears afterwards waits for the next turn's listing.
+        std::fs::write(diag.join("Worker_20261119-150000-utc.log"), "").unwrap();
+        let mut tails = LogTails::default();
+        tails.read(&mut r, &logs);
+        assert!(r.worker_tail.as_ref().is_some_and(|t| t.last.is_some()));
+        assert_eq!(
+            read_diag(&mut r).worker,
+            Some(diag.join("Worker_20261119-150000-utc.log"))
+        );
+        // No `_diag` at all finds no logs.
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(read_diag(&mut r), DiagLogs::default());
+    }
+
     fn at(s: &str) -> i64 {
         crate::timefmt::parse_iso(s).unwrap()
+    }
+
+    /// Follow `r`'s logs as the collector does: list `_diag`, then read.
+    fn read_tails(tails: &mut LogTails, r: &mut Runner) {
+        let logs = list_diag(&r.dir.join("_diag"));
+        tails.read(r, &logs);
     }
 
     #[test]
@@ -1410,7 +1505,6 @@ mod tests {
         // the second console error, 20 minutes after the first one's
         // failing lines, is a new outage. A routine back-off is not an
         // error.
-        assert_eq!(t.errors, 1);
         assert_eq!(t.error_since, Some(at("2026-11-19T13:46:12Z")));
         assert_eq!(
             t.error,
@@ -1424,16 +1518,36 @@ mod tests {
             "{text}[2026-11-19 13:50:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:50:00Z: Runner reconnected.\n"
         ));
         assert_eq!(back.state.as_ref().unwrap().1, "Runner reconnected.");
-        assert_eq!(
-            (back.errors, back.error_since, back.error.clone()),
-            (0, None, None)
-        );
+        assert_eq!((back.error_since, back.error.clone()), (None, None));
         assert_eq!(back.trouble(at("2026-11-19T13:50:01Z")), None);
         // Blank console lines between errors change nothing.
         let blank = parse_runner_tail(&format!(
             "{text}[2026-11-19 13:47:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:47:00Z: \n"
         ));
-        assert_eq!(blank.errors, 1);
+        assert_eq!(blank.error_since, t.error_since);
+        assert_eq!(blank.error, t.error);
+    }
+
+    #[test]
+    fn only_the_listeners_time_stamp_is_cut_from_a_console_line() {
+        let line = |m: &str| console(m, "WRITE LINE: ");
+        assert_eq!(
+            line("WRITE LINE: 2026-11-20 18:28:06Z: Running job: Lint").as_deref(),
+            Some("Running job: Lint")
+        );
+        // A "Z:" in the message is the message, with or without a stamp.
+        assert_eq!(
+            line("WRITE LINE: 2026-11-20 18:28:06Z: Copy to Z: drive done").as_deref(),
+            Some("Copy to Z: drive done")
+        );
+        assert_eq!(
+            line("WRITE LINE: Waiting for Z: to mount").as_deref(),
+            Some("Waiting for Z: to mount")
+        );
+        // Blank and unrelated lines say nothing.
+        assert_eq!(line("WRITE LINE: 2026-11-20 18:28:06Z: "), None);
+        assert_eq!(line("WRITE LINE: "), None);
+        assert_eq!(line("WRITE ERROR: oops"), None);
     }
 
     #[test]
@@ -1566,9 +1680,9 @@ mod tests {
         };
         let mut tails = LogTails::default();
         let last = at("2026-10-29T06:27:18Z");
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         assert!(r.runner_tail.as_ref().unwrap().trouble(last + 60).is_some());
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         let again = r.runner_tail.as_ref().unwrap();
         assert!(again.trouble(last + 4 * 60).is_some());
         assert_eq!(again.trouble(last + 12 * 60), None);
@@ -1619,7 +1733,7 @@ mod tests {
             ..Default::default()
         };
         let mut tails = LogTails::default();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         expect(r.runner_tail.as_ref().unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
         // Followed as it grows, a block at a time.
@@ -1633,14 +1747,14 @@ mod tests {
         };
         let mut tails = LogTails::default();
         std::fs::write(&path, until(OUTAGE, "06:26:55")).unwrap();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         for n in 1..=16 {
             let mut f = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&path)
                 .unwrap();
             std::io::Write::write_all(&mut f, one(n).as_bytes()).unwrap();
-            tails.read(&mut r);
+            read_tails(&mut tails, &mut r);
         }
         expect(r.runner_tail.as_ref().unwrap());
         assert_eq!(
@@ -1660,7 +1774,7 @@ mod tests {
         let now = at("2026-10-29T09:15:03Z");
         // One failed attempt is routine, and the old error is not shown.
         assert_eq!(t.trouble(now), None);
-        assert_eq!((t.error_since, t.errors), (None, 0));
+        assert_eq!(t.error_since, None);
         assert_eq!(t.failure_since, Some(now - 1));
         // A second failed attempt half a minute later is still routine: the
         // third may work.
@@ -1786,7 +1900,6 @@ mod tests {
 [2026-10-03 21:10:26Z ERR  Terminal] WRITE ERROR: A session for this runner already exists.
 ";
         let t = parse_runner_tail(log);
-        assert_eq!(t.errors, 3);
         assert_eq!(t.error_since, Some(at("2026-10-03T21:09:55Z")));
         assert_eq!(
             t.error.as_ref().unwrap().1,
@@ -1824,7 +1937,7 @@ mod tests {
             at("2026-11-18T17:06:15Z"),
             "Run actions/setup-node@v7".to_string(),
         ));
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         let t = r.worker_tail.clone().unwrap();
         assert_eq!(t.step, step);
         assert!(t.process_running);
@@ -1836,7 +1949,7 @@ mod tests {
                 .open(&path)
                 .unwrap();
             std::io::Write::write_all(&mut f, kib.as_bytes()).unwrap();
-            tails.read(&mut r);
+            read_tails(&mut tails, &mut r);
         }
         let t = r.worker_tail.clone().unwrap();
         assert_eq!(t.step, step, "the step line is kept");
@@ -1849,7 +1962,7 @@ mod tests {
             ..Default::default()
         };
         assert!(std::fs::metadata(&path).unwrap().len() > 3 * TAIL_BYTES);
-        fresh.read(&mut r2);
+        read_tails(&mut fresh, &mut r2);
         assert_eq!(r2.worker_tail, r.worker_tail);
         // A log that grew by more than a block between two reads.
         let mut grown = LogTails::default();
@@ -1858,13 +1971,13 @@ mod tests {
             ..Default::default()
         };
         std::fs::write(&path, WORKER_STEP).unwrap();
-        grown.read(&mut r3);
+        read_tails(&mut grown, &mut r3);
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut f, WORKER_PAD.repeat(1500).as_bytes()).unwrap();
-        grown.read(&mut r3);
+        read_tails(&mut grown, &mut r3);
         assert_eq!(r3.worker_tail.as_ref().unwrap().step, step);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1882,7 +1995,7 @@ mod tests {
             dir: dir.clone(),
             ..Default::default()
         };
-        LogTails::default().read(&mut r);
+        read_tails(&mut LogTails::default(), &mut r);
         let t = r.worker_tail.unwrap();
         assert_eq!(t.step, None, "further back than the search goes");
         assert!(t.last.is_some());
@@ -1903,14 +2016,14 @@ mod tests {
             ..Default::default()
         };
         let mut tails = LogTails::default();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         assert_eq!(r.worker_tail.as_ref().unwrap().step, None);
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&path)
             .unwrap();
         std::io::Write::write_all(&mut f, rest.as_bytes()).unwrap();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         let step = r.worker_tail.take().unwrap().step.unwrap().1;
         assert_eq!(step, "Run [31mtests", "escape removed");
         // A log replaced by a shorter one is looked at afresh.
@@ -1919,7 +2032,7 @@ mod tests {
             "[2026-11-18 17:30:00Z INFO StepsRunner] Processing step: DisplayName='Test'\n",
         )
         .unwrap();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         assert_eq!(
             r.worker_tail.as_ref().unwrap().step.as_ref().unwrap().1,
             "Test"
@@ -1970,7 +2083,7 @@ mod tests {
             ..Default::default()
         };
         let mut tails = LogTails::default();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         assert_eq!(
             r.worker_tail.as_ref().unwrap().step.as_ref().unwrap().1,
             "Build"
@@ -1982,7 +2095,7 @@ mod tests {
             "[2026-11-19 10:00:01Z INFO StepsRunner] Processing step: DisplayName='Test'\n",
         )
         .unwrap();
-        tails.read(&mut r);
+        read_tails(&mut tails, &mut r);
         assert_eq!(
             r.worker_tail.as_ref().unwrap().step.as_ref().unwrap().1,
             "Test"

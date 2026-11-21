@@ -2,7 +2,7 @@
 source: tests/render.rs
 expression: "draw(&s, &app_for(&s), 180, 50).backend()"
 ---
-"╭ ¹crowsnest firstmate @ deckhand ──────────────────────────────────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮╭ ²RUNNERS ✗ 1 stalled ───────────────── queue 1 ╮"
+"╭ ¹crowsnest firstmate @ deckhand ──────────────────────────────────────────────────── 14:27:06 ↻ read 40s ago · changed 47s ago ╮╭ ²RUNNERS ✗ 1 down ──────────────────── queue 1 ╮"
 "│  ? 1 asking you    ◐ 3 working   ✓ 0 done   ○ 2 idle   ⚑ 8 held calls (oldest 8d)                                              ││ ◐ pantry    ✓ moving · online        ↺2  q1 6m │"
 "├────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤│   ◐ Unit + e2e tests #122   8m ━━──────── ~40m │"
 "│   STATE      TASK                             PROJECT        PIPELINE  STEP            PR · CI          AGE   KIND             ││     step 4/9 setup-node 8m · out 1s ago        │"

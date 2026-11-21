@@ -6,7 +6,9 @@
 //! the jobs of runs not seen before.
 
 use crate::model::{DoneJob, Job, RepoHistory, RunInfo, Typical};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 /// Completed runs listed per read.
 pub const LIST_RUNS: usize = 10;
@@ -16,7 +18,7 @@ pub const SAMPLES: usize = 10;
 const KEEP_RUNS: usize = 60;
 
 /// One finished run and its jobs.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CachedRun {
     pub run: RunInfo,
     pub jobs: Vec<Job>,
@@ -26,9 +28,103 @@ pub struct CachedRun {
 #[derive(Debug, Clone, Default)]
 pub struct RepoCache {
     runs: BTreeMap<(u64, u32), CachedRun>,
+    /// Runs created before this may be missing: crowsnest was not looking
+    /// while they finished. Runs from then on are all here.
+    floor: Option<i64>,
+    /// Changed since it was loaded or last saved.
+    dirty: bool,
+}
+
+/// What a cache file holds. A file of another `version` is not read.
+#[derive(Serialize, Deserialize)]
+struct CacheFile {
+    version: u32,
+    #[serde(default)]
+    floor: Option<i64>,
+    runs: Vec<CachedRun>,
+}
+
+/// The format of the cache file; raise it when what is stored changes.
+const FILE_VERSION: u32 = 1;
+
+/// The file that keeps `repo`'s finished runs in `dir`, or `None` for a name
+/// that is not a GitHub `owner/repo`. `+` cannot be in either part, so two
+/// repositories never share a file.
+pub fn cache_file(dir: &Path, repo: &str) -> Option<PathBuf> {
+    let (owner, name) = repo.split_once('/')?;
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    (ok(owner) && ok(name)).then(|| dir.join(format!("{owner}+{name}.json")))
 }
 
 impl RepoCache {
+    /// The runs kept in `path`, or an empty cache when there is no file, it
+    /// cannot be read or understood, or it is of another version: the runs
+    /// are then read again, which is all a missing cache costs.
+    pub fn load(path: &Path) -> RepoCache {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return RepoCache::default();
+        };
+        match serde_json::from_str::<CacheFile>(&text) {
+            Ok(f) if f.version == FILE_VERSION => {
+                let mut c = RepoCache {
+                    floor: f.floor,
+                    ..Default::default()
+                };
+                for r in f.runs {
+                    c.insert(r.run, r.jobs);
+                }
+                c.dirty = false;
+                c
+            }
+            _ => RepoCache::default(),
+        }
+    }
+
+    /// Write the runs to `path` when they changed since the last load or
+    /// save: to a temporary file first, so a crash never leaves half a file.
+    pub fn save(&mut self, path: &Path) -> std::io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = CacheFile {
+            version: FILE_VERSION,
+            floor: self.floor,
+            runs: self.runs.values().cloned().collect(),
+        };
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(&file).map_err(std::io::Error::other)?,
+        )?;
+        std::fs::rename(&tmp, path)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Note that the latest listing of finished runs shares none with the
+    /// cache, so runs that finished in between were never read: only what
+    /// was created since the oldest listed run is known to be complete.
+    pub fn gap_before(&mut self, listed: &[RunInfo]) {
+        if self.runs.is_empty() || listed.iter().any(|r| self.has(r)) {
+            return;
+        }
+        if let Some(since) = listed.iter().filter_map(|r| r.created_at).min()
+            && self.floor.is_none_or(|f| f < since)
+        {
+            self.floor = Some(since);
+            self.dirty = true;
+        }
+    }
+
     pub fn has(&self, run: &RunInfo) -> bool {
         self.runs.contains_key(&(run.id, run.attempt))
     }
@@ -45,6 +141,7 @@ impl RepoCache {
     pub fn insert(&mut self, run: RunInfo, jobs: Vec<Job>) {
         self.runs
             .insert((run.id, run.attempt), CachedRun { run, jobs });
+        self.dirty = true;
         while self.runs.len() > KEEP_RUNS {
             self.runs.pop_first();
         }
@@ -53,7 +150,8 @@ impl RepoCache {
     /// The history these runs make, plus the jobs that already finished in
     /// runs still in progress (`live`).
     pub fn summary(&self, live: &[Job]) -> RepoHistory {
-        let covered_since = self.runs.values().filter_map(|r| r.run.created_at).min();
+        let oldest = self.runs.values().filter_map(|r| r.run.created_at).min();
+        let covered_since = oldest.into_iter().chain(self.floor).max();
         let mut jobs: Vec<&Job> = self.runs.values().flat_map(|r| r.jobs.iter()).collect();
         for j in live {
             if !jobs.iter().any(|c| c.id == j.id) {
@@ -245,5 +343,114 @@ mod tests {
             c.insert(r, Vec::new());
         }
         assert_eq!(c.len(), KEEP_RUNS);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("crowsnest-history-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    #[test]
+    fn a_saved_cache_is_read_back_whole_and_written_only_when_it_changed() {
+        let dir = scratch("roundtrip");
+        let file = cache_file(&dir, "acme/pantry").unwrap();
+        let mut c = cache();
+        c.save(&file).unwrap();
+        let back = RepoCache::load(&file);
+        assert_eq!(back.len(), 4);
+        let (a, b) = (c.summary(&[]), back.summary(&[]));
+        assert_eq!(a.jobs.len(), b.jobs.len());
+        assert_eq!(a.typical, b.typical);
+        assert_eq!(a.covered_since, b.covered_since);
+        assert_eq!(
+            a.jobs
+                .iter()
+                .map(|j| (&j.name, j.started_at))
+                .collect::<Vec<_>>(),
+            b.jobs
+                .iter()
+                .map(|j| (&j.name, j.started_at))
+                .collect::<Vec<_>>()
+        );
+        // Unchanged since the last save: nothing is written.
+        std::fs::remove_file(&file).unwrap();
+        c.save(&file).unwrap();
+        assert!(!file.exists());
+        // A loaded cache has nothing to write either.
+        let mut loaded = RepoCache::load(&dir.join("none.json"));
+        loaded.save(&file).unwrap();
+        assert!(!file.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_missing_damaged_or_foreign_file_is_an_empty_cache() {
+        let dir = scratch("damaged");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a+b.json");
+        assert!(RepoCache::load(&file).is_empty());
+        std::fs::write(&file, "{ not json").unwrap();
+        assert!(RepoCache::load(&file).is_empty());
+        std::fs::write(&file, r#"{"version":999,"runs":[]}"#).unwrap();
+        assert!(RepoCache::load(&file).is_empty());
+        // The right version with a run that lacks fields still loads.
+        std::fs::write(
+            &file,
+            r#"{"version":1,"runs":[{"run":{"id":5},"jobs":[]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(RepoCache::load(&file).len(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_repository_name_is_a_safe_file_name_or_none() {
+        let d = Path::new("/c");
+        assert_eq!(
+            cache_file(d, "acme/pantry"),
+            Some(PathBuf::from("/c/acme+pantry.json"))
+        );
+        assert_ne!(cache_file(d, "a-b/c"), cache_file(d, "a/b-c"));
+        for bad in ["", "acme", "a/b/c", "../x", "a/..", "a/b c", "/b", "a/"] {
+            assert_eq!(cache_file(d, bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn runs_missed_while_crowsnest_was_off_do_not_count_as_covered() {
+        let mut c = cache();
+        let all = gh::parse_runs(&fixture("gh-runs-completed.json")).unwrap();
+        assert_eq!(
+            c.summary(&[]).covered_since,
+            crate::timefmt::parse_iso("2026-11-19T09:02:10Z")
+        );
+        // A listing that overlaps the cache leaves nothing in doubt.
+        c.gap_before(&all[..2]);
+        assert_eq!(
+            c.summary(&[]).covered_since,
+            crate::timefmt::parse_iso("2026-11-19T09:02:10Z")
+        );
+        // Ten newer runs, none cached: what finished in between is unknown.
+        let newer: Vec<RunInfo> = (0..3)
+            .map(|i| RunInfo {
+                id: 90 + i,
+                attempt: 1,
+                created_at: crate::timefmt::parse_iso("2026-11-20T08:00:00Z").map(|t| t + i as i64),
+                ..Default::default()
+            })
+            .collect();
+        c.gap_before(&newer);
+        let since = crate::timefmt::parse_iso("2026-11-20T08:00:00Z");
+        assert_eq!(c.summary(&[]).covered_since, since);
+        // The older jobs are still history, only the claim of coverage moved.
+        assert_eq!(c.summary(&[]).jobs.len(), 16);
+        // It survives a save and a load.
+        let dir = scratch("gap");
+        let file = dir.join("x+y.json");
+        c.save(&file).unwrap();
+        assert_eq!(RepoCache::load(&file).summary(&[]).covered_since, since);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

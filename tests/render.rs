@@ -1047,7 +1047,10 @@ fn offline_and_slow_runners_are_called_out() {
     utc();
     let s = fleet_of_runners();
     let text = draw_light(&s, &app_for(&s), 180, 50);
-    assert!(text.contains("RUNNERS \u{2717} 1 stalled"), "{text}");
+    // A runner that is down is called down, not stalled; a stalled one
+    // (see `runner_stalled_180`) still is stalled.
+    assert!(text.contains("RUNNERS \u{2717} 1 down"), "{text}");
+    assert!(!text.contains("1 stalled"), "{text}");
     let down = lines_with(&text, "millwork")[0];
     assert!(
         down.contains("\u{2717} millwork") && down.contains("DOWN \u{b7} offline"),
@@ -2098,7 +2101,6 @@ fn rate_limited() -> Snapshot {
         reset_at: now + 21 * 60,
         read_at: Some(now - 4 * 60),
         paused_until: Some(now + 21 * 60),
-        paused_at: Some(now - 4 * 60),
     };
     s.jobs_read_at = Some(now - 4 * 60 - 25);
     s
@@ -2257,9 +2259,30 @@ fn runs_past_one_page_are_disclosed() {
     let detail = draw_light(&s, &app, 180, 44);
     assert!(
         detail.contains(
-            "+3 more active runs not read: only the 100 newest queued and 100 newest running are"
+            "+3 more active runs not read: of the queued runs and of the running runs, only the 100 newest and the 100 oldest are read"
         ),
         "{detail}"
+    );
+    // Jobs past a run's first page are counted the same way, and the
+    // sentence is whole at a narrow width too.
+    s.gh_budget.jobs_unread.insert("acme/pantry".into(), 1);
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(wide.contains("+3 runs, 1 job unread"), "{wide}");
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let narrow = draw_light(&s, &app, 100, 44);
+    let flat = narrow
+        .replace(['\u{2502}', '"'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("only the 100 newest and the 100 oldest are read"),
+        "{narrow}"
+    );
+    assert!(
+        flat.contains("+1 more job not read: only the first 100 jobs of a run are read"),
+        "{narrow}"
     );
 }
 
@@ -2288,7 +2311,6 @@ fn with_log_tails() -> Snapshot {
             "millwork-runner" => {
                 r.runner_tail = Some(LogTail {
                     state: Some((now - 2 * 3600, "Listening for Jobs".into())),
-                    errors: 6,
                     error_since: Some(now - 61 * 60),
                     error: Some((now - 41 * 60, "Error: Conflict.".into())),
                     failure_since: Some(now - 61 * 60),
@@ -2316,7 +2338,7 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
         "{text}"
     );
     assert!(
-        text.contains("runner log 32s ago: Running job: Unit + e2e tests"),
+        text.contains("Running job: Unit + e2e tests since 14:18 \u{b7} log 32s ago"),
         "{text}"
     );
     let mut app = app_for(&s);
@@ -2342,6 +2364,37 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
     let mut app = app_for(&old);
     open_runner(&old, &mut app, "pantry-local-runner");
     assert!(!draw_light(&old, &app, 100, 34).contains("worker log: step"));
+}
+
+#[test]
+fn a_console_event_line_is_stamped_at_its_time_not_since() {
+    utc();
+    let mut s = with_log_tails();
+    let now = s.now;
+    for (line, shown) in [
+        (
+            "Job Unit completed with result: Succeeded",
+            "Job Unit completed with result: Succeeded at 12:27 \u{b7} log 41m ago",
+        ),
+        (
+            "Runner reconnected.",
+            "Runner reconnected at 12:27 \u{b7} log 41m ago",
+        ),
+    ] {
+        for r in &mut s.runners {
+            if r.name == "millwork-runner" {
+                let t = r.runner_tail.as_mut().unwrap();
+                t.state = Some((now - 2 * 3600, line.into()));
+                t.failure_at = Some(now - 6 * 60);
+            }
+        }
+        let mut app = app_for(&s);
+        open_runner(&s, &mut app, "millwork-runner");
+        let text = draw_light(&s, &app, 100, 40);
+        assert!(text.contains(shown), "{text}");
+        assert!(!text.contains(" since 12:27"), "{text}");
+        assert!(!text.contains("reconnected. "), "{text}");
+    }
 }
 
 #[test]
@@ -2382,10 +2435,13 @@ fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
     let mut app = app_for(&s);
     open_runner(&s, &mut app, "millwork-runner");
     let text = draw_light(&s, &app, 100, 40);
+    // The listener's last line is hours old: its own time is given, and the
+    // log file's age is a separate thing.
     assert!(
-        text.contains("runner log 41m ago: Listening for Jobs"),
+        text.contains("Listening for Jobs since 12:27 \u{b7} log 41m ago"),
         "{text}"
     );
+    assert!(!text.contains("log 41m ago: Listening"), "{text}");
     assert!(!text.contains("console error"), "{text}");
     assert!(!draw_light(&s, &app_for(&s), 180, 50).contains("console error"));
     assert!(!draw_light(&s, &app_for(&s), 100, 34).contains("log: console error"));
@@ -2394,7 +2450,6 @@ fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
         if r.name == "millwork-runner" {
             let t = r.runner_tail.as_mut().unwrap();
             t.state = None;
-            t.errors = 0;
             t.error = None;
             t.error_since = None;
             t.failure_since = Some(now - 4 * 60);
@@ -2521,4 +2576,100 @@ fn options_menu_refresh_has_the_github_cadence() {
     assert!(text.contains("GitHub every"), "{text}");
     assert!(text.contains("60 s"), "{text}");
     insta::assert_snapshot!(draw(&s, &app, 100, 40).backend());
+}
+
+/// The fleet with bookshop's runner idle for 3 hours after its last job, and
+/// systemd having restarted its unit `restarts` times.
+fn idle_after_a_run(restarts: u32) -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.history
+        .get_mut("acme/bookshop")
+        .unwrap()
+        .jobs
+        .push(crowsnest::model::DoneJob {
+            runner: "bookshop-runner".into(),
+            workflow: "CI".into(),
+            name: "Unit".into(),
+            label: "#7".into(),
+            conclusion: "success".into(),
+            created_at: Some(now - 3 * 3600 - 600),
+            started_at: Some(now - 3 * 3600 - 300),
+            completed_at: Some(now - 3 * 3600),
+        });
+    for r in &mut s.runners {
+        if r.name == "bookshop-runner" {
+            r.service = Some(Service {
+                active: "active".into(),
+                restarts: Some(restarts),
+                ..Default::default()
+            });
+        }
+    }
+    s
+}
+
+#[test]
+fn the_restart_count_drops_the_ran_age_whole_instead_of_cutting_it() {
+    utc();
+    let lane = |text: &str| -> String {
+        lines_with(text, "bookshop")
+            .into_iter()
+            .find(|l| l.contains("idle"))
+            .map(|l| l[l.find("bookshop").unwrap()..].to_string())
+            .unwrap_or_else(|| panic!("no idle bookshop lane in\n{text}"))
+    };
+    // With room, the age and the count are both there.
+    let s = idle_after_a_run(1);
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(lane(&wide).contains("ran  3h ago"), "{}", lane(&wide));
+    assert!(lane(&wide).contains("\u{21ba}1"), "{}", lane(&wide));
+    // With little room, a count that long takes it and the age goes whole.
+    for restarts in [265, 4169] {
+        let s = idle_after_a_run(restarts);
+        for (w, h) in [(100, 34), (180, 50)] {
+            let text = draw_light(&s, &app_for(&s), w, h);
+            let l = lane(&text);
+            assert!(l.contains(&format!("{restarts}")), "{w}: {l}");
+            // Whole, or not there at all: never `ran 3\u{2026}` or `ra\u{2026}`.
+            let cut = l.contains('\u{2026}');
+            let whole = l.contains("ran  3h");
+            assert!(!cut && (whole || !l.contains("ran")), "{w}: {l}");
+        }
+    }
+}
+
+#[test]
+fn the_restart_count_drops_the_elapsed_time_of_a_busy_lane_whole_too() {
+    utc();
+    let mut s = fleet_of_runners();
+    for r in &mut s.runners {
+        if r.name == "pantry-local-runner" {
+            r.service.as_mut().unwrap().restarts = Some(4169);
+        }
+    }
+    let lane = |text: &str| -> String {
+        lines_with(text, "pantry ")
+            .into_iter()
+            .find(|l| l.contains("moving"))
+            .map(|l| {
+                l[l.find("pantry ").unwrap()..]
+                    .split("\u{2502}\u{2502}")
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap_or_else(|| panic!("no busy pantry lane in\n{text}"))
+    };
+    let text = draw_light(&s, &app_for(&s), 100, 34);
+    let l = lane(&text);
+    assert!(l.contains("\u{21ba}4169"), "{l}");
+    // The verdict and the count are whole; the time that did not fit is gone.
+    assert!(l.contains("moving") && !l.contains('\u{2026}'), "{l}");
+    assert!(!l.contains("8m/40m"), "{l}");
+    // With room it is there.
+    s.runners
+        .iter_mut()
+        .for_each(|r| r.service.as_mut().map_or((), |sv| sv.restarts = Some(2)));
+    assert!(lane(&draw_light(&s, &app_for(&s), 100, 34)).contains("8m/40m"));
 }
