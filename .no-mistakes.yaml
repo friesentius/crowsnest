@@ -1,0 +1,10 @@
+# Per-repo no-mistakes overrides.
+#
+# Feature and fix PRs land on `dev`; a release is a `dev` -> `main` PR.
+# Without this the gate falls back to the default branch, `main`.
+pr:
+  base_branch: dev
+
+commands:
+  lint: cargo fmt --check && cargo clippy --all-targets --locked -- -D warnings
+  test: cargo test --locked

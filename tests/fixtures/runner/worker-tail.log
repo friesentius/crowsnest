@@ -1,0 +1,14 @@
+[2026-11-19 14:18:40Z INFO StepsRunner] Processing step: DisplayName='Run actions/checkout@v4'
+[2026-11-19 14:18:40Z INFO StepsRunner] Starting the step.
+[2026-11-19 14:18:40Z INFO ProcessInvokerWrapper] Starting process:
+[2026-11-19 14:18:40Z INFO ProcessInvokerWrapper]   File name: '/srv/actions-runner-pantry/externals/node20/bin/node'
+[2026-11-19 14:18:41Z INFO ProcessInvokerWrapper] Finished process 4127 with exit code 0, and elapsed time 00:00:01.2980397.
+[2026-11-19 14:18:41Z INFO StepsRunner] Step result: 
+[2026-11-19 14:18:42Z INFO StepsRunner] Processing step: DisplayName='Run actions/setup-node@v4'
+[2026-11-19 14:18:42Z INFO StepsRunner] Starting the step.
+[2026-11-19 14:18:42Z INFO ProcessInvokerWrapper] Starting process:
+[2026-11-19 14:18:42Z INFO ProcessInvokerWrapper]   File name: '/srv/actions-runner-pantry/externals/node20/bin/node'
+[2026-11-19 14:18:42Z INFO ProcessInvokerWrapper]   Require exit code zero: 'False'
+[2026-11-19 14:19:13Z ERR  GitHubActionsService] GET request to wss://broker.actions.githubusercontent.com/_ws/ping.sock failed. HTTP Status: SwitchingProtocols
+   at System.Net.Http.HttpConnection.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+[2026-11-19 14:27:02Z INFO JobServerQueue] Try to upload 2 log files or attachments, success rate: 2/2.

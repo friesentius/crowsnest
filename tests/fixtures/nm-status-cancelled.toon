@@ -1,0 +1,27 @@
+run:
+  id: "01M7RZTBT6Z9NRSVC80E70PJH6"
+  branch: fm/pantry-cook-last-slide-design
+  status: cancelled
+  head: f2f753bf
+  head_sha: f2f753bf04217eb7ea359a18db94f4608ca6f6c8
+  verification_plan:
+    path: /home/captain/.no-mistakes/run-inputs/01M7RZTBT6Z9NRSVC80E70PJH6/verification-plan.txt
+    sha256: 1cf294bf5b259fa6f6b42b4666802ae393d86afa0378979ac53261bf647e4c93
+    source_path: /home/captain/firstmate/data/pantry-cook-last-slide-design/nm-verification-plan.txt
+    captured_at: 1795061264
+  pr: "https://github.com/acme/pantry/pull/120"
+  findings: 1 awaiting
+  steps[9]{step,status,findings,duration_ms}:
+    intent,completed,0,109
+    rebase,completed,0,1264
+    review,completed,1,209873
+    test,completed,0,658648
+    document,completed,0,32904
+    lint,completed,0,635
+    push,completed,0,3759
+    pr,completed,0,25921
+    ci,failed,0,4305889
+  shared_work[1]{attributed_to,scope,duration_ms}:
+    document,document+lint housekeeping,32904
+outcome: cancelled
+error: "cancelled: aborted by user"

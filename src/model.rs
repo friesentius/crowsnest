@@ -1,0 +1,1292 @@
+//! Crowsnest's own view of the fleet. Sources fill these types; the UI only
+//! reads them, so a different collector can replace the sources without
+//! touching the UI.
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+/// What a row needs from the reader, most urgent first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    /// The worker has an open decision for the captain.
+    Captain,
+    Blocked,
+    Failed,
+    /// Working or paused with no sign of life past the stale threshold.
+    Stale,
+    /// The worker's no-mistakes run is parked at a gate.
+    Gate,
+    Working,
+    Paused,
+    Done,
+    Unknown,
+    Idle,
+}
+
+impl WorkerState {
+    pub fn word(self) -> &'static str {
+        match self {
+            WorkerState::Captain => "CAPTAIN",
+            WorkerState::Blocked => "BLOCKED",
+            WorkerState::Failed => "FAILED",
+            WorkerState::Stale => "STALE",
+            WorkerState::Gate => "GATE",
+            WorkerState::Working => "WORKING",
+            WorkerState::Paused => "PAUSED",
+            WorkerState::Done => "DONE",
+            WorkerState::Unknown => "UNKNOWN",
+            WorkerState::Idle => "IDLE",
+        }
+    }
+
+    /// Rows that need nobody: hidden by the "active" filter.
+    pub fn is_quiet(self) -> bool {
+        matches!(
+            self,
+            WorkerState::Done | WorkerState::Idle | WorkerState::Unknown
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LastEvent {
+    pub state: String,
+    pub note: String,
+    /// Age when the fleet snapshot was taken.
+    pub age_secs: Option<i64>,
+    /// Unix time of the event, when the snapshot's own time is known. The
+    /// age on screen is measured from this, so it keeps counting between
+    /// snapshots instead of freezing at the last read.
+    pub at: Option<i64>,
+}
+
+impl LastEvent {
+    /// Seconds since the event, as of `now`.
+    pub fn age(&self, now: i64) -> Option<i64> {
+        match self.at {
+            Some(at) => Some((now - at).max(0)),
+            None => self.age_secs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Worker {
+    pub id: String,
+    /// `ship`, `scout`, `secondmate`, or a child's kind.
+    pub kind: String,
+    pub project: String,
+    pub harness: String,
+    pub mode: String,
+    pub title: Option<String>,
+    /// Firstmate's current state word (`working`, `parked`, `done`, ...).
+    pub fm_state: String,
+    /// Where firstmate observed it (`run-step`, `pane`, `status-log`, ...).
+    pub source: String,
+    pub detail: String,
+    pub branch: Option<String>,
+    pub worktree: Option<PathBuf>,
+    pub pr_url: Option<String>,
+    pub open_decisions: Vec<String>,
+    pub blocked_event: bool,
+    pub last_event: Option<LastEvent>,
+    /// `until <time>` declared by the worker's latest status line.
+    pub wait_until: Option<i64>,
+    /// The secondmate this row belongs to, for a secondmate's child.
+    pub parent: Option<String>,
+    pub endpoint_exists: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HeldCall {
+    pub id: String,
+    pub title: String,
+    pub age_days: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Fleet {
+    pub generated: Option<i64>,
+    pub workers: Vec<Worker>,
+    /// Backlog rows waiting on the captain (`captain_actionable`).
+    pub held: Vec<HeldCall>,
+    /// The first queued backlog row that is not a captain call.
+    pub next: Option<HeldCall>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepStatus {
+    Completed,
+    Running,
+    Fixing,
+    Pending,
+    Skipped,
+    Failed,
+    /// Parked at an approval gate.
+    Awaiting,
+    Other,
+}
+
+impl StepStatus {
+    pub fn parse(s: &str) -> StepStatus {
+        match s {
+            "completed" | "passed" | "success" => StepStatus::Completed,
+            "running" => StepStatus::Running,
+            "fixing" => StepStatus::Fixing,
+            "pending" => StepStatus::Pending,
+            "skipped" => StepStatus::Skipped,
+            "failed" | "error" | "cancelled" => StepStatus::Failed,
+            s if s.starts_with("awaiting") || s == "fix_review" || s == "parked" => {
+                StepStatus::Awaiting
+            }
+            _ => StepStatus::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Step {
+    pub name: String,
+    pub status: StepStatus,
+    pub findings: u32,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ActiveStep {
+    pub step: String,
+    pub status: String,
+    pub active_secs: Option<i64>,
+    pub last_activity: String,
+    /// Seconds since the step last reported activity, when known.
+    pub last_activity_secs: Option<i64>,
+    pub round: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Pipeline {
+    pub run_id: String,
+    pub branch: String,
+    /// Run status (`running`, `completed`, `failed`, `cancelled`, ...).
+    pub status: String,
+    pub head: String,
+    pub pr_url: Option<String>,
+    /// `none`, `1 awaiting`, `2 auto-fix`, ...
+    pub findings: String,
+    pub steps: Vec<Step>,
+    pub active: Option<ActiveStep>,
+    pub outcome: Option<String>,
+    pub error: Option<String>,
+    /// The gate step the run is parked at, when no-mistakes names it.
+    pub gate: Option<String>,
+    /// How long the run had been parked waiting on the agent when it was read
+    /// (`awaiting_agent: parked 1h17m`).
+    pub parked_secs: Option<i64>,
+    /// Unix time this status was read. Durations in it count on from here.
+    pub read_at: Option<i64>,
+}
+
+impl Pipeline {
+    /// The run is still moving on its own. no-mistakes leaves a run's status
+    /// at `running` while it waits at a gate, so a parked run is not live.
+    pub fn is_live(&self) -> bool {
+        matches!(self.status.as_str(), "running" | "fixing" | "pending") && !self.is_parked()
+    }
+
+    pub fn is_parked(&self) -> bool {
+        self.parked_secs.is_some()
+            || self.status.starts_with("awaiting")
+            || self.status == "fix_review"
+            || self.steps.iter().any(|s| s.status == StepStatus::Awaiting)
+    }
+
+    /// Seconds between reading this status and `now`.
+    fn since_read(&self, now: i64) -> i64 {
+        self.read_at.map_or(0, |at| (now - at).max(0))
+    }
+
+    /// The name of the gate the run is parked at.
+    pub fn gate_step(&self) -> Option<&str> {
+        self.gate.as_deref().filter(|g| !g.is_empty()).or_else(|| {
+            self.steps
+                .iter()
+                .find(|s| s.status == StepStatus::Awaiting)
+                .map(|s| s.name.as_str())
+        })
+    }
+
+    /// How long the run has been parked waiting on the agent, as of `now`.
+    pub fn parked_for(&self, now: i64) -> Option<i64> {
+        self.parked_secs.map(|s| s + self.since_read(now))
+    }
+
+    /// How long the active step has been running, as of `now`.
+    pub fn active_for(&self, now: i64) -> Option<i64> {
+        let a = self.active.as_ref()?;
+        a.active_secs.map(|s| s + self.since_read(now))
+    }
+
+    /// How long ago the active step last reported activity, as of `now`.
+    pub fn quiet_for(&self, now: i64) -> Option<i64> {
+        let a = self.active.as_ref()?;
+        a.last_activity_secs.map(|s| s + self.since_read(now))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckState {
+    Pass,
+    Fail,
+    Running,
+    Queued,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Check {
+    pub name: String,
+    pub state: CheckState,
+    pub started_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct PrChecks {
+    pub url: String,
+    pub number: u64,
+    pub draft: bool,
+    pub state: String,
+    pub checks: Vec<Check>,
+}
+
+impl PrChecks {
+    pub fn count(&self, state: CheckState) -> usize {
+        self.checks.iter().filter(|c| c.state == state).count()
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Runner {
+    pub name: String,
+    pub dir: PathBuf,
+    /// `owner/repo` when the runner is registered to one repository.
+    pub repo: Option<String>,
+    /// A `Runner.Worker` process runs from the runner's directory.
+    pub busy: bool,
+    /// How long that `Runner.Worker` has run, when the scan was taken.
+    pub busy_secs: Option<i64>,
+    /// Unix time of the last process scan, or `None` when the process table
+    /// could not be read (then `busy` and `listener_secs` say nothing).
+    pub scanned_at: Option<i64>,
+    /// How long the runner's `Runner.Listener` has run, when one runs.
+    pub listener_secs: Option<i64>,
+    /// When crowsnest first saw the runner without a `Runner.Worker` in its
+    /// current idle stretch.
+    pub idle_since: Option<i64>,
+    /// Modification times of the newest `_diag/Runner_*.log`,
+    /// `_diag/Worker_*.log` and `_diag/pages/*.log` (the running step's
+    /// output; best effort, the pages are not a documented interface).
+    pub runner_log_at: Option<i64>,
+    pub worker_log_at: Option<i64>,
+    pub step_output_at: Option<i64>,
+    /// What the tails of the newest worker and runner logs say.
+    pub worker_tail: Option<LogTail>,
+    pub runner_tail: Option<LogTail>,
+    /// The running job's process tree CPU time: (Unix time, cumulative
+    /// CPU milliseconds) samples, oldest first, at least 15 s apart.
+    pub job_cpu: Vec<(i64, u64)>,
+    /// The running job runs its steps through `docker` or `podman`, whose
+    /// CPU is not in the job's process tree.
+    pub job_in_container: bool,
+    /// The systemd unit that runs it: from `--runner-unit` or the config
+    /// file's `[runners] units`, from the running listener's cgroup, or from
+    /// the `.service` file `svc.sh install` writes.
+    pub unit: Option<String>,
+    /// Where `unit` came from.
+    pub unit_source: Option<UnitSource>,
+    pub service: Option<Service>,
+}
+
+/// Where a runner's systemd unit was learned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitSource {
+    /// `--runner-unit` or `[runners] units` in the config file.
+    Configured,
+    /// The cgroup of the runner's running `Runner.Listener`.
+    Listener,
+    /// The `.service` file `svc.sh install` wrote in the runner directory.
+    Recorded,
+}
+
+/// Where the last runner discovery looked, so an empty runner panel can say
+/// so.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RunnerSearch {
+    /// Running `Runner.Listener` processes were read for their directory.
+    pub processes: bool,
+    /// How many of them there were.
+    pub listeners: usize,
+    /// How many of those had no runner directory (`.runner`) above their
+    /// executable.
+    pub unlocated: usize,
+    /// The folders searched, and the names looked for in them.
+    pub roots: Vec<PathBuf>,
+    pub names: Vec<String>,
+    /// Runner directories named in `units`, searched whether or not they
+    /// are under a folder.
+    pub pinned: usize,
+}
+
+impl Runner {
+    /// CPU milliseconds the running job's processes used since `since`, and
+    /// the seconds of samples that covers. Processes that exit take their
+    /// time with them, so only increases between samples count.
+    pub fn job_cpu_since(&self, since: i64) -> Option<(u64, i64)> {
+        let start = self
+            .job_cpu
+            .iter()
+            .rposition(|(t, _)| *t <= since)
+            .unwrap_or(0);
+        let window = &self.job_cpu[start..];
+        let (first, last) = (window.first()?, window.last()?);
+        let used = window
+            .windows(2)
+            .map(|w| w[1].1.saturating_sub(w[0].1))
+            .sum();
+        Some((used, last.0 - first.0.max(since)))
+    }
+
+    /// The repository's short name, or the runner's own name.
+    pub fn label(&self) -> &str {
+        self.repo
+            .as_deref()
+            .and_then(|r| r.rsplit('/').next())
+            .unwrap_or(&self.name)
+    }
+
+    /// Unix time its `Runner.Worker` started, when one runs.
+    pub fn busy_since(&self) -> Option<i64> {
+        self.busy.then_some(self.scanned_at? - self.busy_secs?)
+    }
+}
+
+/// `systemctl show` of a runner's unit.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Service {
+    /// `ActiveState`, e.g. `active` or `failed`.
+    pub active: String,
+    /// `SubState`, e.g. `running`.
+    pub sub: String,
+    pub restarts: Option<u32>,
+    /// Why it could not be read, or `not-found` when systemd has no such unit.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JobStep {
+    pub number: u32,
+    pub name: String,
+    /// `queued`, `in_progress` or `completed`.
+    pub status: String,
+    pub conclusion: Option<String>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+/// What a workflow run is for, from the runs list.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunInfo {
+    pub id: u64,
+    pub attempt: u32,
+    pub workflow: String,
+    pub number: u64,
+    /// `pull_request`, `push`, `workflow_dispatch`, ...
+    pub event: String,
+    /// The PR title for a pull request, the commit message for a push.
+    pub title: String,
+    pub branch: String,
+    pub sha: String,
+    /// The pull request, only for pull request events: push runs on a
+    /// release branch list the open PR too, but are not for it.
+    pub pr: Option<u64>,
+    pub base: Option<String>,
+    pub created_at: Option<i64>,
+}
+
+impl RunInfo {
+    /// `#123`, or `dev push`, or the branch.
+    pub fn label(&self) -> String {
+        match self.pr {
+            Some(n) => format!("#{n}"),
+            None if self.event == "push" => format!("{} push", self.branch),
+            None => self.branch.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Job {
+    pub repo: String,
+    pub name: String,
+    /// `queued`, `in_progress`, `waiting` (on an approval or concurrency
+    /// group) or `completed`.
+    pub status: String,
+    pub runner: Option<String>,
+    pub started_at: Option<i64>,
+    pub branch: String,
+    pub id: u64,
+    pub run_id: u64,
+    pub workflow: String,
+    pub created_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub conclusion: Option<String>,
+    pub labels: Vec<String>,
+    pub steps: Vec<JobStep>,
+    /// The run it belongs to, when the runs list was read with it.
+    pub run: Option<RunInfo>,
+}
+
+impl Job {
+    pub fn is_queued(&self) -> bool {
+        self.status == "queued" || self.status == "waiting"
+    }
+
+    /// Runs on a self-hosted runner: the only jobs a local runner can take.
+    /// Jobs read without labels are given the benefit of the doubt.
+    pub fn is_self_hosted(&self) -> bool {
+        self.labels.is_empty()
+            || self
+                .labels
+                .iter()
+                .any(|l| l.eq_ignore_ascii_case("self-hosted"))
+    }
+
+    /// `#123`, or `dev push`, or the branch.
+    pub fn label(&self) -> String {
+        self.run
+            .as_ref()
+            .map_or_else(|| self.branch.clone(), RunInfo::label)
+    }
+
+    /// The number of the last step. Step numbers can skip (post steps of
+    /// actions that did not run are left out), so this is not the count.
+    pub fn step_total(&self) -> u32 {
+        self.steps.iter().map(|s| s.number).max().unwrap_or(0)
+    }
+
+    /// The step running now, or the last one that ran.
+    pub fn current_step(&self) -> Option<&JobStep> {
+        self.steps
+            .iter()
+            .find(|s| s.status == "in_progress")
+            .or_else(|| self.steps.iter().rev().find(|s| s.started_at.is_some()))
+    }
+}
+
+/// One registered runner as GitHub reports it
+/// (`repos/<r>/actions/runners`, which needs repository admin read).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GhRunner {
+    pub name: String,
+    /// `online` or `offline`.
+    pub status: String,
+    pub busy: bool,
+    pub version: String,
+    pub labels: Vec<String>,
+}
+
+/// GitHub's runner list for one repository.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoRunners {
+    pub read_at: Option<i64>,
+    pub runners: Vec<GhRunner>,
+    /// The token may not read runners (403: needs admin read).
+    pub denied: bool,
+    pub error: Option<String>,
+}
+
+/// A finished job, kept small: the history the runner detail shows.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DoneJob {
+    pub runner: String,
+    pub workflow: String,
+    pub name: String,
+    /// `#123`, `dev push`, or the branch.
+    pub label: String,
+    pub conclusion: String,
+    pub created_at: Option<i64>,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+}
+
+impl DoneJob {
+    pub fn ran_secs(&self) -> Option<i64> {
+        Some(self.completed_at? - self.started_at?).filter(|s| *s >= 0)
+    }
+    pub fn waited_secs(&self) -> Option<i64> {
+        Some(self.started_at? - self.created_at?).filter(|s| *s >= 0)
+    }
+}
+
+/// The typical duration of one job, or one step of it.
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+pub struct Typical {
+    pub workflow: String,
+    pub job: String,
+    pub step: Option<String>,
+    /// Median of the latest successful samples, in seconds.
+    pub secs: i64,
+    pub samples: usize,
+}
+
+/// What crowsnest knows of one repository's finished jobs.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepoHistory {
+    /// Finished jobs on self-hosted runners, newest first.
+    pub jobs: Vec<DoneJob>,
+    pub typical: Vec<Typical>,
+    /// Creation time of the oldest run read: `jobs` holds everything since.
+    pub covered_since: Option<i64>,
+    pub error: Option<String>,
+}
+
+impl RepoHistory {
+    /// The typical duration of a job (`step` None) or one of its steps.
+    pub fn typical(&self, workflow: &str, job: &str, step: Option<&str>) -> Option<&Typical> {
+        self.typical
+            .iter()
+            .find(|t| t.workflow == workflow && t.job == job && t.step.as_deref() == step)
+    }
+}
+
+/// The limits that decide whether a runner looks stuck. Kept apart from
+/// [`Thresholds`] so those stay `Eq`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RunnerThresholds {
+    /// A busy runner whose step output (or worker log) has not advanced for
+    /// this long is STALLED.
+    pub silent_secs: i64,
+    /// A job running longer than this many times its typical duration is SLOW.
+    pub overdue_factor: f64,
+    /// A job queued this long while its runner is idle is NOT PICKING UP.
+    pub pickup_secs: i64,
+    /// A silent job whose processes used less CPU than this over the silent
+    /// window is idle, so STALLED; one that used more is only quiet.
+    pub idle_cpu_ms: u64,
+}
+
+impl Default for RunnerThresholds {
+    fn default() -> Self {
+        RunnerThresholds {
+            silent_secs: 10 * 60,
+            overdue_factor: 2.0,
+            pickup_secs: 5 * 60,
+            idle_cpu_ms: 2000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Disk {
+    pub mount: String,
+    pub used_pct: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Host {
+    pub name: String,
+    pub load: [f64; 3],
+    pub cpus: usize,
+    pub mem_total: u64,
+    pub mem_available: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+    pub disks: Vec<Disk>,
+    /// Linux pressure stall `some avg10` for memory and cpu, in percent.
+    pub psi_mem: Option<f64>,
+    pub psi_cpu: Option<f64>,
+}
+
+impl Host {
+    pub fn mem_used_pct(&self) -> f64 {
+        pct(
+            self.mem_total.saturating_sub(self.mem_available),
+            self.mem_total,
+        )
+    }
+    pub fn swap_used_pct(&self) -> f64 {
+        pct(
+            self.swap_total.saturating_sub(self.swap_free),
+            self.swap_total,
+        )
+    }
+}
+
+fn pct(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        part as f64 * 100.0 / whole as f64
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QuotaWindow {
+    pub provider: String,
+    /// quota-axi's stable window id (`five_hour`, `premium_interactions`).
+    pub id: String,
+    pub label: String,
+    pub pct_used: f64,
+    pub resets_at: Option<i64>,
+    /// quota-axi's pace: `ahead` (spending faster than the window's clock,
+    /// so it runs out before it resets), `on_pace` or `behind`.
+    pub pace: Option<String>,
+    /// quota-axi says `ahead`, its projection is established (not `early`)
+    /// and puts the run-out before the reset: at its rate so far the window
+    /// runs out before it resets.
+    pub short: bool,
+    /// When quota-axi projects the window runs out, for a window that is
+    /// `short`.
+    pub runs_out_at: Option<i64>,
+}
+
+/// GitHub's counters for one budget of the `gh` login, from the headers of
+/// its last answer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RateLimit {
+    pub limit: u64,
+    pub remaining: u64,
+    /// Unix time the budget refills.
+    pub reset_at: i64,
+    /// When these counters were read.
+    pub read_at: Option<i64>,
+    /// GitHub refused for rate limit: nothing is asked until then.
+    pub paused_until: Option<i64>,
+}
+
+impl RateLimit {
+    /// A pause still in effect at `now`.
+    pub fn paused(&self, now: i64) -> Option<i64> {
+        self.paused_until.filter(|u| *u > now)
+    }
+}
+
+/// The GitHub reads waiting longer than the settings say, because the REST
+/// budget would not last to its reset at the pace they ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Slowed {
+    /// The wait between reads now, in seconds.
+    pub every: i64,
+    /// When the next read is due.
+    pub next_at: i64,
+}
+
+/// The REST and GraphQL budgets, and what the queue read had to leave out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct GhBudget {
+    pub core: RateLimit,
+    pub graphql: RateLimit,
+    /// Set after a read while the wait to the next one is stretched past the
+    /// configured cadence (the active one, or the 5 minutes of an idle one)
+    /// by the budget, and no rate-limit pause is on.
+    pub slowed: Option<Slowed>,
+    /// Queued or running workflow runs per repository that were not read
+    /// (those between the newest and the oldest page), from GitHub's
+    /// `total_count`.
+    pub runs_unread: BTreeMap<String, u64>,
+    /// Jobs per repository that were not read: those past the first page of
+    /// a run's job list.
+    pub jobs_unread: BTreeMap<String, u64>,
+}
+
+/// What the newest lines of a runner's `_diag` log say, from its tail.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct LogTail {
+    /// The last line and its time.
+    pub last: Option<(i64, String)>,
+    /// Worker log: the step it last started, by display name.
+    pub step: Option<(i64, String)>,
+    /// Worker log: a process was started and has not finished.
+    pub process_running: bool,
+    /// Runner log: what the listener last wrote to its console (`Listening
+    /// for Jobs`, `Running job: ...`, `Job ... completed with result: ...`).
+    pub state: Option<(i64, String)>,
+    /// Runner log: the console errors written since that line (`Runner
+    /// connect error: ...`): the first one's time, and the last (its
+    /// message without the listener's own framing).
+    pub error_since: Option<i64>,
+    pub error: Option<(i64, String)>,
+    /// Runner log: lines that show the listener failing to reach GitHub
+    /// (an `ERR` line, `Attempt N of ... failed`, `Back off ...`, `Sleeping
+    /// for N seconds before retrying`) since its last ordinary console
+    /// line: the first one's time and the newest one's. One failed request
+    /// writes several of these in the same second, so the time they span is
+    /// what tells. The listener prints a console error once per outage, so
+    /// these lines are the evidence that the trouble goes on.
+    pub failure_since: Option<i64>,
+    pub failure_at: Option<i64>,
+}
+
+/// How long after its newest failure line a listener still counts as in
+/// trouble. The listener's request timeout is 100 s, so this covers two
+/// failed attempts.
+pub const FAILURE_LIVE_SECS: i64 = 5 * 60;
+
+/// How long failing attempts must have gone on, with no console line in
+/// view, before the listener reads as retrying. A request that times out
+/// (100 s) or a failed attempt that the next one fixes is routine and spans
+/// less; a real outage spans minutes.
+pub const RETRYING_MIN_SECS: i64 = 2 * 60;
+
+/// What a runner log says is wrong with the listener's connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trouble<'a> {
+    /// A console error, written first at `since`; `msg` is the last one.
+    ConsoleError { since: i64, msg: &'a str },
+    /// Failing attempts since `since`, with no console line in view: the
+    /// log was first read mid-outage.
+    Retrying { since: i64 },
+}
+
+impl LogTail {
+    /// The trouble the log shows as of `now`, by the clock. A listener is in
+    /// trouble while its newest failure line is younger than
+    /// [`FAILURE_LIVE_SECS`]: it prints its console error once and says
+    /// nothing when it reconnects, so how long the log has been quiet in
+    /// its own time says nothing. An ordinary console line, or a failure
+    /// line after a long quiet stretch, has already reset the counts when
+    /// the log was read.
+    pub fn trouble(&self, now: i64) -> Option<Trouble<'_>> {
+        if !self
+            .failure_at
+            .is_some_and(|f| now - f <= FAILURE_LIVE_SECS)
+        {
+            return None;
+        }
+        if let (Some(since), Some((_, msg))) = (self.error_since, self.error.as_ref()) {
+            return Some(Trouble::ConsoleError {
+                since,
+                msg: msg.as_str(),
+            });
+        }
+        // A read that lands mid-outage sees no console line at all. After an
+        // ordinary console line, failing lines without a console error are
+        // routine timeouts.
+        if self.state.is_some() {
+            return None;
+        }
+        // A failed attempt or two is routine; failing for minutes is not.
+        self.failure_since
+            .zip(self.failure_at)
+            .filter(|(first, last)| last - first >= RETRYING_MIN_SECS)
+            .map(|(since, _)| Trouble::Retrying { since })
+    }
+}
+
+/// How the queue of one repository was last read: when it was read in
+/// full, and why the latest attempt failed, if it did. A repository whose
+/// read failed keeps the jobs of its last good read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct QueueRead {
+    pub read_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// How fresh one source is.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Freshness {
+    /// Unix time of the last successful read.
+    pub ok_at: Option<i64>,
+    pub error: Option<String>,
+}
+
+/// Everything the UI shows, as of `now`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Snapshot {
+    pub now: i64,
+    pub fleet: Option<Fleet>,
+    pub pipelines: BTreeMap<String, Pipeline>,
+    pub prs: BTreeMap<String, PrChecks>,
+    pub runners: Vec<Runner>,
+    /// Where the runner discovery looked; `None` before its first read.
+    pub runner_search: Option<RunnerSearch>,
+    /// Queued and running jobs of the repositories with a local runner.
+    pub jobs: Vec<Job>,
+    /// Unix time a repository's queue was last read in full (the newest of
+    /// them).
+    pub jobs_read_at: Option<i64>,
+    /// How each repository's queue was last read, keyed by `owner/repo`. A
+    /// repository that could not be read keeps the jobs of its last good
+    /// read in `jobs`.
+    pub queue_reads: BTreeMap<String, QueueRead>,
+    /// GitHub's view of each repository's runners, keyed by `owner/repo`.
+    pub gh_runners: BTreeMap<String, RepoRunners>,
+    /// Finished jobs and typical durations, keyed by `owner/repo`.
+    pub history: BTreeMap<String, RepoHistory>,
+    pub host: Option<Host>,
+    pub quota: Vec<QuotaWindow>,
+    pub fresh: BTreeMap<String, Freshness>,
+    /// GitHub's rate-limit budgets as last seen.
+    pub gh_budget: GhBudget,
+}
+
+/// The limits that turn a quiet row into one that needs attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Thresholds {
+    /// A working task with no status line or pipeline activity this long is stale.
+    pub stale_secs: i64,
+    /// A pipeline gate parked on the agent this long needs attention.
+    pub parked_secs: i64,
+    /// How long after a declared wait ends before the worker is flagged.
+    pub wait_grace_secs: i64,
+}
+
+impl Thresholds {
+    pub const DEFAULT_PARKED_SECS: i64 = 10 * 60;
+    pub const DEFAULT_WAIT_GRACE_SECS: i64 = 5 * 60;
+
+    pub fn new(stale_secs: i64) -> Self {
+        Thresholds {
+            stale_secs,
+            parked_secs: Self::DEFAULT_PARKED_SECS,
+            wait_grace_secs: Self::DEFAULT_WAIT_GRACE_SECS,
+        }
+    }
+}
+
+/// Why a row needs attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleKind {
+    /// No sign of life past the stale threshold.
+    Quiet,
+    /// A pipeline gate has waited on the worker past the parked threshold.
+    Parked,
+    /// The worker's declared wait ended and nothing followed.
+    WaitPassed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stale {
+    pub kind: StaleKind,
+    pub reason: String,
+}
+
+/// Decide a row's state from firstmate's state, its pipeline, and time.
+pub fn derive_state(w: &Worker, pipe: Option<&Pipeline>, now: i64, th: &Thresholds) -> WorkerState {
+    classify(w, pipe, now, th).0
+}
+
+/// A row's state, and why it needs attention when that state is `Stale`.
+pub fn classify(
+    w: &Worker,
+    pipe: Option<&Pipeline>,
+    now: i64,
+    th: &Thresholds,
+) -> (WorkerState, Option<Stale>) {
+    // A parked gate stays a quiet GATE row until it has waited too long, or
+    // its worker's declared wait has passed.
+    let gate = || match stale_for(w, pipe, now, th, false) {
+        Some(s) => (WorkerState::Stale, Some(s)),
+        None => (WorkerState::Gate, None),
+    };
+    if !w.open_decisions.is_empty() {
+        return (WorkerState::Captain, None);
+    }
+    if w.blocked_event || w.fm_state == "blocked" {
+        return (WorkerState::Blocked, None);
+    }
+    match w.fm_state.as_str() {
+        "failed" => return (WorkerState::Failed, None),
+        "parked" => return gate(),
+        // A pipeline still moving outranks the report: the work is not
+        // finished until the run is, so the row shows its running step.
+        "done" if !pipe.is_some_and(Pipeline::is_live) => return (WorkerState::Done, None),
+        "no_active_work" | "idle" => return (WorkerState::Idle, None),
+        _ => {}
+    }
+    if pipe.is_some_and(|p| p.status == "failed") {
+        return (WorkerState::Failed, None);
+    }
+    if pipe.is_some_and(Pipeline::is_parked) {
+        return gate();
+    }
+    let active = matches!(w.fm_state.as_str(), "working" | "paused" | "done");
+    if !active {
+        return (WorkerState::Unknown, None);
+    }
+    if let Some(s) = stale_for(w, pipe, now, th, true) {
+        return (WorkerState::Stale, Some(s));
+    }
+    if w.fm_state == "paused" {
+        (WorkerState::Paused, None)
+    } else {
+        (WorkerState::Working, None)
+    }
+}
+
+/// Why a worker looks stuck, if it does.
+///
+/// A run parked at a gate waiting on the worker needs attention once it has
+/// waited past the parked threshold, whatever else the worker looks like: the
+/// gate is waiting for an answer whether or not the harness is busy.
+/// Otherwise a worker is alive when firstmate sees its harness busy, or when
+/// its no-mistakes run is moving. A live run keeps the worker alive even past
+/// its declared wait, since the pipeline is the work. Otherwise a worker is
+/// stuck when its declared wait passed more than the grace period ago, or,
+/// with `quiet` and no declared wait, when its last status line is older than
+/// the stale threshold.
+pub fn stale_for(
+    w: &Worker,
+    pipe: Option<&Pipeline>,
+    now: i64,
+    th: &Thresholds,
+    quiet: bool,
+) -> Option<Stale> {
+    use crate::timefmt::dur;
+    if let Some(p) = pipe
+        && let Some(parked) = p.parked_for(now)
+        && parked >= th.parked_secs
+    {
+        let gate = p
+            .gate_step()
+            .map_or("gate".to_string(), |g| format!("{g} gate"));
+        return Some(Stale {
+            kind: StaleKind::Parked,
+            reason: format!(
+                "parked at {gate} for {}, waiting on the worker",
+                dur(parked)
+            ),
+        });
+    }
+    if w.source == "pane" && w.detail.contains("busy") {
+        return None;
+    }
+    if pipe.is_some_and(Pipeline::is_live) {
+        return None;
+    }
+    if let Some(until) = w.wait_until {
+        if now < until + th.wait_grace_secs {
+            return None;
+        }
+        return Some(Stale {
+            kind: StaleKind::WaitPassed,
+            reason: format!("declared wait ended {} ago", dur(now - until)),
+        });
+    }
+    if !quiet {
+        return None;
+    }
+    let age = w.last_event.as_ref().and_then(|e| e.age(now))?;
+    (age > th.stale_secs).then(|| Stale {
+        kind: StaleKind::Quiet,
+        reason: format!("no status line or pipeline activity for {}", dur(age)),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn th() -> Thresholds {
+        Thresholds::new(1800)
+    }
+
+    fn worker(state: &str) -> Worker {
+        Worker {
+            id: "t".into(),
+            fm_state: state.into(),
+            source: "status-log".into(),
+            last_event: Some(LastEvent {
+                state: "working".into(),
+                note: String::new(),
+                age_secs: Some(60),
+                at: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn captain_beats_everything() {
+        let mut w = worker("working");
+        w.open_decisions = vec!["board-review".into()];
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Captain);
+    }
+
+    #[test]
+    fn stale_after_threshold_without_pipeline() {
+        let mut w = worker("working");
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Working);
+        w.last_event.as_mut().unwrap().age_secs = Some(2900);
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Stale);
+        let live = Pipeline {
+            status: "running".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_state(&w, Some(&live), 0, &th()),
+            WorkerState::Working
+        );
+    }
+
+    #[test]
+    fn failed_pipeline_is_failed() {
+        let failed = Pipeline {
+            status: "failed".into(),
+            ..Default::default()
+        };
+        for state in ["working", "paused"] {
+            let mut w = worker(state);
+            assert_eq!(
+                derive_state(&w, Some(&failed), 0, &th()),
+                WorkerState::Failed
+            );
+            w.last_event.as_mut().unwrap().age_secs = Some(5000);
+            assert_eq!(
+                derive_state(&w, Some(&failed), 0, &th()),
+                WorkerState::Failed
+            );
+        }
+        // A cancelled run was stopped on purpose, not a failure.
+        let cancelled = Pipeline {
+            status: "cancelled".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_state(&worker("working"), Some(&cancelled), 0, &th()),
+            WorkerState::Working
+        );
+    }
+
+    #[test]
+    fn declared_waits() {
+        let mut w = worker("paused");
+        w.last_event.as_mut().unwrap().age_secs = Some(5000);
+        w.wait_until = Some(1000);
+        assert_eq!(derive_state(&w, None, 900, &th()), WorkerState::Paused);
+        assert_eq!(derive_state(&w, None, 1200, &th()), WorkerState::Paused);
+        assert_eq!(derive_state(&w, None, 1400, &th()), WorkerState::Stale);
+    }
+
+    #[test]
+    fn busy_pane_is_alive() {
+        let mut w = worker("working");
+        w.source = "pane".into();
+        w.detail = "harness busy (claude-hook)".into();
+        w.last_event.as_mut().unwrap().age_secs = Some(99_999);
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Working);
+    }
+
+    #[test]
+    fn simple_mappings() {
+        assert_eq!(
+            derive_state(&worker("done"), None, 0, &Thresholds::new(1)),
+            WorkerState::Done
+        );
+        assert_eq!(
+            derive_state(&worker("parked"), None, 0, &Thresholds::new(1)),
+            WorkerState::Gate
+        );
+        assert_eq!(
+            derive_state(&worker("blocked"), None, 0, &Thresholds::new(1)),
+            WorkerState::Blocked
+        );
+        assert_eq!(
+            derive_state(&worker("no_active_work"), None, 0, &Thresholds::new(1)),
+            WorkerState::Idle
+        );
+        assert_eq!(
+            derive_state(&worker("unknown"), None, 0, &Thresholds::new(1)),
+            WorkerState::Unknown
+        );
+    }
+
+    /// A run no-mistakes reports as `running` while it waits at its review gate.
+    fn parked(secs: i64) -> Pipeline {
+        Pipeline {
+            status: "running".into(),
+            gate: Some("review".into()),
+            parked_secs: Some(secs),
+            read_at: Some(1000),
+            steps: vec![Step {
+                name: "review".into(),
+                status: StepStatus::Awaiting,
+                findings: 1,
+                duration_ms: 0,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_parked_run_is_not_live() {
+        assert!(!parked(5).is_live());
+        assert!(parked(5).is_parked());
+    }
+
+    #[test]
+    fn a_gate_parked_past_the_threshold_needs_attention() {
+        let w = worker("working");
+        let t = Thresholds::new(1800);
+        // Under the threshold it stays a quiet GATE row.
+        let (state, why) = classify(&w, Some(&parked(120)), 1000, &t);
+        assert_eq!((state, why), (WorkerState::Gate, None));
+        // Parked time keeps counting after the read: 120s + 500s is past 10m.
+        let (state, why) = classify(&w, Some(&parked(120)), 1500, &t);
+        assert_eq!(state, WorkerState::Stale);
+        let why = why.unwrap();
+        assert_eq!(why.kind, StaleKind::Parked);
+        assert_eq!(
+            why.reason,
+            "parked at review gate for 10m, waiting on the worker"
+        );
+        // The threshold is configurable.
+        let patient = Thresholds {
+            parked_secs: 3600,
+            ..t
+        };
+        assert_eq!(
+            derive_state(&w, Some(&parked(4000 - 1000)), 1000, &patient),
+            WorkerState::Gate
+        );
+        assert_eq!(
+            derive_state(&w, Some(&parked(4600 - 1000)), 1000 + 1000, &patient),
+            WorkerState::Stale
+        );
+    }
+
+    #[test]
+    fn firstmate_parking_the_worker_does_not_hide_a_stalled_gate() {
+        let w = worker("parked");
+        assert_eq!(
+            derive_state(&w, Some(&parked(4620)), 1000, &th()),
+            WorkerState::Stale
+        );
+        // Parked with no pipeline reading is the worker waiting on someone else.
+        assert_eq!(derive_state(&w, None, 1000, &th()), WorkerState::Gate);
+    }
+
+    #[test]
+    fn a_busy_pane_does_not_hide_a_stalled_gate() {
+        let mut w = worker("working");
+        w.source = "pane".into();
+        w.detail = "harness busy (claude-hook)".into();
+        assert_eq!(
+            derive_state(&w, Some(&parked(4620)), 1000, &th()),
+            WorkerState::Stale
+        );
+        // Under the threshold it is just a gate, and with no gate it is working.
+        assert_eq!(
+            derive_state(&w, Some(&parked(60)), 1000, &th()),
+            WorkerState::Gate
+        );
+        assert_eq!(derive_state(&w, None, 0, &th()), WorkerState::Working);
+    }
+
+    #[test]
+    fn a_live_pipeline_keeps_a_worker_alive_past_its_declared_wait() {
+        let mut w = worker("working");
+        w.wait_until = Some(1000);
+        let live = Pipeline {
+            status: "running".into(),
+            ..Default::default()
+        };
+        // Twelve minutes past the wait, but the pipeline is still moving.
+        assert_eq!(
+            derive_state(&w, Some(&live), 1000 + 720, &th()),
+            WorkerState::Working
+        );
+        // Once it stops moving, the passed wait counts.
+        assert_eq!(
+            derive_state(&w, None, 1000 + 720, &th()),
+            WorkerState::Stale
+        );
+    }
+
+    #[test]
+    fn a_live_pipeline_outranks_a_reported_done() {
+        let w = worker("done");
+        let live = Pipeline {
+            status: "running".into(),
+            ..Default::default()
+        };
+        // The pipeline is still moving: the row is working, not done.
+        assert_eq!(
+            derive_state(&w, Some(&live), 1000, &th()),
+            WorkerState::Working
+        );
+        // Even long after the last status line, a moving run is not stale.
+        assert_eq!(
+            derive_state(&w, Some(&live), 1000 + 100_000, &th()),
+            WorkerState::Working
+        );
+        // Done once the run is finished, parked, failed or absent.
+        for status in ["completed", "failed", "cancelled"] {
+            let p = Pipeline {
+                status: status.into(),
+                ..Default::default()
+            };
+            assert_eq!(
+                derive_state(&w, Some(&p), 1000, &th()),
+                WorkerState::Done,
+                "{status}"
+            );
+        }
+        assert_eq!(
+            derive_state(&w, Some(&parked(5)), 1000, &th()),
+            WorkerState::Done
+        );
+        assert_eq!(derive_state(&w, None, 1000, &th()), WorkerState::Done);
+    }
+
+    #[test]
+    fn a_passed_declared_wait_is_flagged_on_a_gate_row_too() {
+        let mut w = worker("parked");
+        w.wait_until = Some(1000);
+        let t = Thresholds::new(1800);
+        assert_eq!(
+            derive_state(&w, Some(&parked(30)), 1200, &t),
+            WorkerState::Gate
+        );
+        let (state, why) = classify(&w, Some(&parked(30)), 1000 + 301, &t);
+        assert_eq!(state, WorkerState::Stale);
+        assert_eq!(why.unwrap().kind, StaleKind::WaitPassed);
+        // Without a gate the same wait flags a paused worker.
+        let mut p = worker("paused");
+        p.wait_until = Some(1000);
+        let (state, why) = classify(&p, None, 1000 + 301, &t);
+        assert_eq!(state, WorkerState::Stale);
+        assert_eq!(why.unwrap().reason, "declared wait ended 5m ago");
+        let lenient = Thresholds {
+            wait_grace_secs: 3600,
+            ..t
+        };
+        assert_eq!(
+            derive_state(&p, None, 1000 + 301, &lenient),
+            WorkerState::Paused
+        );
+    }
+
+    #[test]
+    fn event_age_keeps_counting_after_the_snapshot() {
+        let e = LastEvent {
+            age_secs: Some(60),
+            at: Some(940),
+            ..Default::default()
+        };
+        assert_eq!(e.age(1000), Some(60));
+        assert_eq!(e.age(1100), Some(160));
+        let legacy = LastEvent {
+            age_secs: Some(60),
+            ..Default::default()
+        };
+        assert_eq!(legacy.age(5000), Some(60));
+    }
+}

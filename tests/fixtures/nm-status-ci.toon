@@ -1,0 +1,58 @@
+run:
+  id: "01M7SF0NV7M9M2ZJG1Q9GBWJDW"
+  branch: fm/pantry-tour-followups
+  status: running
+  head: 293f8b48
+  head_sha: 293f8b48c05825b0410cc8527da36b48a5361bda
+  verification_plan:
+    path: /home/captain/.no-mistakes/run-inputs/01M7SF0NV7M9M2ZJG1Q9GBWJDW/verification-plan.txt
+    sha256: b2fe547a85265d2fbc4bb66f1e913511c472885149c71e765769eb486c89bfcb
+    source_path: /home/captain/firstmate/data/pantry-tour-followups/verification-plan.txt
+    captured_at: 1795077199
+  pr: "https://github.com/acme/pantry/pull/122"
+  findings: none
+  steps[9]{step,status,findings,duration_ms}:
+    intent,completed,0,109
+    rebase,completed,0,1544
+    review,completed,0,35279
+    test,completed,0,291885
+    document,completed,0,29403
+    lint,completed,0,629
+    push,completed,0,7160
+    pr,completed,0,34492
+    ci,running,0,0
+  shared_work[1]{attributed_to,scope,duration_ms}:
+    document,document+lint housekeeping,29403
+  active_steps[1]{step,status,active_for,round_active_for,last_activity,agent_pid,round}:
+    ci,running,35m1s,35m1s,"quiet 34m57s ago: log: CI checks running, waiting for results...","",round 2
+branch_sync:
+  state: behind
+  changed: false
+  local:
+    branch: fm/pantry-tour-followups
+    head: 5fcc3ce71bd89c4e4de33c4f00d6df5e5555d217
+    clean: true
+  pipeline:
+    run: "01M7SF0NV7M9M2ZJG1Q9GBWJDW"
+    status: running
+    phase: ""
+    submitted_head: 5fcc3ce71bd89c4e4de33c4f00d6df5e5555d217
+    current_head: 293f8b48c05825b0410cc8527da36b48a5361bda
+    pushed_head: 293f8b48c05825b0410cc8527da36b48a5361bda
+    pushed_at: 1795096269
+    push_generation: 2
+  target:
+    kind: upstream
+    remote: origin
+    url: "git@github.com:acme/pantry.git"
+    ref: refs/heads/fm/pantry-tour-followups
+  remote:
+    observed_head: 293f8b48c05825b0410cc8527da36b48a5361bda
+    freshness: pipeline_push
+    observed_at: 1795096269
+  relation: behind
+  safety: refresh_required
+  pr_state: open
+  next_action:
+    code: sync
+    command: no-mistakes axi sync

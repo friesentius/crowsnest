@@ -1,0 +1,30 @@
+{
+  "total_count": 1,
+  "workflow_runs": [
+    {
+      "id": 44537668424,
+      "name": "CI",
+      "display_title": "fix: per-account tour sample slugs, nothing-to-publish dialog, dvh dialog heights",
+      "status": "in_progress",
+      "conclusion": null,
+      "head_branch": "fm/pantry-tour-followups",
+      "head_sha": "80015de3c2b1a09f8e7d6c5b4a39281706f5e4d3",
+      "event": "pull_request",
+      "run_number": 309,
+      "run_attempt": 1,
+      "pull_requests": [
+        {
+          "number": 122,
+          "head": {
+            "ref": "fm/pantry-tour-followups"
+          },
+          "base": {
+            "ref": "dev"
+          }
+        }
+      ],
+      "created_at": "2026-11-19T13:51:41Z",
+      "updated_at": "2026-11-19T14:18:35Z"
+    }
+  ]
+}

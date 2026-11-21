@@ -1,0 +1,1383 @@
+{
+  "schema": "fm-fleet-snapshot.v1",
+  "generated": "2026-11-19T14:26:26Z",
+  "fm_home": "/home/captain/firstmate",
+  "roots": {
+    "fm_root": "/home/captain/firstmate",
+    "state": "/home/captain/firstmate/state",
+    "data": "/home/captain/firstmate/data",
+    "config": "/home/captain/firstmate/config",
+    "projects": "/home/captain/firstmate/projects"
+  },
+  "backlog": {
+    "records": [
+      {
+        "repo": "crowsnest",
+        "since": "2026-11-19",
+        "state": "in_flight",
+        "hold_kind": null,
+        "priority": null,
+        "hold_until": null,
+        "blocked_reason": null,
+        "hold_age_days": 0,
+        "links": [],
+        "kind": "scout",
+        "requires_child_metadata": true,
+        "hold_reason": null,
+        "blocked_by_ids": [],
+        "checked": false,
+        "raw": "- [ ] fleet-tui-dashboard - TUI dashboard: live status of crewmates and no-mistakes pipelines alongside firstmate (captain: later, when resources free up)",
+        "structured": true,
+        "captain_actionable": false,
+        "current_role": "worker",
+        "title": "TUI dashboard: live status of crewmates and no-mistakes pipelines alongside firstmate (captain: later, when resources free up)",
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "report_path": null,
+        "hold_set": null,
+        "id": "fleet-tui-dashboard",
+        "order": 1,
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "local_note": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "done": null,
+        "pr_url": null,
+        "blocked_by": null
+      },
+      {
+        "blocked_reason": null,
+        "hold_until": null,
+        "hold_age_days": 0,
+        "links": [],
+        "since": "2026-11-19",
+        "repo": "bookshop",
+        "priority": null,
+        "hold_kind": null,
+        "state": "in_flight",
+        "hold_reason": null,
+        "requires_child_metadata": true,
+        "checked": false,
+        "blocked_by_ids": [],
+        "raw": "- [ ] bs-p1b-headers-hero - Bookshop phase 1b: security headers and a lighter phone hero image (W13 W14)",
+        "kind": "ship",
+        "body_excerpt": null,
+        "merged": null,
+        "hold_set": null,
+        "report_path": null,
+        "current_role": "worker",
+        "structured": true,
+        "captain_actionable": false,
+        "title": "Bookshop phase 1b: security headers and a lighter phone hero image (W13 W14)",
+        "local_note": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "done": null,
+        "blocked_by": null,
+        "pr_url": null,
+        "order": 2,
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "id": "bs-p1b-headers-hero",
+        "body_lines": []
+      },
+      {
+        "body_lines": [],
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "order": 3,
+        "id": "bs-p1a-parity-copy",
+        "blocked_by": null,
+        "pr_url": null,
+        "done": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "local_note": null,
+        "title": "Bookshop phase 1a: dev matches the live store (docs + dev Storefront mock) and visitor copy fixes (S4 S8 S10 W11 W12)",
+        "current_role": "worker",
+        "captain_actionable": false,
+        "structured": true,
+        "hold_set": null,
+        "report_path": null,
+        "body_excerpt": null,
+        "merged": null,
+        "kind": "ship",
+        "raw": "- [ ] bs-p1a-parity-copy - Bookshop phase 1a: dev matches the live store (docs + dev Storefront mock) and visitor copy fixes (S4 S8 S10 W11 W12)",
+        "checked": false,
+        "blocked_by_ids": [],
+        "hold_reason": null,
+        "requires_child_metadata": true,
+        "priority": null,
+        "state": "in_flight",
+        "hold_kind": null,
+        "since": "2026-11-19",
+        "repo": "bookshop",
+        "hold_age_days": 0,
+        "links": [],
+        "blocked_reason": null,
+        "hold_until": null
+      },
+      {
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "id": "pantry-tour-followups",
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "order": 4,
+        "pr_url": null,
+        "blocked_by": null,
+        "done": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "local_note": null,
+        "title": "Pantry: guided-tour review follow-ups F15 (sample slug pool), F18 (empty publish summary), F19 (dvh on publish sheet for iOS Safari)",
+        "captain_actionable": false,
+        "structured": true,
+        "current_role": "worker",
+        "report_path": null,
+        "hold_set": null,
+        "merged": null,
+        "body_excerpt": "(scrubbed)",
+        "kind": "ship",
+        "raw": "- [ ] pantry-tour-followups - Pantry: guided-tour review follow-ups F15 (sample slug pool), F18 (empty publish summary), F19 (dvh on publish sheet for iOS Safari)",
+        "blocked_by_ids": [],
+        "checked": false,
+        "requires_child_metadata": true,
+        "hold_reason": null,
+        "state": "in_flight",
+        "hold_kind": null,
+        "priority": null,
+        "repo": "pantry",
+        "since": "2026-11-19",
+        "hold_age_days": 0,
+        "links": [],
+        "hold_until": null,
+        "blocked_reason": null
+      },
+      {
+        "since": "2026-11-10",
+        "repo": "webshop",
+        "priority": null,
+        "hold_kind": "captain",
+        "state": "queued",
+        "blocked_reason": null,
+        "hold_until": null,
+        "links": [],
+        "hold_age_days": 8,
+        "kind": "task",
+        "hold_reason": "(scrubbed)",
+        "requires_child_metadata": false,
+        "raw": "- [ ] webshop-shop-price-ids-2 - Held for the captain: webshop shop price ids 2",
+        "blocked_by_ids": [],
+        "checked": false,
+        "current_role": "queued",
+        "captain_actionable": true,
+        "structured": true,
+        "title": "Held for the captain: webshop shop price ids 2",
+        "merged": null,
+        "body_excerpt": "(scrubbed)",
+        "hold_set": "2026-11-10T17:49:53Z",
+        "report_path": null,
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "order": 5,
+        "id": "webshop-shop-price-ids-2",
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "done": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "hold_bucket": "live",
+        "local_note": null,
+        "blocked_by": null,
+        "pr_url": null
+      },
+      {
+        "kind": null,
+        "raw": "- [ ] webshop-release-dev-to-main - Held for the captain: webshop release dev to main",
+        "blocked_by_ids": [],
+        "checked": false,
+        "requires_child_metadata": false,
+        "hold_reason": "(scrubbed)",
+        "state": "queued",
+        "hold_kind": "captain",
+        "priority": null,
+        "repo": "webshop",
+        "since": "2026-11-14",
+        "links": [],
+        "hold_age_days": 5,
+        "hold_until": null,
+        "blocked_reason": null,
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "id": "webshop-release-dev-to-main",
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "order": 6,
+        "pr_url": null,
+        "blocked_by": null,
+        "done": null,
+        "local_note": null,
+        "hold_bucket": "live",
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "title": "Held for the captain: webshop release dev to main",
+        "captain_actionable": true,
+        "structured": true,
+        "current_role": "queued",
+        "report_path": null,
+        "hold_set": "2026-11-14T14:26:16Z",
+        "merged": null,
+        "body_excerpt": "(scrubbed)"
+      },
+      {
+        "done": null,
+        "hold_bucket": "live",
+        "local_note": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "blocked_by": null,
+        "pr_url": null,
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "order": 7,
+        "id": "webshop-vps-shared-deploy",
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "hold_set": "2026-11-14T18:44:57Z",
+        "report_path": null,
+        "current_role": "queued",
+        "captain_actionable": true,
+        "structured": true,
+        "title": "Held for the captain: webshop vps shared deploy",
+        "hold_reason": "(scrubbed)",
+        "requires_child_metadata": false,
+        "raw": "- [ ] webshop-vps-shared-deploy - Held for the captain: webshop vps shared deploy",
+        "blocked_by_ids": [],
+        "checked": false,
+        "kind": null,
+        "blocked_reason": null,
+        "hold_until": null,
+        "links": [],
+        "hold_age_days": 4,
+        "since": "2026-11-14",
+        "repo": "webshop",
+        "priority": null,
+        "hold_kind": "captain",
+        "state": "queued"
+      },
+      {
+        "kind": null,
+        "hold_reason": "(scrubbed)",
+        "requires_child_metadata": false,
+        "blocked_by_ids": [],
+        "checked": false,
+        "raw": "- [ ] bookshop-vps-shared-deploy - Held for the captain: bookshop vps shared deploy",
+        "since": "2026-11-14",
+        "repo": null,
+        "priority": null,
+        "hold_kind": "captain",
+        "state": "queued",
+        "blocked_reason": null,
+        "hold_until": null,
+        "hold_age_days": 4,
+        "links": [],
+        "order": 8,
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "id": "bookshop-vps-shared-deploy",
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "hold_bucket": "live",
+        "local_note": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "done": null,
+        "blocked_by": null,
+        "pr_url": null,
+        "current_role": "queued",
+        "structured": true,
+        "captain_actionable": true,
+        "title": "Held for the captain: bookshop vps shared deploy",
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "hold_set": "2026-11-14T18:44:58Z",
+        "report_path": null
+      },
+      {
+        "hold_set": "2026-11-15T14:08:33Z",
+        "report_path": null,
+        "merged": null,
+        "body_excerpt": "(scrubbed)",
+        "title": "Held for the captain: pantry storage r2",
+        "current_role": "queued",
+        "captain_actionable": true,
+        "structured": true,
+        "blocked_by": null,
+        "pr_url": null,
+        "done": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "hold_bucket": "live",
+        "local_note": null,
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "order": 9,
+        "id": "pantry-storage-r2",
+        "hold_age_days": 4,
+        "links": [],
+        "blocked_reason": null,
+        "hold_until": null,
+        "priority": null,
+        "hold_kind": "captain",
+        "state": "queued",
+        "since": "2026-11-15",
+        "repo": "pantry",
+        "raw": "- [ ] pantry-storage-r2 - Held for the captain: pantry storage r2",
+        "checked": false,
+        "blocked_by_ids": [],
+        "hold_reason": "(scrubbed)",
+        "requires_child_metadata": false,
+        "kind": null
+      },
+      {
+        "blocked_reason": null,
+        "hold_until": null,
+        "hold_age_days": 3,
+        "links": [],
+        "since": "2026-11-15",
+        "repo": null,
+        "priority": null,
+        "hold_kind": "captain",
+        "state": "queued",
+        "hold_reason": "(scrubbed)",
+        "requires_child_metadata": false,
+        "raw": "- [ ] brand-direction-later - Held for the captain: brand direction later",
+        "blocked_by_ids": [],
+        "checked": false,
+        "kind": null,
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "hold_set": "2026-11-16T02:21:21Z",
+        "report_path": null,
+        "current_role": "queued",
+        "captain_actionable": true,
+        "structured": true,
+        "title": "Held for the captain: brand direction later",
+        "done": null,
+        "hold_bucket": "live",
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "local_note": null,
+        "blocked_by": null,
+        "pr_url": null,
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "order": 10,
+        "id": "brand-direction-later",
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ]
+      },
+      {
+        "local_note": null,
+        "hold_bucket": "live",
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "done": null,
+        "pr_url": null,
+        "blocked_by": null,
+        "id": "notes-macros-later",
+        "order": 11,
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "report_path": null,
+        "hold_set": "2026-11-18T03:30:54Z",
+        "structured": true,
+        "captain_actionable": true,
+        "current_role": "queued",
+        "title": "Held for the captain: notes macros later",
+        "requires_child_metadata": false,
+        "hold_reason": "(scrubbed)",
+        "checked": false,
+        "blocked_by_ids": [],
+        "raw": "- [ ] notes-macros-later - Held for the captain: notes macros later",
+        "kind": "task",
+        "hold_until": null,
+        "blocked_reason": null,
+        "links": [],
+        "hold_age_days": 1,
+        "repo": "notes-plugin",
+        "since": "2026-11-17",
+        "hold_kind": "captain",
+        "state": "queued",
+        "priority": null
+      },
+      {
+        "requires_child_metadata": false,
+        "hold_reason": "(scrubbed)",
+        "blocked_by_ids": [],
+        "checked": false,
+        "raw": "- [ ] pantry-sitemap-cache - Held for the captain: pantry sitemap cache",
+        "kind": "ship",
+        "hold_until": null,
+        "blocked_reason": null,
+        "hold_age_days": 1,
+        "links": [],
+        "repo": "pantry",
+        "since": "2026-11-17",
+        "state": "queued",
+        "hold_kind": "captain",
+        "priority": null,
+        "local_note": null,
+        "hold_bucket": "live",
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "done": null,
+        "pr_url": null,
+        "blocked_by": null,
+        "id": "pantry-sitemap-cache",
+        "order": 12,
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "report_path": null,
+        "hold_set": "2026-11-18T04:02:42Z",
+        "structured": true,
+        "captain_actionable": true,
+        "current_role": "queued",
+        "title": "Held for the captain: pantry sitemap cache"
+      },
+      {
+        "blocked_reason": null,
+        "hold_until": null,
+        "links": [],
+        "hold_age_days": 0,
+        "since": "2026-11-19",
+        "repo": "pantry",
+        "priority": null,
+        "state": "queued",
+        "hold_kind": null,
+        "hold_reason": null,
+        "requires_child_metadata": false,
+        "blocked_by_ids": [],
+        "checked": false,
+        "raw": "- [ ] pantry-release-0-4-0 - Next: pantry release 0 4 0",
+        "kind": "task",
+        "body_excerpt": null,
+        "merged": null,
+        "hold_set": null,
+        "report_path": null,
+        "current_role": "queued",
+        "structured": true,
+        "captain_actionable": false,
+        "title": "Next: pantry release 0 4 0",
+        "local_note": null,
+        "hold_bucket": null,
+        "completion": {
+          "verb": null,
+          "date": null
+        },
+        "done": null,
+        "blocked_by": null,
+        "pr_url": null,
+        "order": 13,
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "id": "pantry-release-0-4-0",
+        "body_lines": []
+      }
+    ],
+    "path": "/home/captain/firstmate/data/backlog.md",
+    "present": true
+  },
+  "tasks": [
+    {
+      "id": "fleet-tui-dashboard",
+      "kind": "ship",
+      "harness": "claude",
+      "mode": "no-mistakes",
+      "yolo": "on",
+      "branch": "fm/fleet-tui-dashboard",
+      "project": "/home/captain/firstmate/projects/crowsnest",
+      "spawn_gen": "s1795096673.559508.31329",
+      "backend": "herdr",
+      "remote": null,
+      "paths": {
+        "meta": {
+          "path": "/home/captain/firstmate/state/fleet-tui-dashboard.meta",
+          "present": true
+        },
+        "status_log": {
+          "path": "/home/captain/firstmate/state/fleet-tui-dashboard.status",
+          "present": true,
+          "kind": "event_history",
+          "last_event": {
+            "state": "working",
+            "note": "promoted to ship; building crowsnest v1 (Roster, Rust/ratatui) on fm/fleet-tui-dashboard",
+            "raw": "working [at=1795098379]: promoted to ship; building crowsnest v1 (Roster, Rust/ratatui) on fm/fleet-tui-dashboard",
+            "age_seconds": 7
+          }
+        },
+        "worktree": {
+          "path": "/home/captain/.worktrees/crowsnest-9e1707/1/crowsnest",
+          "present": true
+        },
+        "home": {
+          "path": null,
+          "present": false
+        },
+        "report": {
+          "path": "/home/captain/firstmate/data/fleet-tui-dashboard/report.md",
+          "present": true
+        }
+      },
+      "secondmate_projects": [],
+      "current_state": {
+        "state": "working",
+        "source": "pane",
+        "detail": "harness busy (claude-hook)",
+        "raw": "state: working \u00b7 source: pane \u00b7 harness busy (claude-hook)",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "endpoint": {
+        "target": "default:w7S:p2",
+        "exists": true,
+        "agent_alive": "not_checked",
+        "status": "unknown",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "pr": {
+        "url": null,
+        "source": "absent",
+        "head": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "blocked_event": false,
+        "open_decisions": [],
+        "scout_report_present": true,
+        "last_event_text": "working [at=1795098379]: promoted to ship; building crowsnest v1 (Roster, Rust/ratatui) on fm/fleet-tui-dashboard"
+      },
+      "actions": {
+        "watch": "bin/fm-peek.sh fm-fleet-tui-dashboard",
+        "steer": "bin/fm-send.sh fm-fleet-tui-dashboard '<instruction>'",
+        "return_channel_note": null
+      },
+      "backlog": {
+        "repo": "crowsnest",
+        "since": "2026-11-19",
+        "state": "in_flight",
+        "hold_kind": null,
+        "priority": null,
+        "hold_until": null,
+        "blocked_reason": null,
+        "hold_age_days": 0,
+        "links": [],
+        "kind": "scout",
+        "requires_child_metadata": true,
+        "hold_reason": null,
+        "blocked_by_ids": [],
+        "checked": false,
+        "raw": "- [ ] fleet-tui-dashboard - TUI dashboard: live status of crewmates and no-mistakes pipelines alongside firstmate (captain: later, when resources free up)",
+        "structured": true,
+        "captain_actionable": false,
+        "current_role": "worker",
+        "title": "TUI dashboard: live status of crewmates and no-mistakes pipelines alongside firstmate (captain: later, when resources free up)",
+        "body_excerpt": "(scrubbed)",
+        "merged": null,
+        "report_path": null,
+        "hold_set": null,
+        "id": "fleet-tui-dashboard",
+        "order": 1,
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "local_note": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "done": null,
+        "pr_url": null,
+        "blocked_by": null
+      }
+    },
+    {
+      "id": "pantry-tour-followups",
+      "kind": "ship",
+      "harness": "claude",
+      "mode": "no-mistakes",
+      "yolo": "on",
+      "branch": "fm/pantry-tour-followups",
+      "project": "/home/captain/firstmate/projects/pantry",
+      "spawn_gen": "s1795076698.3455032.6080",
+      "backend": "herdr",
+      "remote": null,
+      "paths": {
+        "meta": {
+          "path": "/home/captain/firstmate/state/pantry-tour-followups.meta",
+          "present": true
+        },
+        "status_log": {
+          "path": "/home/captain/firstmate/state/pantry-tour-followups.status",
+          "present": true,
+          "kind": "event_history",
+          "last_event": {
+            "state": "paused",
+            "note": "PR https://github.com/acme/pantry/pull/122 pipeline run rebased onto dev, driving review->CI; resume on next gate/outcome until 2026-11-19T14:15Z",
+            "raw": "paused [at=1795095939]: PR https://github.com/acme/pantry/pull/122 pipeline run rebased onto dev, driving review->CI; resume on next gate/outcome until 2026-11-19T14:15Z",
+            "age_seconds": 2447
+          }
+        },
+        "worktree": {
+          "path": "/home/captain/.worktrees/pantry-82978c/2/pantry",
+          "present": true
+        },
+        "home": {
+          "path": null,
+          "present": false
+        },
+        "report": {
+          "path": "/home/captain/firstmate/data/pantry-tour-followups/report.md",
+          "present": false
+        }
+      },
+      "secondmate_projects": [],
+      "current_state": {
+        "state": "working",
+        "source": "run-step",
+        "detail": "validating (running) \u00b7 run: 01M7SF0NV7M9M2ZJG1Q9GBWJDW",
+        "raw": "state: working \u00b7 source: run-step \u00b7 validating (running) \u00b7 run: 01M7SF0NV7M9M2ZJG1Q9GBWJDW",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "endpoint": {
+        "target": "default:w7P:p2",
+        "exists": true,
+        "agent_alive": "not_checked",
+        "status": "unknown",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "pr": {
+        "url": "https://github.com/acme/pantry/pull/122",
+        "source": "status_event",
+        "head": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "blocked_event": false,
+        "open_decisions": [],
+        "scout_report_present": false,
+        "last_event_text": "paused [at=1795095939]: PR https://github.com/acme/pantry/pull/122 pipeline run rebased onto dev, driving review->CI; resume on next gate/outcome until 2026-11-19T14:15Z"
+      },
+      "actions": {
+        "watch": "bin/fm-peek.sh fm-pantry-tour-followups",
+        "steer": "bin/fm-send.sh fm-pantry-tour-followups '<instruction>'",
+        "return_channel_note": null
+      },
+      "backlog": {
+        "body_lines": [
+          "(body scrubbed for the public fixture)"
+        ],
+        "id": "pantry-tour-followups",
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "order": 4,
+        "pr_url": null,
+        "blocked_by": null,
+        "done": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "local_note": null,
+        "title": "Pantry: guided-tour review follow-ups F15 (sample slug pool), F18 (empty publish summary), F19 (dvh on publish sheet for iOS Safari)",
+        "captain_actionable": false,
+        "structured": true,
+        "current_role": "worker",
+        "report_path": null,
+        "hold_set": null,
+        "merged": null,
+        "body_excerpt": "(scrubbed)",
+        "kind": "ship",
+        "raw": "- [ ] pantry-tour-followups - Pantry: guided-tour review follow-ups F15 (sample slug pool), F18 (empty publish summary), F19 (dvh on publish sheet for iOS Safari)",
+        "blocked_by_ids": [],
+        "checked": false,
+        "requires_child_metadata": true,
+        "hold_reason": null,
+        "state": "in_flight",
+        "hold_kind": null,
+        "priority": null,
+        "repo": "pantry",
+        "since": "2026-11-19",
+        "hold_age_days": 0,
+        "links": [],
+        "hold_until": null,
+        "blocked_reason": null
+      }
+    },
+    {
+      "id": "bs-p1a-parity-copy",
+      "kind": "ship",
+      "harness": "claude",
+      "mode": "no-mistakes",
+      "yolo": "on",
+      "branch": "fm/bs-p1a-parity-copy",
+      "project": "/home/captain/firstmate/projects/bookshop",
+      "spawn_gen": "s1795095890.314170.24236",
+      "backend": "herdr",
+      "remote": null,
+      "paths": {
+        "meta": {
+          "path": "/home/captain/firstmate/state/bs-p1a-parity-copy.meta",
+          "present": true
+        },
+        "status_log": {
+          "path": "/home/captain/firstmate/state/bs-p1a-parity-copy.status",
+          "present": true,
+          "kind": "event_history",
+          "last_event": {
+            "state": "paused",
+            "note": "50Z: no-mistakes fix round running after review gate response",
+            "raw": "paused [at=1795098045] until 2026-11-19T14:50Z: no-mistakes fix round running after review gate response",
+            "age_seconds": 341
+          }
+        },
+        "worktree": {
+          "path": "/home/captain/.worktrees/bookshop-98774f/2/bookshop",
+          "present": true
+        },
+        "home": {
+          "path": null,
+          "present": false
+        },
+        "report": {
+          "path": "/home/captain/firstmate/data/bs-p1a-parity-copy/report.md",
+          "present": false
+        }
+      },
+      "secondmate_projects": [],
+      "current_state": {
+        "state": "working",
+        "source": "run-step",
+        "detail": "validating (running) \u00b7 run: 01M7T2S9APR143NGN6G26E0HDY",
+        "raw": "state: working \u00b7 source: run-step \u00b7 validating (running) \u00b7 run: 01M7T2S9APR143NGN6G26E0HDY",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "endpoint": {
+        "target": "default:w7Q:p2",
+        "exists": true,
+        "agent_alive": "not_checked",
+        "status": "unknown",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "pr": {
+        "url": null,
+        "source": "absent",
+        "head": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "blocked_event": false,
+        "open_decisions": [],
+        "scout_report_present": false,
+        "last_event_text": "paused [at=1795098045] until 2026-11-19T14:50Z: no-mistakes fix round running after review gate response"
+      },
+      "actions": {
+        "watch": "bin/fm-peek.sh fm-bs-p1a-parity-copy",
+        "steer": "bin/fm-send.sh fm-bs-p1a-parity-copy '<instruction>'",
+        "return_channel_note": null
+      },
+      "backlog": {
+        "body_lines": [],
+        "reported": null,
+        "unresolved_blocker_ids": [],
+        "order": 3,
+        "id": "bs-p1a-parity-copy",
+        "blocked_by": null,
+        "pr_url": null,
+        "done": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "local_note": null,
+        "title": "Bookshop phase 1a: dev matches the live store (docs + dev Storefront mock) and visitor copy fixes (S4 S8 S10 W11 W12)",
+        "current_role": "worker",
+        "captain_actionable": false,
+        "structured": true,
+        "hold_set": null,
+        "report_path": null,
+        "body_excerpt": null,
+        "merged": null,
+        "kind": "ship",
+        "raw": "- [ ] bs-p1a-parity-copy - Bookshop phase 1a: dev matches the live store (docs + dev Storefront mock) and visitor copy fixes (S4 S8 S10 W11 W12)",
+        "checked": false,
+        "blocked_by_ids": [],
+        "hold_reason": null,
+        "requires_child_metadata": true,
+        "priority": null,
+        "state": "in_flight",
+        "hold_kind": null,
+        "since": "2026-11-19",
+        "repo": "bookshop",
+        "hold_age_days": 0,
+        "links": [],
+        "blocked_reason": null,
+        "hold_until": null
+      }
+    },
+    {
+      "id": "bs-p1b-headers-hero",
+      "kind": "ship",
+      "harness": "claude",
+      "mode": "no-mistakes",
+      "yolo": "on",
+      "branch": "fm/bs-p1b-headers-hero",
+      "project": "/home/captain/firstmate/projects/bookshop",
+      "spawn_gen": "s1795095902.320149.6474",
+      "backend": "herdr",
+      "remote": null,
+      "paths": {
+        "meta": {
+          "path": "/home/captain/firstmate/state/bs-p1b-headers-hero.meta",
+          "present": true
+        },
+        "status_log": {
+          "path": "/home/captain/firstmate/state/bs-p1b-headers-hero.status",
+          "present": true,
+          "kind": "event_history",
+          "last_event": {
+            "state": "paused",
+            "note": "no-mistakes fix round, waiting until 2026-11-19T14:36Z",
+            "raw": "paused [at=1795098284]: no-mistakes fix round, waiting until 2026-11-19T14:36Z",
+            "age_seconds": 102
+          }
+        },
+        "worktree": {
+          "path": "/home/captain/.worktrees/bookshop-98774f/3/bookshop",
+          "present": true
+        },
+        "home": {
+          "path": null,
+          "present": false
+        },
+        "report": {
+          "path": "/home/captain/firstmate/data/bs-p1b-headers-hero/report.md",
+          "present": false
+        }
+      },
+      "secondmate_projects": [],
+      "current_state": {
+        "state": "working",
+        "source": "run-step",
+        "detail": "validating (running) \u00b7 run: 01M7T2RYP07ZZSNRRSK849BRC3",
+        "raw": "state: working \u00b7 source: run-step \u00b7 validating (running) \u00b7 run: 01M7T2RYP07ZZSNRRSK849BRC3",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "endpoint": {
+        "target": "default:w7R:p2",
+        "exists": true,
+        "agent_alive": "not_checked",
+        "status": "unknown",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "pr": {
+        "url": null,
+        "source": "absent",
+        "head": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "blocked_event": false,
+        "open_decisions": [],
+        "scout_report_present": false,
+        "last_event_text": "paused [at=1795098284]: no-mistakes fix round, waiting until 2026-11-19T14:36Z"
+      },
+      "actions": {
+        "watch": "bin/fm-peek.sh fm-bs-p1b-headers-hero",
+        "steer": "bin/fm-send.sh fm-bs-p1b-headers-hero '<instruction>'",
+        "return_channel_note": null
+      },
+      "backlog": {
+        "blocked_reason": null,
+        "hold_until": null,
+        "hold_age_days": 0,
+        "links": [],
+        "since": "2026-11-19",
+        "repo": "bookshop",
+        "priority": null,
+        "hold_kind": null,
+        "state": "in_flight",
+        "hold_reason": null,
+        "requires_child_metadata": true,
+        "checked": false,
+        "blocked_by_ids": [],
+        "raw": "- [ ] bs-p1b-headers-hero - Bookshop phase 1b: security headers and a lighter phone hero image (W13 W14)",
+        "kind": "ship",
+        "body_excerpt": null,
+        "merged": null,
+        "hold_set": null,
+        "report_path": null,
+        "current_role": "worker",
+        "structured": true,
+        "captain_actionable": false,
+        "title": "Bookshop phase 1b: security headers and a lighter phone hero image (W13 W14)",
+        "local_note": null,
+        "hold_bucket": null,
+        "completion": {
+          "date": null,
+          "verb": null
+        },
+        "done": null,
+        "blocked_by": null,
+        "pr_url": null,
+        "order": 2,
+        "unresolved_blocker_ids": [],
+        "reported": null,
+        "id": "bs-p1b-headers-hero",
+        "body_lines": []
+      }
+    },
+    {
+      "id": "millwork",
+      "kind": "secondmate",
+      "harness": "claude",
+      "mode": "secondmate",
+      "yolo": "off",
+      "branch": null,
+      "project": "/home/captain/.worktrees/firstmate-6415ae/3/firstmate",
+      "spawn_gen": "s1794331040.1934951.8761",
+      "backend": "herdr",
+      "remote": null,
+      "paths": {
+        "meta": {
+          "path": "/home/captain/firstmate/state/millwork.meta",
+          "present": true
+        },
+        "status_log": {
+          "path": "/home/captain/firstmate/state/millwork.status",
+          "present": true,
+          "kind": "event_history",
+          "last_event": {
+            "state": "done",
+            "note": "corr=985cbad21bc5bf5d open-record persistence complete: this session holds no open work beyond durable records (backlog empty, nothing in flight, no unregistered captain calls), so nothing was filed or corrected; ready for restart",
+            "raw": "done: corr=985cbad21bc5bf5d open-record persistence complete: this session holds no open work beyond durable records (backlog empty, nothing in flight, no unregistered captain calls), so nothing was filed or corrected; ready for restart",
+            "age_seconds": null
+          }
+        },
+        "worktree": {
+          "path": "/home/captain/.worktrees/firstmate-6415ae/3/firstmate",
+          "present": true
+        },
+        "home": {
+          "path": "/home/captain/.worktrees/firstmate-6415ae/3/firstmate",
+          "present": true
+        },
+        "report": {
+          "path": "/home/captain/firstmate/data/millwork/report.md",
+          "present": false
+        }
+      },
+      "secondmate_projects": [
+        "millwork"
+      ],
+      "current_state": {
+        "state": "unknown",
+        "source": "none",
+        "detail": "backend target gone: default:w5K:p2",
+        "raw": "state: unknown \u00b7 source: none \u00b7 backend target gone: default:w5K:p2",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "endpoint": {
+        "target": "default:w5K:p2",
+        "exists": false,
+        "agent_alive": "dead",
+        "status": "absent",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "pr": {
+        "url": "https://github.com/example-org/millwork/pull/195",
+        "source": "status_event",
+        "head": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "blocked_event": false,
+        "open_decisions": [],
+        "scout_report_present": false,
+        "last_event_text": "done: corr=985cbad21bc5bf5d open-record persistence complete: this session holds no open work beyond durable records (backlog empty, nothing in flight, no unregistered captain calls), so nothing was filed or corrected; ready for restart"
+      },
+      "actions": {
+        "send": "bin/fm-send.sh fm-millwork '<request>'",
+        "watch": "read status/doc return channel; do not routinely fm-peek a secondmate for answers",
+        "return_channel_note": "Secondmate answers come back through status/doc paths after a marked fm-send request."
+      },
+      "backlog": null
+    },
+    {
+      "id": "timesheet",
+      "kind": "secondmate",
+      "harness": "claude",
+      "mode": "secondmate",
+      "yolo": "off",
+      "branch": null,
+      "project": "/home/captain/.worktrees/firstmate-6415ae/2/firstmate",
+      "spawn_gen": "s1794331046.1938013.31748",
+      "backend": "herdr",
+      "remote": null,
+      "paths": {
+        "meta": {
+          "path": "/home/captain/firstmate/state/timesheet.meta",
+          "present": true
+        },
+        "status_log": {
+          "path": "/home/captain/firstmate/state/timesheet.status",
+          "present": true,
+          "kind": "event_history",
+          "last_event": {
+            "state": "done",
+            "note": "open-record persistence done: no open work held in this conversation (no tasks in flight, queued, or held; no unregistered captain calls); nothing filed or corrected; safe to restart (via-helper)",
+            "raw": "done [corr=92120455f5b52fa3] [at=1794244585]: open-record persistence done: no open work held in this conversation (no tasks in flight, queued, or held; no unregistered captain calls); nothing filed or corrected; safe to restart (via-helper)",
+            "age_seconds": 853801
+          }
+        },
+        "worktree": {
+          "path": "/home/captain/.worktrees/firstmate-6415ae/2/firstmate",
+          "present": true
+        },
+        "home": {
+          "path": "/home/captain/.worktrees/firstmate-6415ae/2/firstmate",
+          "present": true
+        },
+        "report": {
+          "path": "/home/captain/firstmate/data/timesheet/report.md",
+          "present": false
+        }
+      },
+      "secondmate_projects": [
+        "timesheet"
+      ],
+      "current_state": {
+        "state": "unknown",
+        "source": "none",
+        "detail": "backend target gone: default:w5M:p2",
+        "raw": "state: unknown \u00b7 source: none \u00b7 backend target gone: default:w5M:p2",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "endpoint": {
+        "target": "default:w5M:p2",
+        "exists": false,
+        "agent_alive": "dead",
+        "status": "absent",
+        "observed_at": "2026-11-19T14:26:26Z",
+        "freshness": "fresh"
+      },
+      "pr": {
+        "url": "https://github.com/example-org/timesheet/pull/210",
+        "source": "status_event",
+        "head": null
+      },
+      "hints": {
+        "pending_decision": false,
+        "blocked_event": false,
+        "open_decisions": [],
+        "scout_report_present": false,
+        "last_event_text": "done [corr=92120455f5b52fa3] [at=1794244585]: open-record persistence done: no open work held in this conversation (no tasks in flight, queued, or held; no unregistered captain calls); nothing filed or corrected; safe to restart (via-helper)"
+      },
+      "actions": {
+        "send": "bin/fm-send.sh fm-timesheet '<request>'",
+        "watch": "read status/doc return channel; do not routinely fm-peek a secondmate for answers",
+        "return_channel_note": "Secondmate answers come back through status/doc paths after a marked fm-send request."
+      },
+      "backlog": null
+    }
+  ],
+  "main_inventory": {
+    "valid": true,
+    "reason": null,
+    "orphan_in_flight": [],
+    "unstructured_current_count": 0
+  },
+  "contributions": {
+    "counts": {
+      "captain": 0,
+      "fleet": 0,
+      "maintainer": 0,
+      "nobody": 273
+    }
+  },
+  "scout_reports": [
+    {
+      "id": "notes-pr-review",
+      "path": "/home/captain/firstmate/data/notes-pr-review/report.md",
+      "kind": "scout"
+    },
+    {
+      "id": "notes-pr-review-2",
+      "path": "/home/captain/firstmate/data/notes-pr-review-2/report.md",
+      "kind": "scout"
+    }
+  ],
+  "secondmate_current": {
+    "registry": {
+      "present": true,
+      "available": true,
+      "reason": null,
+      "provenance": "registered-table",
+      "path": "/home/captain/firstmate/data/secondmates.md",
+      "freshness": {
+        "status": "fresh",
+        "observed_at": "2026-11-19T14:26:26Z"
+      },
+      "records": [
+        {
+          "id": "millwork",
+          "home": "/home/captain/.worktrees/firstmate-6415ae/3/firstmate",
+          "host": null,
+          "root": null,
+          "remote": false,
+          "registered": true,
+          "registry_error": null
+        },
+        {
+          "id": "timesheet",
+          "home": "/home/captain/.worktrees/firstmate-6415ae/2/firstmate",
+          "host": null,
+          "root": null,
+          "remote": false,
+          "registered": true,
+          "registry_error": null
+        }
+      ],
+      "input_truncated": false,
+      "records_truncated": false,
+      "complete": true,
+      "reasons": [],
+      "lines_in_window": 2,
+      "records_in_window": 2
+    },
+    "records": [
+      {
+        "id": "millwork",
+        "home": "/home/captain/.worktrees/firstmate-6415ae/3/firstmate",
+        "host": null,
+        "remote": false,
+        "registered": true,
+        "spawn_gen": "s1794331040.1934951.8761",
+        "current": {
+          "state": "no_active_work",
+          "reason": null
+        },
+        "invalidity": {
+          "kind": null,
+          "ids": []
+        },
+        "reconcile_inventory": {
+          "kind": null,
+          "ids": []
+        },
+        "provenance": {
+          "selected": "structured-home",
+          "structured_home": "/home/captain/.worktrees/firstmate-6415ae/3/firstmate",
+          "summary_source": "local-ledger",
+          "summary_valid": true,
+          "trust": "complete",
+          "parent_event_role": "historical-only"
+        },
+        "freshness": {
+          "status": "fresh",
+          "observed_at": "2026-11-19T14:22:01Z",
+          "age_seconds": 265
+        },
+        "active_children": [],
+        "decisions_open": [],
+        "holds": [],
+        "queued": [],
+        "contributions": {
+          "known": 2,
+          "checked": 2,
+          "counts": {
+            "captain": 0,
+            "fleet": 0,
+            "maintainer": 0,
+            "nobody": 2
+          },
+          "unmeasured": 0,
+          "complete": true,
+          "proven_clear": true,
+          "stale_verdicts": 0,
+          "missing_verdicts": 0,
+          "unreadable_records": 0,
+          "valid_until": 1795099021,
+          "captain": [],
+          "captain_omitted": 0
+        },
+        "landed": [],
+        "endpoints": [],
+        "counts": {
+          "active_children": 0,
+          "decisions_open": 0,
+          "holds": 0,
+          "queued": 0,
+          "landed": 8,
+          "endpoints": 0
+        },
+        "omitted": [],
+        "parent_event": null,
+        "terminal_evidence": null,
+        "contradiction": false
+      },
+      {
+        "id": "timesheet",
+        "home": "/home/captain/.worktrees/firstmate-6415ae/2/firstmate",
+        "host": null,
+        "remote": false,
+        "registered": true,
+        "spawn_gen": "s1794331046.1938013.31748",
+        "current": {
+          "state": "no_active_work",
+          "reason": null
+        },
+        "invalidity": {
+          "kind": null,
+          "ids": []
+        },
+        "reconcile_inventory": {
+          "kind": null,
+          "ids": []
+        },
+        "provenance": {
+          "selected": "structured-home",
+          "structured_home": "/home/captain/.worktrees/firstmate-6415ae/2/firstmate",
+          "summary_source": "local-ledger",
+          "summary_valid": true,
+          "trust": "complete",
+          "parent_event_role": "historical-only"
+        },
+        "freshness": {
+          "status": "fresh",
+          "observed_at": "2026-11-10T17:17:32Z",
+          "age_seconds": 767334
+        },
+        "active_children": [],
+        "decisions_open": [],
+        "holds": [],
+        "queued": [],
+        "contributions": {
+          "known": 14,
+          "checked": 14,
+          "counts": {
+            "captain": 0,
+            "fleet": 0,
+            "maintainer": 0,
+            "nobody": 14
+          },
+          "unmeasured": 0,
+          "complete": true,
+          "proven_clear": true,
+          "stale_verdicts": 0,
+          "missing_verdicts": 0,
+          "unreadable_records": 0,
+          "valid_until": 1794331952,
+          "captain": [],
+          "captain_omitted": 0
+        },
+        "landed": [],
+        "endpoints": [],
+        "counts": {
+          "active_children": 0,
+          "decisions_open": 0,
+          "holds": 0,
+          "queued": 0,
+          "landed": 8,
+          "endpoints": 0
+        },
+        "omitted": [],
+        "parent_event": null,
+        "terminal_evidence": null,
+        "contradiction": true
+      }
+    ],
+    "total_registered": 2,
+    "total": 2,
+    "shown": 2,
+    "truncated": 0
+  },
+  "secondmate_landed": {
+    "records": [],
+    "truncated": [],
+    "unreadable": [],
+    "partial": []
+  },
+  "secondmate_guidance": {
+    "note": "For kind=secondmate, bearings selects validated structured state from that registered home; parent events and bounded terminal evidence are fallback-only supplements and never current-state authority."
+  }
+}
