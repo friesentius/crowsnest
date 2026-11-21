@@ -231,7 +231,7 @@ A worker whose declared wait has passed is flagged the same way, except while it
 
 ## Runners
 
-The RUNNERS panel has one lane per self-hosted runner, and its title answers "is a runner stuck?" at a glance: `✗ 1 stalled`, `▲ 1 slow`, `✓ all moving`, or nothing while every runner is idle.
+The RUNNERS panel has one lane per self-hosted runner, and its title answers "is a runner stuck?" at a glance: `✗ 1 stalled` (or `✗ 1 down`, `✗ 1 not picking up`, and `✗ 2 stuck` when different runners are in different trouble), `▲ 1 slow`, `✓ all moving`, or nothing while every runner is idle.
 
 ```text
 ╭ RUNNERS ✗ 1 stalled ────────────────── queue 1 ╮

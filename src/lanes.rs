@@ -50,7 +50,7 @@ impl Verdict {
         }
     }
 
-    /// Needs someone to act: counted as stalled in the panel title.
+    /// Needs someone to act: counted as stuck in the panel title.
     pub fn is_stuck(self) -> bool {
         matches!(
             self,
@@ -502,8 +502,9 @@ fn lane<'a>(
 /// What the runner panel's title says about the fleet of runners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fleet {
-    /// This many runners are down, stalled or not picking up.
-    Stuck(usize),
+    /// This many runners are down, stalled or not picking up: `kind` is
+    /// which, when they are all the same.
+    Stuck { n: usize, kind: Option<Verdict> },
     /// This many runners are slow.
     Slow(usize),
     /// Something runs and nothing is wrong.
@@ -517,7 +518,14 @@ pub fn fleet(lanes: &[Lane]) -> Fleet {
     let stuck = n(Verdict::is_stuck);
     let slow = n(|v| v == Verdict::Slow);
     if stuck > 0 {
-        Fleet::Stuck(stuck)
+        let mut kinds = lanes
+            .iter()
+            .map(|l| l.verdict)
+            .filter(|v| v.is_stuck())
+            .collect::<Vec<_>>();
+        kinds.dedup();
+        let kind = (kinds.len() == 1).then(|| kinds[0]);
+        Fleet::Stuck { n: stuck, kind }
     } else if slow > 0 {
         Fleet::Slow(slow)
     } else if lanes.iter().any(|l| l.current.is_some()) {
@@ -799,7 +807,13 @@ mod tests {
         );
         assert_eq!(l.queue[0].state, QueueState::Blocked);
         assert_eq!((l.next_start, l.drains_at), (None, None));
-        assert_eq!(fleet(&[l]), Fleet::Stuck(1));
+        assert_eq!(
+            fleet(&[l]),
+            Fleet::Stuck {
+                n: 1,
+                kind: Some(Verdict::Stalled)
+            }
+        );
         // Nine minutes of silence is under the default limit, and the limit
         // is configurable.
         s.runners[0].step_output_at = Some(NOW - 9 * MIN);
@@ -956,7 +970,13 @@ mod tests {
             (Verdict::NotPickingUp, Why::Unpicked(114 * MIN))
         );
         assert_eq!(l.queue[0].state, QueueState::NotPickingUp);
-        assert_eq!(fleet(&[l]), Fleet::Stuck(1));
+        assert_eq!(
+            fleet(&[l]),
+            Fleet::Stuck {
+                n: 1,
+                kind: Some(Verdict::NotPickingUp)
+            }
+        );
         // A read from before the limit passed proves nothing yet.
         s.jobs_read_at = Some(NOW - 2 * MIN);
         assert_eq!(one(&s).verdict, Verdict::Idle);
@@ -1103,8 +1123,29 @@ mod tests {
         down.listener_secs = None;
         s.runners.push(down);
         let ls = lanes(&s, &RunnerThresholds::default());
-        assert_eq!(fleet(&ls), Fleet::Stuck(1));
+        // A runner that is down is down, not stalled.
+        assert_eq!(
+            fleet(&ls),
+            Fleet::Stuck {
+                n: 1,
+                kind: Some(Verdict::Down)
+            }
+        );
         assert_eq!(fleet(&ls[..2]), Fleet::Moving);
+        // Different troubles are only `stuck` together.
+        let mut stalled = ls[0].clone();
+        stalled.verdict = Verdict::Stalled;
+        assert_eq!(
+            fleet(&[stalled.clone(), ls[2].clone()]),
+            Fleet::Stuck { n: 2, kind: None }
+        );
+        assert_eq!(
+            fleet(&[stalled.clone(), stalled]),
+            Fleet::Stuck {
+                n: 2,
+                kind: Some(Verdict::Stalled)
+            }
+        );
         assert_eq!(fleet(&ls[1..2]), Fleet::Quiet);
     }
 

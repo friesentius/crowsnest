@@ -671,8 +671,18 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
         span("RUNNERS", t.bold()),
     ];
     match lanes::fleet(&lanes) {
-        Fleet::Stuck(n) => title.push(span(
-            format!(" {} {n} stalled", t.verdict(Verdict::Stalled).0),
+        // Say what is wrong: a runner that is down is not stalled.
+        Fleet::Stuck { n, kind } => title.push(span(
+            format!(
+                " {} {n} {}",
+                t.verdict(kind.unwrap_or(Verdict::Stalled)).0,
+                match kind {
+                    Some(Verdict::Down) => "down",
+                    Some(Verdict::Stalled) => "stalled",
+                    Some(Verdict::NotPickingUp) => "not picking up",
+                    _ => "stuck",
+                }
+            ),
             t.bad(),
         )),
         Fleet::Slow(n) => title.push(span(format!(" {} {n} slow", t.warn_glyph()), t.warn())),

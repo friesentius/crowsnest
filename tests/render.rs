@@ -1047,7 +1047,10 @@ fn offline_and_slow_runners_are_called_out() {
     utc();
     let s = fleet_of_runners();
     let text = draw_light(&s, &app_for(&s), 180, 50);
-    assert!(text.contains("RUNNERS \u{2717} 1 stalled"), "{text}");
+    // A runner that is down is called down, not stalled; a stalled one
+    // (see `runner_stalled_180`) still is stalled.
+    assert!(text.contains("RUNNERS \u{2717} 1 down"), "{text}");
+    assert!(!text.contains("1 stalled"), "{text}");
     let down = lines_with(&text, "millwork")[0];
     assert!(
         down.contains("\u{2717} millwork") && down.contains("DOWN \u{b7} offline"),
