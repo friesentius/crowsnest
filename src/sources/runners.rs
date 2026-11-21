@@ -7,10 +7,11 @@
 //! process runs from inside that directory, and busy while a `Runner.Worker`
 //! does. Its systemd unit comes from the configuration, the cgroup of its
 //! listener, or the `.service` file `svc.sh install` writes. How recently it
-//! wrote its `_diag` logs comes from file times alone; no log is read. All
-//! of these are local reads; no API call is needed.
+//! wrote its `_diag` logs comes from file times; what it last did comes from
+//! the last 64 KiB of its newest worker and runner logs, never the whole
+//! file. All of these are local reads; no API call is needed.
 
-use crate::model::{Runner, RunnerSearch, Service, UnitSource};
+use crate::model::{LogTail, Runner, RunnerSearch, Service, UnitSource};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -352,25 +353,161 @@ fn mtime(p: &Path) -> Option<i64> {
 
 /// The newest `<prefix>*.log` in `dir`, by its name: the runner names its
 /// logs by their start time, so the newest name is the live log.
-fn newest_log(dir: &Path, prefix: &str) -> Option<i64> {
+fn newest_log(dir: &Path, prefix: &str) -> Option<PathBuf> {
     let newest = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|n| n.starts_with(prefix) && n.ends_with(".log"))
         .max()?;
-    mtime(&dir.join(newest))
+    Some(dir.join(newest))
 }
 
 /// When the runner last wrote its listener log, its worker log and a
 /// running step's output (`_diag/pages`). Only file times are read.
 pub fn read_diag(r: &mut Runner) {
     let diag = r.dir.join("_diag");
-    r.runner_log_at = newest_log(&diag, "Runner_");
-    r.worker_log_at = newest_log(&diag, "Worker_");
+    r.runner_log_at = newest_log(&diag, "Runner_").and_then(|p| mtime(&p));
+    r.worker_log_at = newest_log(&diag, "Worker_").and_then(|p| mtime(&p));
     r.step_output_at = std::fs::read_dir(diag.join("pages"))
         .ok()
         .and_then(|d| d.flatten().filter_map(|e| mtime(&e.path())).max());
+}
+
+/// The most of a log's end that is read.
+pub const TAIL_BYTES: u64 = 64 * 1024;
+
+/// The last `max` bytes of the file at `path`, from its first whole line,
+/// with control characters other than newlines and tabs removed. Only the
+/// tail is read, never the whole file.
+pub fn read_tail(path: &Path, max: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let start = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    f.take(max).read_to_end(&mut buf)?;
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        // The cut fell inside a line: drop that part.
+        text = match text.find('\n') {
+            Some(i) => text[i + 1..].to_string(),
+            None => String::new(),
+        };
+    }
+    text.retain(|c| !c.is_control() || c == '\n' || c == '\t');
+    Ok(text)
+}
+
+/// A `_diag` log line: `[2026-11-20 18:28:07Z INFO StepsRunner] text` ->
+/// (time, level, component, text). Continuation lines (stack traces) have
+/// no such head and are skipped.
+fn diag_line(line: &str) -> Option<(i64, &str, &str, &str)> {
+    let rest = line.strip_prefix('[')?;
+    let (head, text) = rest.split_once("] ")?;
+    let mut f = head.split_whitespace();
+    let (day, time, level, component) = (f.next()?, f.next()?, f.next()?, f.next()?);
+    let at = crate::timefmt::parse_iso(&format!("{day}T{time}"))?;
+    Some((at, level, component, text.trim_end()))
+}
+
+/// What the tail of a `Worker_*.log` says: its last line, the step it last
+/// started, and whether a process it started is still running.
+pub fn parse_worker_tail(text: &str) -> LogTail {
+    let mut t = LogTail::default();
+    for (at, level, component, msg) in text.lines().filter_map(diag_line) {
+        t.last = Some((at, format!("[{level} {component}] {msg}")));
+        if let Some(name) = msg.strip_prefix("Processing step: DisplayName='") {
+            let name = name.strip_suffix('\'').unwrap_or(name);
+            t.step = Some((at, name.to_string()));
+            t.process_running = false;
+        } else if component == "ProcessInvokerWrapper" {
+            if msg.starts_with("Starting process:") {
+                t.process_running = true;
+            } else if msg.starts_with("Finished process") {
+                t.process_running = false;
+            }
+        }
+    }
+    t
+}
+
+/// What the tail of a `Runner_*.log` says: its last line, the last line
+/// the listener wrote to its console, and the console errors after it.
+pub fn parse_runner_tail(text: &str) -> LogTail {
+    let mut t = LogTail::default();
+    for (at, level, component, msg) in text.lines().filter_map(diag_line) {
+        t.last = Some((at, format!("[{level} {component}] {msg}")));
+        if component != "Terminal" {
+            continue;
+        }
+        // `WRITE LINE: 2026-11-20 18:28:06Z: Running job: Lint`
+        let console = |kind: &str| {
+            let m = msg.strip_prefix(kind)?;
+            let m = m.split_once("Z: ").map_or(m, |(_, m)| m).trim();
+            (!m.is_empty()).then(|| m.to_string())
+        };
+        if let Some(m) = console("WRITE LINE: ") {
+            if m.starts_with("Current runner version") {
+                continue;
+            }
+            t.state = Some((at, m));
+            t.errors = 0;
+            t.error_since = None;
+            t.error = None;
+        } else if let Some(m) = console("WRITE ERROR: ") {
+            t.errors += 1;
+            t.error_since.get_or_insert(at);
+            t.error = Some((at, m));
+        }
+    }
+    t
+}
+
+/// Reads the tails of each runner's newest worker and runner logs, again
+/// only when a file's size or time changed.
+#[derive(Debug, Default)]
+pub struct LogTails {
+    seen: BTreeMap<PathBuf, ((u64, Option<std::time::SystemTime>), LogTail)>,
+}
+
+impl LogTails {
+    pub fn read(&mut self, r: &mut Runner) {
+        let diag = r.dir.join("_diag");
+        r.worker_tail = self.tail(newest_log(&diag, "Worker_"), parse_worker_tail);
+        r.runner_tail = self.tail(newest_log(&diag, "Runner_"), parse_runner_tail);
+    }
+
+    fn tail(&mut self, path: Option<PathBuf>, parse: fn(&str) -> LogTail) -> Option<LogTail> {
+        let path = path?;
+        let meta = std::fs::metadata(&path).ok()?;
+        let key = (meta.len(), meta.modified().ok());
+        if let Some((k, t)) = self.seen.get(&path)
+            && *k == key
+        {
+            return Some(t.clone());
+        }
+        let t = parse(&read_tail(&path, TAIL_BYTES).ok()?);
+        // A newer log of the same kind replaces the older one.
+        let kind = |p: &Path| {
+            let name = p.file_name()?.to_str()?;
+            Some((
+                p.parent()?.to_path_buf(),
+                name.split('_').next()?.to_string(),
+            ))
+        };
+        let this = kind(&path);
+        self.seen.retain(|p, _| kind(p) != this);
+        self.seen.insert(path, (key, t.clone()));
+        Some(t)
+    }
+
+    /// Forget logs that are no longer any runner's newest.
+    pub fn keep_only(&mut self, runners: &[Runner]) {
+        self.seen
+            .retain(|p, _| runners.iter().any(|r| p.starts_with(&r.dir)));
+    }
 }
 
 /// Parse `systemctl show --property=...` output. `None` when systemd has no
@@ -1055,6 +1192,135 @@ mod tests {
             (r.runner_log_at, r.worker_log_at, r.step_output_at),
             (None, None, None)
         );
+    }
+
+    fn at(s: &str) -> i64 {
+        crate::timefmt::parse_iso(s).unwrap()
+    }
+
+    #[test]
+    fn the_worker_tail_names_its_step_and_a_running_process() {
+        let t = parse_worker_tail(include_str!("../../tests/fixtures/runner/worker-tail.log"));
+        assert_eq!(
+            t.step,
+            Some((
+                at("2026-11-19T14:18:42Z"),
+                "Run actions/setup-node@v4".into()
+            ))
+        );
+        assert!(t.process_running, "setup-node's process has not finished");
+        assert_eq!(
+            t.last,
+            Some((
+                at("2026-11-19T14:27:02Z"),
+                "[INFO JobServerQueue] Try to upload 2 log files or attachments, success rate: 2/2."
+                    .into()
+            ))
+        );
+        // The step before finished its process.
+        let done = parse_worker_tail(
+            &include_str!("../../tests/fixtures/runner/worker-tail.log")
+                .lines()
+                .take(6)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert_eq!(done.step.unwrap().1, "Run actions/checkout@v4");
+        assert!(!done.process_running);
+        assert_eq!(parse_worker_tail("not a log\n"), LogTail::default());
+    }
+
+    #[test]
+    fn the_runner_tail_keeps_the_console_state_and_errors_after_it() {
+        let text = include_str!("../../tests/fixtures/runner/runner-tail.log");
+        let t = parse_runner_tail(text);
+        assert_eq!(
+            t.state,
+            Some((
+                at("2026-11-19T13:18:40Z"),
+                "Job Lint & typecheck completed with result: Succeeded".into()
+            ))
+        );
+        // A routine back-off is not an error; the console's errors are.
+        assert_eq!(t.errors, 2);
+        assert_eq!(t.error_since, Some(at("2026-11-19T13:26:03Z")));
+        assert_eq!(
+            t.error,
+            Some((
+                at("2026-11-19T13:46:12Z"),
+                "Runner connect error: Error: Conflict. Retrying until reconnected.".into()
+            ))
+        );
+        // A console line after them clears them.
+        let back = parse_runner_tail(&format!(
+            "{text}[2026-11-19 13:50:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:50:00Z: Runner reconnected.\n"
+        ));
+        assert_eq!(back.state.unwrap().1, "Runner reconnected.");
+        assert_eq!((back.errors, back.error_since, back.error), (0, None, None));
+    }
+
+    #[test]
+    fn only_the_tail_of_a_log_is_read() {
+        let dir = scratch("tail");
+        let path = dir.join("Worker_20261119-141834-utc.log");
+        let line = "[2026-11-19 14:18:42Z INFO JobServerQueue] padding padding padding padding\n";
+        let mut text = line.repeat(2000);
+        text.push_str("[2026-11-19 14:27:02Z INFO StepsRunner] Processing step: DisplayName='Run \u{1b}[31mtests'\n");
+        std::fs::write(&path, &text).unwrap();
+        assert!(text.len() as u64 > TAIL_BYTES);
+        let tail = read_tail(&path, TAIL_BYTES).unwrap();
+        assert!(tail.len() as u64 <= TAIL_BYTES);
+        assert!(
+            tail.starts_with("[2026-11-19 14:18:42Z"),
+            "starts at a whole line"
+        );
+        assert!(
+            tail.ends_with("DisplayName='Run [31mtests'\n"),
+            "escape removed: {:?}",
+            &tail[tail.len() - 60..]
+        );
+        let short = read_tail(&path, 10).unwrap();
+        assert_eq!(short, "", "no whole line fits");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn log_tails_are_read_again_only_when_the_newest_log_changes() {
+        let dir = scratch("tails");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        let worker = diag.join("Worker_20261119-090000-utc.log");
+        std::fs::write(
+            &worker,
+            "[2026-11-19 09:00:01Z INFO StepsRunner] Processing step: DisplayName='Build'\n",
+        )
+        .unwrap();
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut tails = LogTails::default();
+        tails.read(&mut r);
+        assert_eq!(
+            r.worker_tail.as_ref().unwrap().step.as_ref().unwrap().1,
+            "Build"
+        );
+        assert_eq!(r.runner_tail, None, "no runner log yet");
+        // A newer worker log (the next job) replaces the old one.
+        std::fs::write(
+            diag.join("Worker_20261119-100000-utc.log"),
+            "[2026-11-19 10:00:01Z INFO StepsRunner] Processing step: DisplayName='Test'\n",
+        )
+        .unwrap();
+        tails.read(&mut r);
+        assert_eq!(
+            r.worker_tail.as_ref().unwrap().step.as_ref().unwrap().1,
+            "Test"
+        );
+        assert_eq!(tails.seen.len(), 1, "the older log is forgotten");
+        tails.keep_only(&[]);
+        assert!(tails.seen.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

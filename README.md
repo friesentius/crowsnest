@@ -55,6 +55,7 @@ It is written in Rust with [ratatui](https://ratatui.rs), and it is a single bin
 
 Workers that need you sort to the top and stand out.
 The USAGE panel shows how much of each window is used (quota-axi reports what is left, crowsnest flips it), most-used first, with the reset time beside it.
+A window being spent faster than its clock runs (quota-axi's pace `ahead`) will run out before it resets: its percentage turns yellow and gets a `▲`, and where there is room the reset time is replaced by when it runs out at its average rate so far (`86%▲  out Fri 12:18`). Windows on or under pace look as usual.
 Press Enter on a row to open its detail: every pipeline step with its duration, each PR check, the last status line, and the worktree.
 Press Tab to move to the runner panel, pick a runner with the arrows, and press Enter for its detail (see [Runners](#runners)).
 At 140 columns or more the panels move to a right-hand column, and the held captain calls get their own box.
@@ -88,6 +89,7 @@ The ones you are most likely to want:
 | `--wait-grace-minutes MIN` | 5 | How long after a worker's declared `until` time its row is flagged because nothing followed. |
 | `--fleet-interval SECS` | 60 | Seconds between fleet snapshots. |
 | `--pipeline-interval SECS` | 15 | Seconds between no-mistakes status reads for each live task. |
+| `--github-interval SECS` | 60 | Seconds between GitHub reads while a PR, busy runner or queued job is on screen (at least 30; 5 minutes otherwise). |
 | `--runner-root DIR` | your home | Folders to search for runner directories (repeatable); replaces the config file's `[runners] roots`. Runners whose listener is running are found wherever they are (see [Finding runners](#finding-runners)). |
 | `--runner-silent-minutes MIN` | 10 | How long a busy runner's step output may stay still (with its job's processes idle) before it is shown as STALLED. |
 | `--runner-idle-cpu-seconds SECS` | 2 | CPU-seconds a silent job's processes may use over that window and still count as idle. |
@@ -163,6 +165,7 @@ runner_idle_cpu_seconds = 2.0
 [refresh]
 fleet_seconds = 60
 pipeline_seconds = 15
+github_seconds = 60
 
 [display]
 ascii = false
@@ -187,6 +190,7 @@ units = { "~/ci/actions-runner-app" = "actions-runner-app.service" }  # runner f
 | `thresholds.runner_idle_cpu_seconds` | 2.0 | As `--runner-idle-cpu-seconds`, 0 to 3600. |
 | `refresh.fleet_seconds` | 60 | As `--fleet-interval`, 10 to 3600. |
 | `refresh.pipeline_seconds` | 15 | As `--pipeline-interval`, 5 to 3600. |
+| `refresh.github_seconds` | 60 | As `--github-interval`, 30 to 3600. |
 | `display.ascii` | `false` | As `--ascii`. |
 | `runners.processes` | `true` | Find runners from the `Runner.Listener` processes that are running, and read each one's systemd unit from its cgroup. See [Finding runners](#finding-runners). |
 | `runners.roots` | `[]` | Folders whose subfolders are searched for runner folders. Empty: your home directory. `--runner-root` replaces it for a run. A path starts with `/` or `~/`; one inside the firstmate home is refused and reported. |
@@ -268,7 +272,8 @@ Two limits follow from reading CPU:
 
 Stalled runners are not counted in the roster's `! stale` yet.
 
-Enter on a runner opens its detail: the verdict in a sentence, the run and job with every step (the running one against its typical time), the queue with the estimated start and drain, recent jobs on that runner with their duration and result plus its busy share and queue waits, and its health: the listener and its uptime, whether GitHub lists it online, its version and labels, and its systemd service with restarts.
+Enter on a runner opens its detail: the verdict in a sentence, the run and job with every step (the running one against its typical time), the queue with the estimated start and drain, recent jobs on that runner with their duration and result plus its busy share and queue waits, and its health: the listener and its uptime, whether GitHub lists it online, its version and labels, its systemd service with restarts, and what the listener last wrote to its console (`Listening for Jobs`, `Running job: ...`).
+Crowsnest reads the last 64 KiB of the runner's newest worker and runner logs in `_diag` (only when they changed, never the whole file). From the worker log the detail names the step the worker started and whether the process it started is still running (`worker log: step "Run actions/setup-node@v4" since 14:18, process running`); the lane shows that step when GitHub has not been read. From the runner log, a console error such as `Runner connect error: Error: Conflict. Retrying until reconnected.` is shown in yellow in the health section and on the runner's lane until the listener writes an ordinary line again. The routine back-off the listener logs around every job is not counted.
 GitHub's runner list needs repository admin read; without it the detail says `online ?` and the rest still works.
 The service line and the lane's restart count (`2 restarts`, or `↺2` in a narrow panel) need the runner's systemd unit; [Finding runners](#finding-runners) says where it comes from.
 
@@ -314,17 +319,22 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | --- | --- | --- |
 | Roster, held calls | `bin/fm-fleet-snapshot.sh --json`, schema `fm-fleet-snapshot.v1` | 60 s (`--fleet-interval`), or at once on `r`; crowsnest never reads firstmate's state files, so nothing else speeds it up |
 | Pipeline strip and steps | `no-mistakes axi status`, inside each no-mistakes task's worktree | 15 s |
-| PR checks | one `gh api graphql` read query for every PR on screen | 60 s while anything is active, otherwise 5 min |
-| Runners | `.runner` files in runner folders; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times (never the contents) of the newest `_diag` logs and step output pages | 5 s (folders re-listed every 60 s, and when a listener starts or stops) |
+| PR checks | one `gh api graphql` read query for every PR on screen | 60 s (`--github-interval`) while anything is active, otherwise 5 min |
+| Runners | `.runner` files in runner folders; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times of the newest `_diag` logs and step output pages, and the last 64 KiB of the newest worker and runner logs when they changed | 5 s (folders re-listed every 60 s, and when a listener starts or stops) |
 | Runner units | `/proc/<pid>/cgroup` of each running `Runner.Listener` (Linux), and the `.service` file `svc.sh install` writes | when folders are listed |
 | Runner services | `systemctl [--user] show --property=LoadState,ActiveState,SubState,NRestarts` for a runner with a known unit | 30 s |
-| Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress` and each run's `.../jobs` | with PR checks, and every 60 s while a job is queued |
+| Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress&per_page=100` and each run's `.../jobs`; runs beyond 100 of either are counted as `+N runs unread` | with PR checks, and every 60 s while a job is queued |
 | Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
 | Runner registration | `gh api --method GET repos/<owner>/<repo>/actions/runners` (needs admin read) | 5 min |
 | Host | load, memory, swap, disks, and Linux pressure stall information | 2 s |
 | Usage | `quota-axi --no-credential-refresh --json` | 5 min |
 
 Each source runs on its own thread, with a timeout, and never overlaps itself.
+
+GitHub is read through your `gh` login, whose 5000 requests an hour (REST and GraphQL separately) are shared with everything else using it.
+Every `gh api` read asks for the response headers, so crowsnest knows how much of each budget is left. A list asked for again carries the ETag of its last answer; when nothing changed GitHub answers 304, which does not count against the budget, and the last answer is reused.
+When fewer requests are left than would last until the budget resets at the current pace (keeping half for other programs), GitHub reads slow down; under a tenth of the REST budget the footer says `gh 7% left`.
+When GitHub refuses for rate limit, crowsnest stops asking until the reset time GitHub gives: the last data stays, the footer says `gh limit → 14:48`, and the RUNNERS panel says when reads resume and how old its queue is. A rate-limit refusal is not counted as a failure.
 A source that fails keeps its last good data and is marked with `!` in the footer (`host !`, `runners !`, `nm !`, `gh !`, `quota !`); the fleet snapshot's error is spelled out under the summary line, and the host and runner errors at the top of their panels.
 The host fails outright only when load, memory and disks all failed; the runners fail outright when a root cannot be listed and no runner was found. An unreadable root, an unreadable or malformed `.runner` file, or a process table that cannot be scanned is otherwise a partial failure: the runners that were read stay.
 When its read fails outright, it is retried less often, doubling up to 5 minutes, until it recovers; a read where only some items failed, such as one unresolvable PR or one worktree, is still marked but keeps its normal cadence.
@@ -337,7 +347,7 @@ When one is missing, its source is marked with `!` and the rest keeps working.
 ## Read-only by construction
 
 - `src/exec.rs` is the only place crowsnest starts a program, and it can only start the read commands listed above, with fixed arguments.
-- GraphQL mutations and any REST method other than GET are refused before anything runs.
+- GraphQL mutations and any REST method other than GET are refused before anything runs; the only header crowsnest sends is `If-None-Match` with an ETag GitHub gave it, checked against the ETag format first.
 - quota-axi always gets `--no-credential-refresh`, so a read can never renew a vendor login.
 - The fleet snapshot's optional summary cache is pointed at crowsnest's own cache directory (`$XDG_CACHE_HOME/crowsnest`), never at the firstmate home.
 - Crowsnest takes no firstmate locks, moves no inbox files, and never runs the `steer` or `watch` commands the snapshot lists.

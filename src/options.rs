@@ -173,10 +173,14 @@ pub fn items(
         .into_iter()
         .map(|s| setting_item(s, file, overrides))
         .collect(),
-        Category::Refresh => [Setting::FleetSeconds, Setting::PipelineSeconds]
-            .into_iter()
-            .map(|s| setting_item(s, file, overrides))
-            .collect(),
+        Category::Refresh => [
+            Setting::FleetSeconds,
+            Setting::PipelineSeconds,
+            Setting::GithubSeconds,
+        ]
+        .into_iter()
+        .map(|s| setting_item(s, file, overrides))
+        .collect(),
         Category::Runners => runner_items(file, overrides),
         Category::Display => vec![setting_item(Setting::Ascii, file, overrides)],
     }
@@ -420,7 +424,9 @@ fn value_text(s: Setting, v: u64) -> String {
         | Setting::RunnerPickupMinutes => format!("{v} min"),
         Setting::RunnerOverdueFactor => format!("{}x", s.show(v)),
         Setting::RunnerIdleCpuSeconds => format!("{} s", s.show(v)),
-        Setting::FleetSeconds | Setting::PipelineSeconds => format!("{v} s"),
+        Setting::FleetSeconds | Setting::PipelineSeconds | Setting::GithubSeconds => {
+            format!("{v} s")
+        }
         Setting::Ascii => if v != 0 { "ascii" } else { "unicode" }.into(),
     }
 }
@@ -462,6 +468,10 @@ fn setting_item(s: Setting, file: &Settings, overrides: &Overrides) -> Item {
         Setting::PipelineSeconds => (
             "pipelines every",
             "Time between no-mistakes status reads for each live task.",
+        ),
+        Setting::GithubSeconds => (
+            "GitHub every",
+            "Time between GitHub reads while a PR, busy runner or queued job is on screen (5 min otherwise). Unchanged answers cost nothing, and reads slow down by themselves when the shared 5000/h budget runs low.",
         ),
         Setting::Ascii => (
             "glyphs",

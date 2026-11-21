@@ -292,6 +292,9 @@ pub struct Runner {
     pub runner_log_at: Option<i64>,
     pub worker_log_at: Option<i64>,
     pub step_output_at: Option<i64>,
+    /// What the tails of the newest worker and runner logs say.
+    pub worker_tail: Option<LogTail>,
+    pub runner_tail: Option<LogTail>,
     /// The running job's process tree CPU time: (Unix time, cumulative
     /// CPU milliseconds) samples, oldest first, at least 15 s apart.
     pub job_cpu: Vec<(i64, u64)>,
@@ -639,7 +642,64 @@ pub struct QuotaWindow {
     pub label: String,
     pub pct_used: f64,
     pub resets_at: Option<i64>,
+    /// quota-axi's pace: `ahead` (spending faster than the window's clock,
+    /// so it runs out before it resets), `on_pace` or `behind`.
     pub pace: Option<String>,
+    /// When the window runs out at its average rate so far, when that is
+    /// before it resets.
+    pub runs_out_at: Option<i64>,
+}
+
+/// GitHub's counters for one budget of the `gh` login, from the headers of
+/// its last answer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RateLimit {
+    pub limit: u64,
+    pub remaining: u64,
+    /// Unix time the budget refills.
+    pub reset_at: i64,
+    /// When these counters were read.
+    pub read_at: Option<i64>,
+    /// GitHub refused for rate limit: nothing is asked until then.
+    pub paused_until: Option<i64>,
+    /// When that pause began, so the screen can say how old its data is.
+    pub paused_at: Option<i64>,
+}
+
+impl RateLimit {
+    /// A pause still in effect at `now`.
+    pub fn paused(&self, now: i64) -> Option<i64> {
+        self.paused_until.filter(|u| *u > now)
+    }
+}
+
+/// The REST and GraphQL budgets, and what the queue read had to leave out.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct GhBudget {
+    pub core: RateLimit,
+    pub graphql: RateLimit,
+    /// Queued or running workflow runs per repository that were not read
+    /// (beyond the page size), from GitHub's `total_count`.
+    pub runs_unread: BTreeMap<String, u64>,
+}
+
+/// What the newest lines of a runner's `_diag` log say, from its tail.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct LogTail {
+    /// The last line and its time.
+    pub last: Option<(i64, String)>,
+    /// Worker log: the step it last started, by display name.
+    pub step: Option<(i64, String)>,
+    /// Worker log: a process was started and has not finished.
+    pub process_running: bool,
+    /// Runner log: what the listener last wrote to its console (`Listening
+    /// for Jobs`, `Running job: ...`, `Job ... completed with result: ...`).
+    pub state: Option<(i64, String)>,
+    /// Runner log: the console errors written since that line (`Runner
+    /// connect error: ...`): how many, the first one's time, and the last.
+    pub errors: usize,
+    pub error_since: Option<i64>,
+    pub error: Option<(i64, String)>,
 }
 
 /// How fresh one source is.
@@ -671,6 +731,8 @@ pub struct Snapshot {
     pub host: Option<Host>,
     pub quota: Vec<QuotaWindow>,
     pub fresh: BTreeMap<String, Freshness>,
+    /// GitHub's rate-limit budgets as last seen.
+    pub gh_budget: GhBudget,
 }
 
 /// The limits that turn a quiet row into one that needs attention.

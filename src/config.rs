@@ -76,11 +76,12 @@ pub enum Setting {
     RunnerIdleCpuSeconds,
     FleetSeconds,
     PipelineSeconds,
+    GithubSeconds,
     Ascii,
 }
 
 impl Setting {
-    pub const ALL: [Setting; 10] = [
+    pub const ALL: [Setting; 11] = [
         Setting::StaleMinutes,
         Setting::ParkedMinutes,
         Setting::WaitGraceMinutes,
@@ -90,12 +91,13 @@ impl Setting {
         Setting::RunnerIdleCpuSeconds,
         Setting::FleetSeconds,
         Setting::PipelineSeconds,
+        Setting::GithubSeconds,
         Setting::Ascii,
     ];
 
     pub fn section(self) -> &'static str {
         match self {
-            Setting::FleetSeconds | Setting::PipelineSeconds => "refresh",
+            Setting::FleetSeconds | Setting::PipelineSeconds | Setting::GithubSeconds => "refresh",
             Setting::Ascii => "display",
             _ => "thresholds",
         }
@@ -112,6 +114,7 @@ impl Setting {
             Setting::RunnerIdleCpuSeconds => "runner_idle_cpu_seconds",
             Setting::FleetSeconds => "fleet_seconds",
             Setting::PipelineSeconds => "pipeline_seconds",
+            Setting::GithubSeconds => "github_seconds",
             Setting::Ascii => "ascii",
         }
     }
@@ -128,6 +131,7 @@ impl Setting {
             Setting::RunnerIdleCpuSeconds => "--runner-idle-cpu-seconds",
             Setting::FleetSeconds => "--fleet-interval",
             Setting::PipelineSeconds => "--pipeline-interval",
+            Setting::GithubSeconds => "--github-interval",
             Setting::Ascii => "--ascii",
         }
     }
@@ -156,6 +160,7 @@ impl Setting {
             Setting::RunnerIdleCpuSeconds => (0, 360_000),
             Setting::FleetSeconds => (10, 3600),
             Setting::PipelineSeconds => (5, 3600),
+            Setting::GithubSeconds => (30, 3600),
             Setting::Ascii => (0, 1),
         }
     }
@@ -172,6 +177,7 @@ impl Setting {
             Setting::RunnerIdleCpuSeconds => &[0, 50, 100, 200, 500, 1000, 3000],
             Setting::FleetSeconds => &[10, 15, 20, 30, 45, 60, 90, 120, 300, 600],
             Setting::PipelineSeconds => &[5, 10, 15, 20, 30, 60, 120, 300],
+            Setting::GithubSeconds => &[30, 45, 60, 90, 120, 180, 300, 600],
             Setting::Ascii => &[0, 1],
         }
     }
@@ -212,6 +218,7 @@ impl Setting {
             Setting::RunnerIdleCpuSeconds => s.runner_idle_cpu_hundredths,
             Setting::FleetSeconds => s.fleet_seconds,
             Setting::PipelineSeconds => s.pipeline_seconds,
+            Setting::GithubSeconds => s.github_seconds,
             Setting::Ascii => s.ascii as u64,
         }
     }
@@ -227,6 +234,7 @@ impl Setting {
             Setting::RunnerIdleCpuSeconds => s.runner_idle_cpu_hundredths = v,
             Setting::FleetSeconds => s.fleet_seconds = v,
             Setting::PipelineSeconds => s.pipeline_seconds = v,
+            Setting::GithubSeconds => s.github_seconds = v,
             Setting::Ascii => s.ascii = v != 0,
         }
     }
@@ -275,6 +283,8 @@ pub struct Settings {
     pub runner_idle_cpu_hundredths: u64,
     pub fleet_seconds: u64,
     pub pipeline_seconds: u64,
+    /// Seconds between GitHub reads while something there is live.
+    pub github_seconds: u64,
     pub ascii: bool,
     pub runners: RunnerSettings,
 }
@@ -294,6 +304,7 @@ impl Default for Settings {
             runner_idle_cpu_hundredths: runner.idle_cpu_ms / 10,
             fleet_seconds: 60,
             pipeline_seconds: 15,
+            github_seconds: 60,
             ascii: false,
             runners: RunnerSettings::default(),
         }
@@ -1048,6 +1059,7 @@ wait_grace_minutes = 2
 [refresh]
 fleet_seconds = 5
 pipeline_seconds = 30.5
+github_seconds = 10
 [colours]
 accent = \"cyan\"
 ",
@@ -1067,6 +1079,7 @@ accent = \"cyan\"
                 "thresholds.parked_minutes must be a whole number from 1 to 1440",
                 "refresh.fleet_seconds must be a whole number from 10 to 3600",
                 "refresh.pipeline_seconds must be a whole number from 5 to 3600",
+                "refresh.github_seconds must be a whole number from 30 to 3600",
                 "unknown section [colours]",
             ]
         );

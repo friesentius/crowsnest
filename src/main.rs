@@ -63,6 +63,12 @@ struct Args {
     #[arg(long, value_name = "SECS")]
     pipeline_interval: Option<u64>,
 
+    /// Seconds between GitHub reads while a PR, busy runner or queued job
+    /// is on screen; 5 minutes otherwise [default: 60, or the config
+    /// file's; at least 30].
+    #[arg(long, value_name = "SECS")]
+    github_interval: Option<u64>,
+
     /// Directory to search for runner directories (repeatable;
     /// replaces the config file's [runners] roots; default: your home
     /// directory). Runners whose Runner.Listener is running are found
@@ -173,6 +179,7 @@ fn overrides(args: &Args) -> Overrides {
         ),
         (Setting::FleetSeconds, args.fleet_interval),
         (Setting::PipelineSeconds, args.pipeline_interval),
+        (Setting::GithubSeconds, args.github_interval),
         (Setting::Ascii, args.ascii.then_some(1)),
     ] {
         if let Some(v) = value {
@@ -193,6 +200,10 @@ fn fleet_interval(s: &Settings) -> Duration {
 
 fn pipeline_interval(s: &Settings) -> Duration {
     Duration::from_secs(s.pipeline_seconds.max(5))
+}
+
+fn github_interval(s: &Settings) -> Duration {
+    Duration::from_secs(s.github_seconds.max(30))
 }
 
 /// A fleet read is overdue after three missed reads, and never sooner than
@@ -247,6 +258,7 @@ fn config(
         disk_paths,
         fleet_interval: fleet_interval(settings),
         pipeline_interval: pipeline_interval(settings),
+        github_interval: github_interval(settings),
         github: !args.no_github,
         quota: !args.no_quota,
         quota_providers: args.quota_providers.clone(),
@@ -381,7 +393,11 @@ fn settings_changed(
     fm_home: &Path,
 ) {
     let effective = app.effective();
-    handle.set_intervals(fleet_interval(&effective), pipeline_interval(&effective));
+    handle.set_intervals(
+        fleet_interval(&effective),
+        pipeline_interval(&effective),
+        github_interval(&effective),
+    );
     let (runners, runner_problems) = config::discovery(
         &app.settings.runners,
         &app.overrides,
@@ -460,6 +476,8 @@ mod tests {
             "--runner-overdue-factor",
             "1.25",
             "--runner-idle-cpu-seconds=-1",
+            "--github-interval",
+            "10",
         ])
         .unwrap();
         let o = overrides(&args);
@@ -471,6 +489,8 @@ mod tests {
         assert_eq!(o.get(Setting::RunnerSilentMinutes), None);
         let s = o.apply(&Settings::default());
         assert_eq!(fleet_interval(&s), Duration::from_secs(10), "still clamped");
+        assert_eq!(o.get(Setting::GithubSeconds), Some(10));
+        assert_eq!(github_interval(&s), Duration::from_secs(30), "clamped too");
         assert_eq!(read_overdue_secs(&s), DEFAULT_READ_OVERDUE_SECS);
     }
 

@@ -183,6 +183,14 @@ pub fn parse_runs(json: &str) -> Result<Vec<RunInfo>, String> {
     Ok(out)
 }
 
+/// The `total_count` of a runs list: how many runs match, read or not.
+pub fn total_count(json: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(json)
+        .ok()?
+        .get("total_count")?
+        .as_u64()
+}
+
 /// Every job of `repos/<r>/actions/runs/<id>/jobs`, with its steps.
 pub fn parse_jobs(repo: &str, json: &str) -> Result<Vec<Job>, String> {
     let v: Value = serde_json::from_str(json).map_err(|e| format!("invalid jobs JSON: {e}"))?;

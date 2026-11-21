@@ -25,6 +25,34 @@ fn at(epoch: i64, now: i64) -> String {
     timefmt::short_when(epoch, now)
 }
 
+/// The step the worker's own log says it started, when the runner is busy
+/// and the log is from the running job (not a leftover of the last one).
+fn log_step<'a>(lane: &Lane<'a>) -> Option<(i64, &'a str, bool)> {
+    let r = lane.runner;
+    if !r.busy {
+        return None;
+    }
+    let start = lane
+        .current
+        .as_ref()
+        .and_then(|c| c.job)
+        .and_then(|j| j.started_at)
+        .or(r.busy_since());
+    let wt = r.worker_tail.as_ref()?;
+    let (at, name) = wt.step.as_ref()?;
+    start
+        .is_none_or(|s| *at >= s)
+        .then_some((*at, name.as_str(), wt.process_running))
+}
+
+/// The listener's own console error (`Runner connect error: ...`), when it
+/// has written one since its last ordinary console line.
+fn console_error<'a>(lane: &Lane<'a>) -> Option<(i64, &'a str)> {
+    let rt = lane.runner.runner_tail.as_ref()?;
+    let (_, msg) = rt.error.as_ref()?;
+    Some((rt.error_since?, msg.as_str()))
+}
+
 /// `left`, then `right` flush against the right edge; `left` gives way.
 fn lr(left: Spans, right: Spans, w: usize) -> Line<'static> {
     let rw = width_of(&right);
@@ -241,6 +269,9 @@ fn narrow_detail(view: &View, lane: &Lane) -> Option<Spans> {
                 format!("{} waits, blocked", tiny_name(&q.job.name)),
                 t.bad(),
             ),
+            (None, _) if console_error(lane).is_some() => {
+                ("log: connect error".to_string(), t.warn())
+            }
             (None, Some(a)) => (format!("runner log {} ago", dur((now - a).max(0))), t.dim()),
             (None, None) => return None,
         },
@@ -260,6 +291,10 @@ fn narrow_detail(view: &View, lane: &Lane) -> Option<Spans> {
                 };
                 let (w, st) = wait_text(t, lane, q, true, now);
                 (format!("{}{more} {w}", tiny_name(&q.job.name)), st)
+            }
+            None if lane.current.is_none() => {
+                console_error(lane)?;
+                ("log: connect error".to_string(), t.warn())
             }
             None => {
                 let c = lane.current.as_ref()?;
@@ -338,6 +373,9 @@ fn wide_detail(view: &View, lane: &Lane, w: usize) -> Vec<(u8, Line<'static>)> {
             if let Some(e) = c.step_elapsed {
                 right.push(span(format!("{} ", dur(e)), t.dim()));
             }
+        } else if let Some((since, name, _)) = log_step(lane) {
+            l.push(span(format!("step {} (log)", step_name(name)), t.dim()));
+            right.push(span(format!("{} ", dur((now - since).max(0))), t.dim()));
         }
         if let Some((text, st)) = signal_text(t, lane) {
             if l.len() > 1 {
@@ -358,6 +396,18 @@ fn wide_detail(view: &View, lane: &Lane, w: usize) -> Vec<(u8, Line<'static>)> {
             };
             out.push((if stuck { 1 } else { 3 }, line));
         }
+    }
+    if let Some((since, _)) = console_error(lane) {
+        out.push((
+            1,
+            fit(
+                vec![span(
+                    format!("    runner log: connect error since {}", at(since, now)),
+                    t.warn(),
+                )],
+                w,
+            ),
+        ));
     }
     for (i, q) in lane.queue.iter().enumerate() {
         let (g, gs) = t.check(crate::model::CheckState::Queued);
@@ -544,6 +594,28 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
             .into_iter()
             .map(|l| (0, l))
             .collect();
+    // GitHub refused for rate limit: the queue, steps and verdicts below
+    // stopped updating, so say until when and how old they are.
+    if let Some(until) = snap.gh_budget.core.paused(snap.now) {
+        let old = snap
+            .jobs_read_at
+            .map(|r| format!(", data {} old", dur((snap.now - r).max(0))))
+            .unwrap_or_default();
+        let text = if wide {
+            format!(
+                "{} GitHub limit: resumes {}{old}",
+                t.warn_glyph(),
+                at(until, snap.now)
+            )
+        } else {
+            format!(
+                "{} GitHub limit, resumes {}",
+                t.warn_glyph(),
+                at(until, snap.now)
+            )
+        };
+        lines.insert(0, (0, fit(vec![span(text, t.warn())], w)));
+    }
     lines.extend(body);
     content.extend(keep(lines, avail, t).into_iter().map(Content::Line));
     let mut title = vec![
@@ -567,13 +639,25 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
         Fleet::Quiet => {}
     }
     let queued: usize = lanes.iter().map(|l| l.queue.len()).sum();
-    let right = if queued == 0 {
+    let mut right = if queued == 0 {
         vec![]
     } else if wide {
         vec![span(format!("queue {queued}"), t.warn())]
     } else {
         vec![span(format!("q{queued}"), t.warn())]
     };
+    // Runs past one page were not read, so the queue is short by their jobs.
+    let unread: u64 = snap.gh_budget.runs_unread.values().sum();
+    if unread > 0 {
+        right.push(span(
+            if wide {
+                format!(" +{unread} runs unread")
+            } else {
+                format!("+{unread}?")
+            },
+            t.warn(),
+        ));
+    }
     let border = if view.app.runners_focused(snap) {
         t.focus_border()
     } else {
@@ -784,16 +868,19 @@ fn now_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
     };
     let mut out = Vec::new();
     let Some(j) = c.job else {
+        let why = if view.snap.gh_budget.core.paused(now).is_some() {
+            "GitHub paused for rate limit"
+        } else {
+            "GitHub not read yet"
+        };
         out.push(fit(
             vec![
                 label(t, "NOW"),
-                span(
-                    format!("busy {} (GitHub not read yet)", dur(c.elapsed)),
-                    t.plain(),
-                ),
+                span(format!("busy {} ({why})", dur(c.elapsed)), t.plain()),
             ],
             w,
         ));
+        out.extend(worker_log_line(view, lane, w));
         return out;
     };
     let mut l = vec![label(t, "NOW")];
@@ -936,14 +1023,32 @@ fn now_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         l.push(span(text, st));
     }
     out.push(fit(l, w));
+    out.extend(worker_log_line(view, lane, w));
     out
+}
+
+/// What the worker's own log says it is doing: the step it started and
+/// whether the process it started for it is still running.
+fn worker_log_line(view: &View, lane: &Lane, w: usize) -> Option<Line<'static>> {
+    let t = &view.theme;
+    let (since, name, running) = log_step(lane)?;
+    let mut text = format!(
+        "worker log: step \"{name}\" since {}",
+        at(since, view.snap.now)
+    );
+    if running {
+        text.push_str(", process running");
+    }
+    Some(fit(vec![pad(), span(text, t.dim())], w))
 }
 
 fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
     let t = &view.theme;
     let now = view.snap.now;
     if lane.queue.is_empty() {
-        return vec![fit(vec![label(t, "QUEUE"), span("empty", t.dim())], w)];
+        let mut out = vec![fit(vec![label(t, "QUEUE"), span("empty", t.dim())], w)];
+        out.extend(unread_line(view, lane, w));
+        return out;
     }
     let mut out = Vec::new();
     let name_w = lane
@@ -1020,7 +1125,29 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         _ => "no estimate yet: fewer than 3 past runs of the running job".into(),
     };
     out.push(fit(vec![pad(), span(summary, t.dim())], w));
+    out.extend(unread_line(view, lane, w));
     out
+}
+
+/// Active runs of the lane's repository that were not read: more than one
+/// page of queued or running runs. The queue above is missing their jobs.
+fn unread_line(view: &View, lane: &Lane, w: usize) -> Option<Line<'static>> {
+    let repo = lane.runner.repo.as_ref()?;
+    let n = *view.snap.gh_budget.runs_unread.get(repo)?;
+    let page = crate::sources::RUNS_PAGE;
+    Some(fit(
+        vec![
+            pad(),
+            span(
+                format!(
+                    "+{n} more active run{} not read: only the {page} newest queued and {page} newest running are",
+                    if n == 1 { "" } else { "s" }
+                ),
+                view.theme.warn(),
+            ),
+        ],
+        w,
+    ))
 }
 
 fn recent_section(view: &View, lane: &Lane, w: usize, rows: usize) -> Vec<Line<'static>> {
@@ -1183,11 +1310,36 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             t.dim(),
         )),
     }
-    if let Some(a) = r.runner_log_at {
-        l.push(span(
+    let console = r.runner_tail.as_ref().and_then(|rt| {
+        rt.error
+            .as_ref()
+            .zip(rt.error_since)
+            .map(|((_, msg), since)| {
+                (
+                    format!("connect error since {}: {msg}", at(since, now)),
+                    t.warn(),
+                )
+            })
+            .or_else(|| rt.state.as_ref().map(|(_, s)| (s.clone(), t.dim())))
+    });
+    match (r.runner_log_at, console) {
+        // What the listener last wrote to its console, on a line of its own.
+        (Some(a), Some((text, st))) => {
+            out.push(fit(l, w));
+            l = vec![
+                pad(),
+                span(
+                    format!("runner log {} ago: ", dur((now - a).max(0))),
+                    t.dim(),
+                ),
+                span(text, st),
+            ];
+        }
+        (Some(a), None) => l.push(span(
             format!(" \u{b7} runner log {} ago", dur((now - a).max(0))),
             t.dim(),
-        ));
+        )),
+        (None, _) => {}
     }
     out.push(fit(l, w));
     out
