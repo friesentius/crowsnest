@@ -2291,7 +2291,6 @@ fn with_log_tails() -> Snapshot {
                     errors: 6,
                     error_since: Some(now - 61 * 60),
                     error: Some((now - 41 * 60, "Error: Conflict.".into())),
-                    failures: 40,
                     failure_since: Some(now - 61 * 60),
                     failure_at: Some(now - 20),
                     ..Default::default()
@@ -2390,14 +2389,14 @@ fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
     assert!(!text.contains("console error"), "{text}");
     assert!(!draw_light(&s, &app_for(&s), 180, 50).contains("console error"));
     assert!(!draw_light(&s, &app_for(&s), 100, 34).contains("log: console error"));
-    // Failing attempts with no console error in view: retrying.
+    // Failing attempts with no console line in view: retrying.
     for r in &mut s.runners {
         if r.name == "millwork-runner" {
             let t = r.runner_tail.as_mut().unwrap();
+            t.state = None;
             t.errors = 0;
             t.error = None;
             t.error_since = None;
-            t.failures = 5;
             t.failure_since = Some(now - 4 * 60);
             t.failure_at = Some(now - 15);
         }

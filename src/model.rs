@@ -722,12 +722,10 @@ pub struct LogTail {
     /// Runner log: lines that show the listener failing to reach GitHub
     /// (an `ERR` line, `Attempt N of ... failed`, `Back off ...`, `Sleeping
     /// for N seconds before retrying`) since its last ordinary console
-    /// line: how many, the first one's time, and the newest one's. One
-    /// failed request writes several of these in the same second, so the
-    /// count says little; the time they span does. The listener prints a
-    /// console error once per outage, so these lines are the evidence that
-    /// the trouble goes on.
-    pub failures: usize,
+    /// line: the first one's time and the newest one's. One failed request
+    /// writes several of these in the same second, so the time they span is
+    /// what tells. The listener prints a console error once per outage, so
+    /// these lines are the evidence that the trouble goes on.
     pub failure_since: Option<i64>,
     pub failure_at: Option<i64>,
 }
@@ -737,7 +735,7 @@ pub struct LogTail {
 /// failed attempts.
 pub const FAILURE_LIVE_SECS: i64 = 5 * 60;
 
-/// How long failing attempts must have gone on, with no console error in
+/// How long failing attempts must have gone on, with no console line in
 /// view, before the listener reads as retrying. A request that times out
 /// (100 s) or a failed attempt that the next one fixes is routine and spans
 /// less; a real outage spans minutes.
@@ -748,7 +746,8 @@ pub const RETRYING_MIN_SECS: i64 = 2 * 60;
 pub enum Trouble<'a> {
     /// A console error, written first at `since`; `msg` is the last one.
     ConsoleError { since: i64, msg: &'a str },
-    /// Failing attempts since `since`, with no console error in view.
+    /// Failing attempts since `since`, with no console line in view: the
+    /// log was first read mid-outage.
     Retrying { since: i64 },
 }
 
@@ -772,6 +771,12 @@ impl LogTail {
                 since,
                 msg: msg.as_str(),
             });
+        }
+        // A read that lands mid-outage sees no console line at all. After an
+        // ordinary console line, failing lines without a console error are
+        // routine timeouts.
+        if self.state.is_some() {
+            return None;
         }
         // A failed attempt or two is routine; failing for minutes is not.
         self.failure_since

@@ -543,10 +543,8 @@ fn note_failure(t: &mut LogTail, at: i64) {
         t.errors = 0;
         t.error_since = None;
         t.error = None;
-        t.failures = 0;
         t.failure_since = None;
     }
-    t.failures += 1;
     t.failure_since.get_or_insert(at);
     t.failure_at = Some(at);
 }
@@ -566,7 +564,6 @@ pub fn fold_runner(t: &mut LogTail, text: &str) {
                 t.errors = 0;
                 t.error_since = None;
                 t.error = None;
-                t.failures = 0;
                 t.failure_since = None;
                 t.failure_at = None;
             } else if let Some(m) = console(msg, "WRITE ERROR: ") {
@@ -1664,7 +1661,7 @@ mod tests {
         // One failed attempt is routine, and the old error is not shown.
         assert_eq!(t.trouble(now), None);
         assert_eq!((t.error_since, t.errors), (None, 0));
-        assert_eq!((t.failures, t.failure_since), (1, Some(now - 1)));
+        assert_eq!(t.failure_since, Some(now - 1));
         // A second failed attempt half a minute later is still routine: the
         // third may work.
         let more = format!(
@@ -1690,7 +1687,6 @@ mod tests {
         // failing spans does not.
         let block = include_str!("../../tests/fixtures/runner/runner-routine-timeout.log");
         let t = parse_runner_tail(block);
-        assert!(t.failures >= 7, "{}", t.failures);
         let at = t.failure_at.unwrap();
         assert_eq!(t.failure_since, Some(at));
         assert_eq!(t.trouble(at + 1), None);
@@ -1703,6 +1699,28 @@ mod tests {
             parse_runner_tail(&three).trouble(at + 201),
             Some(Trouble::Retrying { .. })
         ));
+    }
+
+    #[test]
+    fn routine_timeouts_after_an_ordinary_console_line_are_not_retrying() {
+        // Three timed-out requests 100 s apart span over 2 minutes. With no
+        // console line in view the log was read mid-outage: retrying. After
+        // an ordinary console line they are routine and show nothing.
+        let block = include_str!("../../tests/fixtures/runner/runner-routine-timeout.log");
+        let three = format!(
+            "{block}{}{}",
+            shifted_to(block, "2026-11-03", 100),
+            shifted_to(block, "2026-11-03", 200)
+        );
+        let alone = parse_runner_tail(&three);
+        let now = alone.failure_at.unwrap() + 1;
+        assert!(matches!(alone.trouble(now), Some(Trouble::Retrying { .. })));
+        let first = &block[1..20];
+        let listening = format!("[{first}Z INFO Terminal] WRITE LINE: Listening for Jobs\n");
+        let after = parse_runner_tail(&format!("{listening}{three}"));
+        assert!(after.state.is_some());
+        assert_eq!(after.failure_since, alone.failure_since);
+        assert_eq!(after.trouble(now), None);
     }
 
     /// `text` with every `day` line `secs` later.
@@ -1751,7 +1769,7 @@ mod tests {
         assert_eq!(t.trouble(at("2026-10-29T06:40:00Z")), None);
         // Other components' errors, and a lone failed attempt, are not it.
         let other = "[2026-10-29 06:23:24Z ERR  JobDispatcher] Job failed\n[2026-10-29 06:23:25Z ERR  JobDispatcher] Job failed\n";
-        assert_eq!(parse_runner_tail(other).failures, 0);
+        assert_eq!(parse_runner_tail(other).failure_at, None);
     }
 
     #[test]
