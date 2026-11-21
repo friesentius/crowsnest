@@ -5,9 +5,9 @@
 use crowsnest::app::{Action, App, all_rows};
 use crowsnest::config::{Overrides, Panel, Setting, Settings};
 use crowsnest::model::{
-    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, LogTail, PrChecks, QuotaWindow,
-    RepoHistory, RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot, StaleKind,
-    Thresholds, Worker, WorkerState,
+    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, LogTail, PrChecks, QueueRead,
+    QuotaWindow, RepoHistory, RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot,
+    StaleKind, Thresholds, Worker, WorkerState,
 };
 use crowsnest::options::Category;
 use crowsnest::sources::{fleet, gh, history, nm, quota};
@@ -2024,17 +2024,25 @@ fn a_long_entry_keeps_its_end_in_view() {
     assert!(t.contains("\u{2026}"), "{t}");
 }
 
-/// The recorded usage, but the claude week is 86% spent with 21% of its
-/// time left: spent faster than its clock, it runs out before it resets.
-fn ahead_week() -> Snapshot {
+/// The recorded usage, but the claude week is `left`% left, `ahead` of its
+/// clock, and quota-axi projects it runs out at `out`.
+fn ahead_week_with(left: u32, out: &str) -> Snapshot {
     let mut s = snapshot();
-    let json = fixture("quota.json").replacen(
-        "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",\n            \"reservePercentPoints\": 43.9769,",
-        "\"percentRemaining\": 14,\n          \"pace\": {\n            \"status\": \"ahead\",\n            \"reservePercentPoints\": -7.0,",
-        1,
-    );
+    let json = fixture("quota.json")
+        .replacen(
+            "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",",
+            &format!("\"percentRemaining\": {left},\n          \"pace\": {{\n            \"status\": \"ahead\","),
+            1,
+        )
+        .replacen("2026-11-22T06:11:43.000Z", out, 1);
     s.quota = quota::parse(&json).unwrap();
     s
+}
+
+/// 86% of the week spent with 21% of its time left: spent faster than its
+/// clock, it runs out before it resets.
+fn ahead_week() -> Snapshot {
+    ahead_week_with(14, "2026-11-20T12:18:42.000Z")
 }
 
 #[test]
@@ -2058,6 +2066,25 @@ fn a_window_spent_faster_than_its_clock_says_when_it_runs_out() {
         "{narrow}"
     );
     insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
+}
+
+#[test]
+fn a_run_out_projected_from_little_use_is_shown_to_the_hour() {
+    utc();
+    // 4% of the week used: whole percents make the minutes meaningless.
+    let s = ahead_week_with(96, "2026-11-20T11:49:00.000Z");
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        lines_with(&wide, "claude week")[0].contains("\u{2500}   4%\u{25b2}  out ~Fri 12:00"),
+        "{wide}"
+    );
+    // 20% used is no longer coarse.
+    let s = ahead_week_with(80, "2026-11-20T11:49:00.000Z");
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        lines_with(&wide, "claude week")[0].contains("out Fri 11:49"),
+        "{wide}"
+    );
 }
 
 /// The runners fleet while GitHub refuses for rate limit: the limit was
@@ -2126,11 +2153,75 @@ fn a_low_budget_is_shown_in_the_footer() {
         ..Default::default()
     };
     let text = draw_light(&s, &app_for(&s), 180, 50);
-    assert!(text.contains("gh 7% left"), "{text}");
+    assert!(text.contains("gh 7% left 25s"), "{text}");
+    // The age stays beside the chip when the footer is narrow too.
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(narrow.contains("gh 7% left 25s"), "{narrow}");
     s.gh_budget.core.remaining = 600;
     let text = draw_light(&s, &app_for(&s), 180, 50);
     assert!(!text.contains("% left"), "{text}");
     assert!(text.contains("gh 25s"), "{text}");
+}
+
+/// SIMULATED: the budget is low, so the gh tier waits 14 minutes between
+/// reads instead of the configured 60 s.
+fn slowed() -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.gh_budget.core = crowsnest::model::RateLimit {
+        limit: 5000,
+        remaining: 380,
+        reset_at: now + 3000,
+        ..Default::default()
+    };
+    s.gh_budget.slowed = Some(crowsnest::model::Slowed {
+        every: 14 * 60,
+        next_at: now + 10 * 60,
+    });
+    s.jobs_read_at = Some(now - 4 * 60 - 25);
+    s.fresh.get_mut("gh").unwrap().ok_at = Some(now - 4 * 60 - 25);
+    s
+}
+
+#[test]
+fn slowed_reads_say_when_the_next_is_due_and_how_old_the_queue_is() {
+    utc();
+    let s = slowed();
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        wide.contains("\u{25b2} GitHub reads slowed: next 14:37, data 4m old"),
+        "{wide}"
+    );
+    assert!(wide.contains("gh 7% left 4m"), "{wide}");
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(narrow.contains("GitHub slowed, next 14:37"), "{narrow}");
+    assert!(narrow.contains("gh 7% left 4m"), "{narrow}");
+    // Once the next read is due the row is gone, and a pause says its own.
+    let mut due = s.clone();
+    due.gh_budget.slowed.as_mut().unwrap().next_at = due.now - 1;
+    assert!(!draw_light(&due, &app_for(&due), 180, 50).contains("reads slowed"));
+    let mut off = s.clone();
+    off.gh_budget.slowed = None;
+    assert!(!draw_light(&off, &app_for(&off), 180, 50).contains("reads slowed"));
+    let mut paused = rate_limited();
+    paused.gh_budget.slowed = s.gh_budget.slowed;
+    let text = draw_light(&paused, &app_for(&paused), 180, 50);
+    assert!(text.contains("GitHub limit: resumes"), "{text}");
+    assert!(!text.contains("reads slowed"), "{text}");
+}
+
+#[test]
+fn slowed_100() {
+    utc();
+    let s = slowed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn slowed_180() {
+    utc();
+    let s = slowed();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
 }
 
 #[test]
@@ -2199,10 +2290,9 @@ fn with_log_tails() -> Snapshot {
                     state: Some((now - 2 * 3600, "Listening for Jobs".into())),
                     errors: 6,
                     error_since: Some(now - 61 * 60),
-                    error: Some((
-                        now - 41 * 60,
-                        "Runner connect error: Error: Conflict. Retrying until reconnected.".into(),
-                    )),
+                    error: Some((now - 41 * 60, "Error: Conflict.".into())),
+                    failure_since: Some(now - 61 * 60),
+                    failure_at: Some(now - 20),
                     ..Default::default()
                 });
             }
@@ -2233,16 +2323,16 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
     open_runner(&s, &mut app, "millwork-runner");
     let text = draw_light(&s, &app, 180, 44);
     assert!(
-        text.contains("runner log 41m ago: connect error since 13:26: Runner connect error: Error: Conflict. Retrying until reconnected."),
+        text.contains("runner log 41m ago: console error since 13:26: Error: Conflict."),
         "{text}"
     );
     let wide = draw_light(&s, &app_for(&s), 180, 50);
     assert!(
-        wide.contains("runner log: connect error since 13:26"),
+        wide.contains("runner log: console error since 13:26"),
         "{wide}"
     );
     let narrow = draw_light(&s, &app_for(&s), 100, 34);
-    assert!(narrow.contains("\u{2514} log: connect error"), "{narrow}");
+    assert!(narrow.contains("\u{2514} log: console error"), "{narrow}");
     // A worker log from the job before is not this job's step.
     let mut old = s.clone();
     old.runners[0].worker_tail.as_mut().unwrap().step = Some((
@@ -2252,6 +2342,153 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
     let mut app = app_for(&old);
     open_runner(&old, &mut app, "pantry-local-runner");
     assert!(!draw_light(&old, &app, 100, 34).contains("worker log: step"));
+}
+
+#[test]
+fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
+    utc();
+    let mut s = with_log_tails();
+    let now = s.now;
+    let long = "Resource temporarily unavailable (broker.actions.githubusercontent.com:443).";
+    // REPLAY of the real message of 2026-10-29: the detail wraps it under
+    // its label instead of cutting it off at 100 columns.
+    for r in &mut s.runners {
+        if r.name == "millwork-runner" {
+            r.runner_tail.as_mut().unwrap().error = Some((now - 41 * 60, long.into()));
+        }
+    }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(
+        text.contains(
+            "runner log 41m ago: console error since 13:26: Resource temporarily unavailable"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("(broker.actions.githubusercontent.com:443)."),
+        "{text}"
+    );
+    assert!(!text.contains("connect error"), "{text}");
+    // The newest failing attempt is 6 minutes old: the listener got through
+    // (it prints nothing when it does), so nothing is shown, in the detail,
+    // on its lane or in the narrow panel.
+    for r in &mut s.runners {
+        if r.name == "millwork-runner" {
+            r.runner_tail.as_mut().unwrap().failure_at = Some(now - 6 * 60);
+        }
+    }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(
+        text.contains("runner log 41m ago: Listening for Jobs"),
+        "{text}"
+    );
+    assert!(!text.contains("console error"), "{text}");
+    assert!(!draw_light(&s, &app_for(&s), 180, 50).contains("console error"));
+    assert!(!draw_light(&s, &app_for(&s), 100, 34).contains("log: console error"));
+    // Failing attempts with no console line in view: retrying.
+    for r in &mut s.runners {
+        if r.name == "millwork-runner" {
+            let t = r.runner_tail.as_mut().unwrap();
+            t.state = None;
+            t.errors = 0;
+            t.error = None;
+            t.error_since = None;
+            t.failure_since = Some(now - 4 * 60);
+            t.failure_at = Some(now - 15);
+        }
+    }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(
+        text.contains("runner log 41m ago: listener retrying since 14:23"),
+        "{text}"
+    );
+    assert!(draw_light(&s, &app_for(&s), 100, 34).contains("log: retrying"));
+}
+
+/// The runners fleet where bookshop's repository cannot be read, as
+/// REPLAYED from the live check of a runner registered to a repository the
+/// `gh` login cannot see: pantry's queue is fine.
+fn with_unreadable_repository() -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.queue_reads.insert(
+        "acme/pantry".into(),
+        QueueRead {
+            read_at: Some(now - 25),
+            error: None,
+        },
+    );
+    s.queue_reads.insert(
+        "acme/bookshop".into(),
+        QueueRead {
+            read_at: None,
+            error: Some("gh: HTTP 404: Not Found".into()),
+        },
+    );
+    s.fresh.insert(
+        "gh".into(),
+        Freshness {
+            ok_at: Some(now - 25),
+            error: Some("acme/bookshop queue: gh: HTTP 404: Not Found".into()),
+        },
+    );
+    s
+}
+
+#[test]
+fn an_unreadable_repository_says_queue_not_read_not_empty() {
+    utc();
+    let s = with_unreadable_repository();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "bookshop-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(text.contains("Idle, queue not read."), "{text}");
+    assert!(
+        text.contains("QUEUE    not read: gh: HTTP 404: Not Found"),
+        "{text}"
+    );
+    assert!(!text.contains("nothing queued"), "{text}");
+    assert!(!text.contains("QUEUE    empty"), "{text}");
+    // The other repository's runner still has its queue.
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(text.contains("Lint & typecheck"), "{text}");
+    assert!(!text.contains("queue not read"), "{text}");
+    // A repository that was read and has nothing queued is empty.
+    let mut ok = s.clone();
+    ok.queue_reads.get_mut("acme/bookshop").unwrap().error = None;
+    ok.queue_reads.get_mut("acme/bookshop").unwrap().read_at = Some(ok.now - 25);
+    let mut app = app_for(&ok);
+    open_runner(&ok, &mut app, "bookshop-runner");
+    let text = draw_light(&ok, &app, 100, 40);
+    assert!(text.contains("QUEUE    empty"), "{text}");
+    // The jobs of a repository whose latest read failed are shown, with
+    // the reason and a note that they are old.
+    let mut stale = s.clone();
+    stale.queue_reads.get_mut("acme/pantry").unwrap().error = Some("gh: HTTP 502".into());
+    let mut app = app_for(&stale);
+    open_runner(&stale, &mut app, "pantry-local-runner");
+    let text = draw_light(&stale, &app, 100, 44);
+    assert!(text.contains("Lint & typecheck"), "{text}");
+    assert!(
+        text.contains("queue not read: gh: HTTP 502; the jobs above are from the last good read"),
+        "{text}"
+    );
+    // Without GitHub the queue was never read either.
+    let mut off = fleet_of_runners();
+    off.fresh.remove("gh");
+    off.jobs_read_at = None;
+    let mut app = app_for(&off);
+    open_runner(&off, &mut app, "bookshop-runner");
+    let text = draw_light(&off, &app, 100, 40);
+    assert!(text.contains("not read (--no-github)"), "{text}");
 }
 
 #[test]

@@ -838,7 +838,9 @@ fn summary(view: &View, rows: &[Row], w: usize) -> Vec<Span<'static>> {
 /// The footer's gh marker when the rate-limit budget is the news: reads
 /// paused until GitHub's reset (`gh limit → 14:48`), or under a tenth of
 /// the REST budget left (`gh 7% left`), when reads slow down by themselves.
-fn gh_budget_chip(view: &View) -> Option<String> {
+/// The second says nothing of how old the data is, so the footer keeps the
+/// age beside it (`gh 7% left 4m`): the `bool` is whether it does.
+fn gh_budget_chip(view: &View) -> Option<(String, bool)> {
     let t = &view.theme;
     let (b, now) = (&view.snap.gh_budget, view.snap.now);
     let paused = [b.core.paused(now), b.graphql.paused(now)]
@@ -846,15 +848,18 @@ fn gh_budget_chip(view: &View) -> Option<String> {
         .flatten()
         .max();
     if let Some(until) = paused {
-        return Some(format!(
-            "gh limit {} {} ",
-            t.g("\u{2192}", "->"),
-            timefmt::short_when(until, now)
+        return Some((
+            format!(
+                "gh limit {} {} ",
+                t.g("\u{2192}", "->"),
+                timefmt::short_when(until, now)
+            ),
+            false,
         ));
     }
     let c = &b.core;
     (c.limit > 0 && c.reset_at > now && c.remaining * 10 < c.limit)
-        .then(|| format!("gh {}% left ", c.remaining * 100 / c.limit))
+        .then(|| (format!("gh {}% left ", c.remaining * 100 / c.limit), true))
 }
 
 fn age_of(snap: &Snapshot, tier: &str) -> Option<i64> {
@@ -1179,6 +1184,11 @@ fn panel_mark(t: &Theme, p: Panel) -> &'static str {
     t.g(SUP[i], ASCII[i])
 }
 
+/// Below this percent used a window's run-out projection is shown no finer
+/// than the hour: a whole percent of a week is 1.7 hours, so the minutes of
+/// a projection made from so little use mean nothing.
+const COARSE_PROJECTION_BELOW: f64 = 20.0;
+
 fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
@@ -1202,10 +1212,20 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     q.sort_by(|a, b| b.pct_used.total_cmp(&a.pct_used));
     let n = 6;
     let with_reset = w >= 44;
-    // `  ↻ Sat 02:00`, or `  out Fri 12:18` for a window that runs out first.
+    // `  ↻ Sat 02:00`, or `  out Fri 12:18` for a window that runs out
+    // first. quota-axi reports whole percents, so with little of the window
+    // used its projection is only good to the hour: `  out ~Fri 12:00`.
     let out_at = |win: &crate::model::QuotaWindow| {
-        win.runs_out_at
-            .map(|o| format!("  out {}", timefmt::short_when(o, view.snap.now)))
+        win.runs_out_at.map(|o| {
+            if win.pct_used < COARSE_PROJECTION_BELOW {
+                format!(
+                    "  out ~{}",
+                    timefmt::short_when(timefmt::nearest_hour(o), view.snap.now)
+                )
+            } else {
+                format!("  out {}", timefmt::short_when(o, view.snap.now))
+            }
+        })
     };
     let reset_w = q
         .iter()
@@ -1424,9 +1444,12 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         if f.error.is_some() {
             right.push(span(format!("{tier} ! "), t.warn()));
         } else if tier == "gh"
-            && let Some(chip) = gh_budget_chip(view)
+            && let Some((chip, with_age)) = gh_budget_chip(view)
         {
             right.push(span(chip, t.warn()));
+            if with_age && let Some(a) = age_of(view.snap, tier) {
+                right.push(span(format!("{} ", timefmt::dur(a)), t.dim()));
+            }
         } else if let Some(a) = age_of(view.snap, tier)
             && !matches!(tier, "host" | "runners")
         {

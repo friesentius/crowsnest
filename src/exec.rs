@@ -31,7 +31,8 @@ pub enum ReadCommand {
     /// With the ETag of an earlier answer, GitHub answers 304 when nothing
     /// changed, and that answer does not count against the rate limit.
     GhApiGet { path: String, etag: Option<String> },
-    /// `quota-axi --no-credential-refresh --json [--provider a,b]`.
+    /// `quota-axi --no-credential-refresh --json --full [--provider a,b]`. Only
+    /// `--full` carries each window's projected run-out time and its confidence.
     QuotaAxi { providers: Vec<String> },
     /// `systemctl [--user] show --property=... -- <unit>`: a runner's service.
     SystemctlShow { unit: String, user: bool },
@@ -199,7 +200,11 @@ impl ReadCommand {
                 }
             }
             ReadCommand::QuotaAxi { providers } => {
-                let mut args = vec!["--no-credential-refresh".to_string(), "--json".to_string()];
+                let mut args = vec![
+                    "--no-credential-refresh".to_string(),
+                    "--json".to_string(),
+                    "--full".to_string(),
+                ];
                 if !providers.is_empty() {
                     if providers.iter().any(|p| {
                         p.is_empty() || !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')

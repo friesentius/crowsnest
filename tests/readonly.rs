@@ -375,10 +375,106 @@ esac
                     "actions-runner-pantry.service"
                 ]
             ),
-            "quota-axi" => assert_eq!(args, ["--no-credential-refresh", "--json"]),
+            "quota-axi" => assert_eq!(args, ["--no-credential-refresh", "--json", "--full"]),
             other => panic!("unexpected program {other}"),
         }
     }
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// SIMULATED from the live check of finding 3: two runners, one registered
+/// to a repository the `gh` login cannot read (GitHub answers 404 to its run
+/// lists). The queue of the other must still be read and shown.
+#[test]
+fn one_unreadable_repository_does_not_blank_the_queue_of_the_others() {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("unreadable-repo-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let (home, shims, runners) = (root.join("fm"), root.join("shims"), root.join("runners"));
+    for d in [
+        home.join("bin"),
+        home.join("state"),
+        shims.clone(),
+        runners.join("actions-runner-pantry"),
+        runners.join("actions-runner-bookshop"),
+    ] {
+        fs::create_dir_all(d).unwrap();
+    }
+    let runner_file = fs::read_to_string(format!("{FIXTURES}/runner/.runner")).unwrap();
+    fs::write(runners.join("actions-runner-pantry/.runner"), &runner_file).unwrap();
+    // `acme/bookshop` sorts first: it is asked before pantry.
+    fs::write(
+        runners.join("actions-runner-bookshop/.runner"),
+        runner_file.replace("pantry", "bookshop"),
+    )
+    .unwrap();
+    write_exec(
+        &home.join("bin/fm-fleet-snapshot.sh"),
+        "echo '{\"workers\": [], \"secondmates\": []}'\n",
+    );
+    write_exec(
+        &shims.join("gh"),
+        r#"head() { printf 'HTTP/2.0 %s\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 4321\r\nX-Ratelimit-Reset: 4102444800\r\nX-Ratelimit-Resource: core\r\n\r\n' "$1"; }
+case "$*" in
+  *"repos/acme/bookshop/"*) head "404 Not Found"; echo '{"message": "Not Found"}'; echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  *"/actions/runners"*) head "200 OK"; cat "$CN_FIXTURES/gh-runners.json" ;;
+  *"status=completed"*) head "200 OK"; cat "$CN_FIXTURES/gh-runs-completed.json" ;;
+  *"/jobs"*) head "200 OK"; cat "$CN_FIXTURES/gh-jobs.json" ;;
+  *"/actions/runs?"*) head "200 OK"; cat "$CN_FIXTURES/gh-runs.json" ;;
+  *) head "200 OK"; echo '{}' ;;
+esac
+"#,
+    );
+    let config_dir = root.join("config");
+    fs::create_dir_all(config_dir.join("crowsnest")).unwrap();
+    fs::write(
+        config_dir.join("crowsnest/config.toml"),
+        "[runners]\nprocesses = false\n",
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        shims.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_crowsnest"))
+        .args(["--once", "--no-quota", "--fm-home"])
+        .arg(&home)
+        .arg("--cache-dir")
+        .arg(root.join("cache"))
+        .arg("--runner-root")
+        .arg(&runners)
+        .args(["--disk", "/"])
+        .env("PATH", path)
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", &config_dir)
+        .env("CN_FIXTURES", FIXTURES)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let snap: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    // Pantry's queue is read although bookshop's repository answered 404.
+    assert_eq!(snap["jobs"][0]["name"], "Unit + e2e tests");
+    let reads = &snap["queue_reads"];
+    assert!(reads["acme/pantry"]["error"].is_null(), "{reads}");
+    assert!(reads["acme/pantry"]["read_at"].is_i64(), "{reads}");
+    assert_eq!(
+        reads["acme/bookshop"]["error"], "gh: HTTP 404: Not Found",
+        "{reads}"
+    );
+    assert!(reads["acme/bookshop"]["read_at"].is_null(), "{reads}");
+    // A partial error: shown, and the read still counts.
+    let gh = &snap["fresh"]["gh"];
+    assert_eq!(
+        gh["error"], "acme/bookshop queue: gh: HTTP 404: Not Found",
+        "{gh}"
+    );
+    assert!(gh["ok_at"].is_i64(), "{gh}");
+    assert!(snap["jobs_read_at"].is_i64());
     let _ = fs::remove_dir_all(&root);
 }
 

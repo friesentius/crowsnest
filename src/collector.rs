@@ -4,7 +4,7 @@
 //! | tier     | default cadence                                              |
 //! |----------|--------------------------------------------------------------|
 //! | host     | 2 s                                                          |
-//! | runners  | 5 s (process scan, `_diag` file times, tails of the newest logs when they changed), directories re-listed every 60 s and whenever a `Runner.Listener` starts or stops, systemd units every 30 s |
+//! | runners  | 5 s (process scan, `_diag` file times, the newest logs followed as they grow), directories re-listed every 60 s and whenever a `Runner.Listener` starts or stops, systemd units every 30 s |
 //! | pipelines| 15 s per live no-mistakes task                               |
 //! | fleet    | 60 s                                                         |
 //! | github   | 60 s (`github_seconds`) while a PR, runner or queued job is active, otherwise 5 min; slower when the rate-limit budget would not last to its reset, paused while GitHub refuses for rate limit |
@@ -20,7 +20,7 @@
 
 use crate::model::{
     Fleet, Freshness, Job, PrChecks, RepoHistory, RepoRunners, Runner, RunnerSearch, Service,
-    Snapshot,
+    Slowed, Snapshot,
 };
 use crate::sources::{
     self, Queue,
@@ -200,12 +200,29 @@ fn apply_gh(
     }
     match queue {
         Ok(q) => {
+            // A repository that failed reads as a partial error, and keeps
+            // the jobs of its last good read; every one failing is outright.
+            let errors: Vec<String> = q
+                .reads
+                .iter()
+                .filter_map(|(repo, r)| Some(format!("{repo} queue: {}", r.error.as_ref()?)))
+                .collect();
+            if !errors.is_empty() {
+                if errors.len() == q.reads.len() {
+                    failed.extend(errors);
+                } else {
+                    partial.extend(errors);
+                }
+            }
             s.jobs = q
                 .jobs
                 .into_iter()
                 .filter(|j| j.status != "completed")
                 .collect();
-            s.jobs_read_at = Some(now_epoch());
+            if q.read_at.is_some() {
+                s.jobs_read_at = q.read_at;
+            }
+            s.queue_reads = q.reads;
             s.gh_budget.runs_unread = q.unread;
         }
         Err(GhError::Paused { .. }) => paused += 1,
@@ -215,6 +232,19 @@ fn apply_gh(
         return Read::Paused;
     }
     Read::from_errors(failed, partial)
+}
+
+/// The gh tier's wait between reads as the settings give it (`base`: the
+/// configured cadence while something is live, at least 5 minutes otherwise)
+/// and as the REST budget allows it (`every`).
+fn gh_cadence(s: &Snapshot, intervals: &Intervals, calls: u32, now: i64) -> (Duration, Duration) {
+    let live = Intervals::get(&intervals.github);
+    let base = if gh_active(s) {
+        live
+    } else {
+        live.max(Duration::from_secs(300))
+    };
+    (base, ghapi::cadence(&s.gh_budget.core, base, calls, now))
 }
 
 /// How often the completed runs of a repository are listed.
@@ -238,6 +268,8 @@ struct GhState {
     gh_runners: BTreeMap<String, RepoRunners>,
     /// Runs that were queued or running at the last read.
     active: BTreeSet<u64>,
+    /// What each repository's queue held at its last good read.
+    queue: BTreeMap<String, sources::KeptQueue>,
 }
 
 impl GhState {
@@ -704,17 +736,11 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let resume = Arc::new(AtomicI64::new(0));
         let resume2 = resume.clone();
         let intervals = intervals.clone();
+        let intervals2 = intervals.clone();
         let interval = move || {
             let s = shared2.lock().unwrap();
             let now = now_epoch();
-            let live = Intervals::get(&intervals.github);
-            let base = if gh_active(&s) {
-                live
-            } else {
-                live.max(Duration::from_secs(300))
-            };
-            let every =
-                ghapi::cadence(&s.gh_budget.core, base, calls2.load(Ordering::Relaxed), now);
+            let (_, every) = gh_cadence(&s, &intervals, calls2.load(Ordering::Relaxed), now);
             // Paused for rate limit: try again as soon as the pause ends.
             let b = &s.gh_budget;
             match [b.core.paused(now), b.graphql.paused(now)]
@@ -749,14 +775,16 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     )
                 };
                 gh_read.lock().unwrap().clone_from(&urls);
+                // Every path this turn asks for keeps its stored answer.
+                state.client.begin_turn();
                 let prs = sources::read_pr_checks(&mut state.client, &urls);
-                let queue = sources::read_queue(&mut state.client, &runner_list);
+                let queue = sources::read_queue(&mut state.client, &runner_list, &mut state.queue);
                 // Show the checks and the queue first: the first history
                 // read fetches several runs' jobs and takes a while.
                 let live = match &queue {
                     Ok(q) => Ok(Queue {
                         jobs: q.jobs.clone(),
-                        unread: BTreeMap::new(),
+                        ..Default::default()
                     }),
                     Err(e) => Err(e.clone()),
                 };
@@ -780,6 +808,22 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 s.gh_runners = gh_runners;
                 s.gh_budget.core = state.client.budget.core.clone();
                 s.gh_budget.graphql = state.client.budget.graphql.clone();
+                // Say when the next read is due if the budget stretched it.
+                let now = now_epoch();
+                let (base, every) = gh_cadence(&s, &intervals2, calls.load(Ordering::Relaxed), now);
+                let paused = s
+                    .gh_budget
+                    .core
+                    .paused(now)
+                    .or(s.gh_budget.graphql.paused(now));
+                // The tier fires when the time since this read reaches the
+                // cadence as it will then be, which is sooner than the
+                // cadence now.
+                let soon = ghapi::wait(&s.gh_budget.core, base, calls.load(Ordering::Relaxed), now);
+                s.gh_budget.slowed = (every > base && paused.is_none()).then(|| Slowed {
+                    every: every.as_secs() as i64,
+                    next_at: now + soon.as_secs() as i64,
+                });
                 read
             },
         );
@@ -929,8 +973,9 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
         let mut state = GhState::default();
+        state.client.begin_turn();
         let prs = sources::read_pr_checks(&mut state.client, &urls);
-        let queue = sources::read_queue(&mut state.client, &s.runners);
+        let queue = sources::read_queue(&mut state.client, &s.runners, &mut state.queue);
         let (history, gh_runners) = state.read(&s.runners, &queue);
         s.history = history;
         s.gh_runners = gh_runners;
@@ -955,6 +1000,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::QueueRead;
 
     #[test]
     fn failing_tiers_back_off_to_five_minutes() {
@@ -1147,12 +1193,126 @@ mod tests {
             Ok(Queue {
                 jobs: vec![job("completed"), job("in_progress"), job("queued")],
                 unread: [("acme/pantry".to_string(), 3)].into(),
+                read_at: Some(4_000),
+                ..Default::default()
             }),
         );
         assert_eq!(r, Read::Ok);
         assert_eq!(s.jobs.len(), 2);
-        assert!(s.jobs_read_at.is_some());
+        assert_eq!(s.jobs_read_at, Some(4_000));
         assert_eq!(s.gh_budget.runs_unread["acme/pantry"], 3);
+    }
+
+    #[test]
+    fn one_repository_that_failed_is_a_partial_error_that_keeps_the_others() {
+        let job = |repo: &str, status: &str| Job {
+            repo: repo.into(),
+            status: status.into(),
+            ..Default::default()
+        };
+        let reads = |bookshop: Option<&str>| {
+            [
+                (
+                    "acme/bookshop".to_string(),
+                    QueueRead {
+                        read_at: None,
+                        error: bookshop.map(String::from),
+                    },
+                ),
+                (
+                    "acme/pantry".to_string(),
+                    QueueRead {
+                        read_at: Some(4_000),
+                        error: None,
+                    },
+                ),
+            ]
+            .into()
+        };
+        let mut s = Snapshot::default();
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(Queue {
+                jobs: vec![job("acme/pantry", "queued"), job("acme/bookshop", "queued")],
+                reads: reads(Some("gh: HTTP 404: Not Found")),
+                read_at: Some(4_000),
+                ..Default::default()
+            }),
+        );
+        // Shown as an error, but not one the tier backs off for.
+        assert_eq!(
+            r,
+            Read::Partial("acme/bookshop queue: gh: HTTP 404: Not Found".into())
+        );
+        assert_eq!(s.jobs.len(), 2, "the failed repository keeps its jobs");
+        assert_eq!(s.jobs_read_at, Some(4_000));
+        assert_eq!(
+            s.queue_reads["acme/bookshop"].error.as_deref(),
+            Some("gh: HTTP 404: Not Found")
+        );
+        // The error clears with the next good read.
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(Queue {
+                reads: reads(None),
+                read_at: Some(4_060),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(r, Read::Ok);
+        assert!(s.queue_reads["acme/bookshop"].error.is_none());
+        // Every repository failing is outright: the tier backs off, and the
+        // last jobs stay.
+        let mut failing = reads(Some("gh: HTTP 404: Not Found"));
+        failing.get_mut("acme/pantry").unwrap().error = Some("gh: HTTP 502".into());
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(Queue {
+                jobs: vec![job("acme/pantry", "queued")],
+                reads: failing,
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(r, Read::Failed(_)), "{r:?}");
+        assert_eq!(s.jobs_read_at, Some(4_060), "nothing was read in full");
+    }
+
+    #[test]
+    fn reads_are_slowed_only_past_the_cadence_the_settings_give() {
+        let iv = Intervals::default();
+        Intervals::set(&iv.github, Duration::from_secs(60));
+        let now = 1_000_000;
+        let mut s = Snapshot::default();
+        s.gh_budget.core = crate::model::RateLimit {
+            limit: 5000,
+            remaining: 4000,
+            reset_at: now + 3600,
+            ..Default::default()
+        };
+        // Nothing live: the settings give 5 minutes, and a budget that
+        // lasts leaves it.
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!((base, every), (Duration::from_secs(300), base));
+        // Something live: the configured minute.
+        s.jobs.push(Job {
+            status: "queued".into(),
+            ..Default::default()
+        });
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!((base, every), (Duration::from_secs(60), base));
+        // Half of 100 left is 5 turns of 10 reads until the reset in an hour.
+        s.gh_budget.core.remaining = 100;
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!(base, Duration::from_secs(60));
+        assert_eq!(every, Duration::from_secs(720));
+        // Idle, a stretch to 3 minutes is still under the 5 the settings give.
+        s.jobs.clear();
+        s.gh_budget.core.remaining = 600;
+        let (base, every) = gh_cadence(&s, &iv, 10, now);
+        assert_eq!((base, every), (Duration::from_secs(300), base));
     }
 
     #[test]

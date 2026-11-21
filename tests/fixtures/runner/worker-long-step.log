@@ -1,0 +1,26 @@
+[2026-11-18 17:06:14Z INFO StepsRunner] Processing step: DisplayName='Run actions/checkout@v7'
+[2026-11-18 17:06:14Z INFO StepsRunner] Evaluating: success()
+[2026-11-18 17:06:14Z INFO StepsRunner] Result: true
+[2026-11-18 17:06:15Z INFO StepsRunner] Processing step: DisplayName='Run actions/setup-node@v7'
+[2026-11-18 17:06:15Z INFO StepsRunner] Evaluating: success()
+[2026-11-18 17:06:15Z INFO StepsRunner] Result: true
+[2026-11-18 17:06:15Z INFO StepsRunner] Starting the step.
+[2026-11-18 17:06:15Z INFO HostContext] Well known directory 'Bin': '/srv/actions-runner-pantry/bin.2.338.2'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper] Starting process:
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   File name: '/srv/actions-runner-pantry/externals/node24/bin/node'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Arguments: '"/srv/actions-runner-pantry/_work/_actions/actions/setup-node/v7/dist/setup/index.js"'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Working directory: '/srv/actions-runner-pantry/_work/pantry/pantry'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Require exit code zero: 'False'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Encoding web name:  ; code page: ''
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Force kill process on cancellation: 'False'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Redirected STDIN: 'False'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Persist current code page: 'False'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   Keep redirected STDIN open: 'False'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper]   High priority process: 'False'
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper] Updated oom_score_adj to 500 for PID: 2489937.
+[2026-11-18 17:06:15Z INFO ProcessInvokerWrapper] Process started with process id 2489937, waiting for process exit.
+[2026-11-18 17:06:15Z INFO JobServerQueue] Try to append 1 batches web console lines for record '00000000-0000-4000-8000-000000000000', success rate: 1/1.
+[2026-11-18 17:06:15Z INFO JobServerQueue] Try to append 1 batches web console lines for record '00000000-0000-4000-8000-000000000000', success rate: 1/1.
+[2026-11-18 17:06:15Z INFO JobServerQueue] Got a step log file to send to results service.
+[2026-11-18 17:07:30Z INFO JobServerQueue] Try to append 1 batches web console lines for record '00000000-0000-4000-8000-000000000000', success rate: 1/1.
+[2026-11-18 17:07:31Z INFO JobServerQueue] Try to append 1 batches web console lines for record '00000000-0000-4000-8000-000000000000', success rate: 1/1.

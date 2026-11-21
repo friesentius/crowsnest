@@ -8,8 +8,9 @@
 //! does. Its systemd unit comes from the configuration, the cgroup of its
 //! listener, or the `.service` file `svc.sh install` writes. How recently it
 //! wrote its `_diag` logs comes from file times; what it last did comes from
-//! the last 64 KiB of its newest worker and runner logs, never the whole
-//! file. All of these are local reads; no API call is needed.
+//! following its newest worker and runner logs: read once from the end, then
+//! only what they grew by, never the whole file. All of these are local
+//! reads; no API call is needed.
 
 use crate::model::{LogTail, Runner, RunnerSearch, Service, UnitSource};
 use serde::Deserialize;
@@ -374,30 +375,71 @@ pub fn read_diag(r: &mut Runner) {
         .and_then(|d| d.flatten().filter_map(|e| mtime(&e.path())).max());
 }
 
-/// The most of a log's end that is read.
+/// The size of one block read when a log is first looked at, and the most
+/// of its end read when that is enough to know the listener's or worker's
+/// state.
 pub const TAIL_BYTES: u64 = 64 * 1024;
 
-/// The last `max` bytes of the file at `path`, from its first whole line,
-/// with control characters other than newlines and tabs removed. Only the
-/// tail is read, never the whole file.
-pub fn read_tail(path: &Path, max: u64) -> std::io::Result<String> {
+/// The most of a log's end read, a [`TAIL_BYTES`] block at a time, to find
+/// the line that says what a runner is doing (the step a worker started, the
+/// listener's last console line) when it is further back than one block.
+pub const SEARCH_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The most new bytes folded into the state of a log at once. A log that
+/// grew more than this since it was last read (crowsnest was suspended) is
+/// looked at afresh instead.
+const FOLD_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// `bytes` as text, with control characters other than newlines and tabs
+/// removed.
+fn clean(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    text.retain(|c| !c.is_control() || c == '\n' || c == '\t');
+    text
+}
+
+/// The bytes of the file at `path` from `from` to `to`.
+fn read_range(path: &Path, from: u64, to: u64) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max);
-    f.seek(SeekFrom::Start(start))?;
+    f.seek(SeekFrom::Start(from))?;
     let mut buf = Vec::new();
-    f.take(max).read_to_end(&mut buf)?;
-    let mut text = String::from_utf8_lossy(&buf).into_owned();
-    if start > 0 {
-        // The cut fell inside a line: drop that part.
-        text = match text.find('\n') {
-            Some(i) => text[i + 1..].to_string(),
-            None => String::new(),
+    f.take(to.saturating_sub(from)).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// The whole lines at the end of the file at `path`: one [`TAIL_BYTES`]
+/// block, and further blocks back while `enough` says the text does not yet
+/// hold what is looked for, up to [`SEARCH_BYTES`] or the start of the file.
+/// Returns the text and the offset just after it, where the next lines of
+/// the log begin. A last line without its newline is not read yet: it may
+/// be half written.
+fn read_back(path: &Path, enough: fn(&str) -> bool) -> std::io::Result<(String, u64)> {
+    let len = std::fs::metadata(path)?.len();
+    let mut start = len;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let from = start.saturating_sub(TAIL_BYTES);
+        let mut block = read_range(path, from, start)?;
+        block.append(&mut buf);
+        buf = block;
+        start = from;
+        let first = if start > 0 {
+            buf.iter()
+                .position(|b| *b == b'\n')
+                .map_or(buf.len(), |i| i + 1)
+        } else {
+            0
         };
+        let last = buf
+            .iter()
+            .rposition(|b| *b == b'\n')
+            .map_or(first, |i| i + 1);
+        let text = clean(&buf[first.min(last)..last]);
+        if start == 0 || len - start >= SEARCH_BYTES || enough(&text) {
+            return Ok((text, start + last as u64));
+        }
     }
-    text.retain(|c| !c.is_control() || c == '\n' || c == '\t');
-    Ok(text)
 }
 
 /// A `_diag` log line: `[2026-11-20 18:28:07Z INFO StepsRunner] text` ->
@@ -412,13 +454,16 @@ fn diag_line(line: &str) -> Option<(i64, &str, &str, &str)> {
     Some((at, level, component, text.trim_end()))
 }
 
-/// What the tail of a `Worker_*.log` says: its last line, the step it last
-/// started, and whether a process it started is still running.
-pub fn parse_worker_tail(text: &str) -> LogTail {
-    let mut t = LogTail::default();
+/// The text a line of a worker log gives for the step it started.
+const STEP_LINE: &str = "Processing step: DisplayName='";
+
+/// Fold the whole lines of `text`, from a `Worker_*.log`, into what is
+/// known: the last line, the step last started, and whether a process it
+/// started is still running.
+pub fn fold_worker(t: &mut LogTail, text: &str) {
     for (at, level, component, msg) in text.lines().filter_map(diag_line) {
         t.last = Some((at, format!("[{level} {component}] {msg}")));
-        if let Some(name) = msg.strip_prefix("Processing step: DisplayName='") {
+        if let Some(name) = msg.strip_prefix(STEP_LINE) {
             let name = name.strip_suffix('\'').unwrap_or(name);
             t.step = Some((at, name.to_string()));
             t.process_running = false;
@@ -430,79 +475,177 @@ pub fn parse_worker_tail(text: &str) -> LogTail {
             }
         }
     }
+}
+
+/// What a worker log's text says: its last line, the step it last started,
+/// and whether a process it started is still running.
+pub fn parse_worker_tail(text: &str) -> LogTail {
+    let mut t = LogTail::default();
+    fold_worker(&mut t, text);
     t
 }
 
-/// What the tail of a `Runner_*.log` says: its last line, the last line
-/// the listener wrote to its console, and the console errors after it.
-pub fn parse_runner_tail(text: &str) -> LogTail {
-    let mut t = LogTail::default();
-    for (at, level, component, msg) in text.lines().filter_map(diag_line) {
-        t.last = Some((at, format!("[{level} {component}] {msg}")));
-        if component != "Terminal" {
-            continue;
-        }
-        // `WRITE LINE: 2026-11-20 18:28:06Z: Running job: Lint`
-        let console = |kind: &str| {
-            let m = msg.strip_prefix(kind)?;
-            let m = m.split_once("Z:").map_or(m, |(_, m)| m).trim();
-            (!m.is_empty()).then(|| m.to_string())
-        };
-        if let Some(m) = console("WRITE LINE: ") {
-            if m.starts_with("Current runner version") {
-                continue;
-            }
-            t.state = Some((at, m));
-            t.errors = 0;
-            t.error_since = None;
-            t.error = None;
-        } else if let Some(m) = console("WRITE ERROR: ") {
-            t.errors += 1;
-            t.error_since.get_or_insert(at);
-            t.error = Some((at, m));
-        }
-    }
-    // A listener in trouble repeats its error every minute or two; one that
-    // kept logging without another error for a while got through, even if
-    // it wrote no console line to say so.
-    if let (Some((last, _)), Some((err, _))) = (&t.last, &t.error)
-        && last - err > ERROR_QUIET_SECS
+/// What a console line of the listener says: `WRITE LINE: 2026-11-20
+/// 18:28:06Z: Running job: Lint` -> `Running job: Lint`. Blank lines say
+/// nothing.
+fn console(msg: &str, kind: &str) -> Option<String> {
+    let m = msg.strip_prefix(kind)?;
+    let m = m.split_once("Z:").map_or(m, |(_, m)| m).trim();
+    (!m.is_empty()).then(|| m.to_string())
+}
+
+/// A console error without the listener's own framing, which only repeats
+/// what the label says: `Runner connect error: Error: Conflict. Retrying
+/// until reconnected.` -> `Error: Conflict.`
+fn console_error_text(m: &str) -> String {
+    let m = m.strip_prefix("Runner connect error: ").unwrap_or(m);
+    m.strip_suffix(" Retrying until reconnected.")
+        .unwrap_or(m)
+        .to_string()
+}
+
+/// Whether the text has an ordinary console line of the listener.
+fn has_console_state(text: &str) -> bool {
+    text.lines()
+        .filter_map(diag_line)
+        .filter(|(_, _, component, _)| *component == "Terminal")
+        .filter_map(|(_, _, _, msg)| console(msg, "WRITE LINE: "))
+        .any(|m| !m.starts_with("Current runner version"))
+}
+
+/// Listener components whose failures mean it cannot reach GitHub.
+const CONNECTION: [&str; 4] = [
+    "BrokerMessageListener",
+    "BrokerServer",
+    "GitHubActionsService",
+    "MessageListener",
+];
+
+/// Whether a line shows the listener failing to reach GitHub: an error
+/// from the connection, a failed attempt, a back-off, or a sleep before
+/// retrying.
+fn failure_line(level: &str, component: &str, msg: &str) -> bool {
+    CONNECTION.contains(&component)
+        && (level == "ERR"
+            || msg.starts_with("Back off ")
+            || (msg.starts_with("Attempt ") && msg.contains(" failed"))
+            || (msg.starts_with("Sleeping for ") && msg.contains("before retrying")))
+}
+
+/// Note a failure line at `at`. Failure lines of one outage follow each
+/// other within the listener's request timeouts; one after a longer quiet
+/// stretch starts a new episode, so an error that ended long ago is not
+/// revived by a routine back-off hours later.
+fn note_failure(t: &mut LogTail, at: i64) {
+    if t.failure_at
+        .is_some_and(|f| at - f > crate::model::FAILURE_LIVE_SECS)
     {
         t.errors = 0;
         t.error_since = None;
         t.error = None;
+        t.failure_since = None;
     }
+    t.failure_since.get_or_insert(at);
+    t.failure_at = Some(at);
+}
+
+/// Fold the whole lines of `text`, from a `Runner_*.log`, into what is
+/// known: the last line, the last line the listener wrote to its console,
+/// and the console errors and failing attempts after it.
+pub fn fold_runner(t: &mut LogTail, text: &str) {
+    for (at, level, component, msg) in text.lines().filter_map(diag_line) {
+        t.last = Some((at, format!("[{level} {component}] {msg}")));
+        if component == "Terminal" {
+            if let Some(m) = console(msg, "WRITE LINE: ") {
+                if m.starts_with("Current runner version") {
+                    continue;
+                }
+                t.state = Some((at, m));
+                t.errors = 0;
+                t.error_since = None;
+                t.error = None;
+                t.failure_since = None;
+                t.failure_at = None;
+            } else if let Some(m) = console(msg, "WRITE ERROR: ") {
+                note_failure(t, at);
+                t.errors += 1;
+                t.error_since.get_or_insert(at);
+                t.error = Some((at, console_error_text(&m)));
+            }
+        } else if failure_line(level, component, msg) {
+            note_failure(t, at);
+        }
+    }
+}
+
+/// What a runner log's text says: its last line, the last line the listener
+/// wrote to its console, and the console errors after it.
+pub fn parse_runner_tail(text: &str) -> LogTail {
+    let mut t = LogTail::default();
+    fold_runner(&mut t, text);
     t
 }
 
-/// How long a runner log may go on without repeating a console error
-/// before that error counts as over.
-const ERROR_QUIET_SECS: i64 = 10 * 60;
+/// A log being followed: how far it has been read, what its file looked
+/// like then, and what its lines add up to.
+#[derive(Debug)]
+struct Followed {
+    /// Just after the last whole line folded in.
+    offset: u64,
+    stamp: (u64, Option<std::time::SystemTime>),
+    tail: LogTail,
+}
 
-/// Reads the tails of each runner's newest worker and runner logs, again
-/// only when a file's size or time changed.
+/// Follows the newest worker and runner logs of each runner. A log is read
+/// once from its end, searching back for the line that tells the state, and
+/// after that only the bytes it grew by are folded into what is known, so a
+/// line that scrolled out of the last 64 KiB is not forgotten. A log whose
+/// size and time did not change is not read again.
 #[derive(Debug, Default)]
 pub struct LogTails {
-    seen: BTreeMap<PathBuf, ((u64, Option<std::time::SystemTime>), LogTail)>,
+    seen: BTreeMap<PathBuf, Followed>,
 }
 
 impl LogTails {
     pub fn read(&mut self, r: &mut Runner) {
         let diag = r.dir.join("_diag");
-        r.worker_tail = self.tail(newest_log(&diag, "Worker_"), parse_worker_tail);
-        r.runner_tail = self.tail(newest_log(&diag, "Runner_"), parse_runner_tail);
+        r.worker_tail = self.tail(newest_log(&diag, "Worker_"), fold_worker, |text| {
+            text.contains(STEP_LINE)
+        });
+        r.runner_tail = self.tail(newest_log(&diag, "Runner_"), fold_runner, has_console_state);
     }
 
-    fn tail(&mut self, path: Option<PathBuf>, parse: fn(&str) -> LogTail) -> Option<LogTail> {
+    /// `fold` sums up the lines of the log at `path`; `enough` says whether
+    /// a first look at its end has found what the sum needs.
+    fn tail(
+        &mut self,
+        path: Option<PathBuf>,
+        fold: fn(&mut LogTail, &str),
+        enough: fn(&str) -> bool,
+    ) -> Option<LogTail> {
         let path = path?;
         let meta = std::fs::metadata(&path).ok()?;
-        let key = (meta.len(), meta.modified().ok());
-        if let Some((k, t)) = self.seen.get(&path)
-            && *k == key
-        {
-            return Some(t.clone());
+        let len = meta.len();
+        let stamp = (len, meta.modified().ok());
+        if let Some(f) = self.seen.get_mut(&path) {
+            if f.stamp == stamp {
+                return Some(f.tail.clone());
+            }
+            if len >= f.offset && len - f.offset <= FOLD_MAX_BYTES {
+                let new = read_range(&path, f.offset, len).ok()?;
+                // Whole lines only: the last one may be half written.
+                let whole = new.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                fold(&mut f.tail, &clean(&new[..whole]));
+                f.offset += whole as u64;
+                f.stamp = stamp;
+                return Some(f.tail.clone());
+            }
+            // Shorter than it was (replaced) or grown past reason: look
+            // at it afresh.
         }
-        let t = parse(&read_tail(&path, TAIL_BYTES).ok()?);
+        let (text, offset) = read_back(&path, enough).ok()?;
+        let mut tail = LogTail::default();
+        fold(&mut tail, &text);
         // A newer log of the same kind replaces the older one.
         let kind = |p: &Path| {
             let name = p.file_name()?.to_str()?;
@@ -513,8 +656,15 @@ impl LogTails {
         };
         let this = kind(&path);
         self.seen.retain(|p, _| kind(p) != this);
-        self.seen.insert(path, (key, t.clone()));
-        Some(t)
+        self.seen.insert(
+            path,
+            Followed {
+                offset,
+                stamp,
+                tail: tail.clone(),
+            },
+        );
+        Some(tail)
     }
 
     /// Forget logs that are no longer any runner's newest.
@@ -759,6 +909,7 @@ impl ProcessScan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Trouble;
 
     #[test]
     fn parses_runner_file_with_bom() {
@@ -1255,64 +1406,551 @@ mod tests {
                 "Job Lint & typecheck completed with result: Succeeded".into()
             ))
         );
-        // A routine back-off is not an error; the console's errors are.
-        assert_eq!(t.errors, 2);
-        assert_eq!(t.error_since, Some(at("2026-11-19T13:26:03Z")));
+        // The failing lines of one outage follow each other within minutes;
+        // the second console error, 20 minutes after the first one's
+        // failing lines, is a new outage. A routine back-off is not an
+        // error.
+        assert_eq!(t.errors, 1);
+        assert_eq!(t.error_since, Some(at("2026-11-19T13:46:12Z")));
         assert_eq!(
             t.error,
             Some((
                 at("2026-11-19T13:46:12Z"),
-                "Runner connect error: Error: Conflict. Retrying until reconnected.".into()
+                "Error: Conflict.".into() // the listener's own framing is dropped
             ))
         );
         // A console line after them clears them.
         let back = parse_runner_tail(&format!(
             "{text}[2026-11-19 13:50:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:50:00Z: Runner reconnected.\n"
         ));
-        assert_eq!(back.state.unwrap().1, "Runner reconnected.");
-        assert_eq!((back.errors, back.error_since, back.error), (0, None, None));
+        assert_eq!(back.state.as_ref().unwrap().1, "Runner reconnected.");
+        assert_eq!(
+            (back.errors, back.error_since, back.error.clone()),
+            (0, None, None)
+        );
+        assert_eq!(back.trouble(at("2026-11-19T13:50:01Z")), None);
         // Blank console lines between errors change nothing.
         let blank = parse_runner_tail(&format!(
             "{text}[2026-11-19 13:47:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:47:00Z: \n"
         ));
-        assert_eq!(blank.errors, 2);
-        // Logging on for over 10 minutes without another error: it is over.
-        let later = |time: &str| {
-            parse_runner_tail(&format!(
-                "{text}[2026-11-19 {time}Z INFO RSAFileKeyManager] Loading RSA key parameters\n"
-            ))
+        assert_eq!(blank.errors, 1);
+    }
+
+    #[test]
+    fn a_console_errors_message_is_given_without_the_listeners_framing() {
+        let line = |m: &str| {
+            format!("[2026-10-29 06:22:58Z ERR  Terminal] WRITE ERROR: 2026-10-29 06:22:58Z: {m}\n")
         };
-        assert_eq!(later("13:55:00").errors, 2, "8m48s on, still in trouble");
-        let over = later("13:57:00");
+        let err = |m: &str| parse_runner_tail(&line(m)).error.unwrap().1;
         assert_eq!(
-            (over.errors, over.error),
-            (0, None),
-            "10m48s on, it got through"
+            err(
+                "Runner connect error: Resource temporarily unavailable (broker.actions.githubusercontent.com:443). Retrying until reconnected."
+            ),
+            "Resource temporarily unavailable (broker.actions.githubusercontent.com:443)."
+        );
+        assert_eq!(
+            err("Runner connect error: Error: Conflict. Retrying until reconnected."),
+            "Error: Conflict."
+        );
+        // Other errors are given as written.
+        assert_eq!(
+            err("Stop retry on SessionConflictException after retried for 240 seconds."),
+            "Stop retry on SessionConflictException after retried for 240 seconds."
+        );
+        assert_eq!(
+            parse_runner_tail(
+                "[2026-10-03 21:09:55Z ERR  Terminal] WRITE ERROR: A session for this runner already exists.\n"
+            )
+            .error
+            .unwrap()
+            .1,
+            "A session for this runner already exists."
+        );
+    }
+
+    /// The lines of `text` up to the moment `hms` of 2026-10-29 (UTC).
+    fn until(text: &str, hms: &str) -> String {
+        let limit = format!("[2026-10-29 {hms}Z");
+        let mut out = String::new();
+        let mut open = true;
+        for line in text.lines() {
+            if line.starts_with("[2026-10-29 ") {
+                open = line[..limit.len()] <= *limit.as_str();
+            }
+            if open {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// `text` with every timestamped line `secs` later, within the day.
+    fn shifted(text: &str, secs: i64) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            match line.strip_prefix("[2026-10-29 ") {
+                Some(rest) if rest.is_char_boundary(8) => {
+                    let (hms, tail) = rest.split_at(8);
+                    let p: Vec<i64> = hms.split(':').map(|n| n.parse().unwrap()).collect();
+                    let s = p[0] * 3600 + p[1] * 60 + p[2] + secs;
+                    out.push_str(&format!(
+                        "[2026-10-29 {:02}:{:02}:{:02}{tail}\n",
+                        s / 3600,
+                        s / 60 % 60,
+                        s % 60
+                    ));
+                }
+                _ => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    const OUTAGE: &str = include_str!("../../tests/fixtures/runner/runner-outage.log");
+
+    #[test]
+    fn a_connect_error_is_live_while_attempts_keep_failing_and_over_after() {
+        // REPLAY of a real log (glpi-relay, 2026-10-29): the listener wrote
+        // its error at 06:22:58Z, its last failed attempt was at 06:27:18Z
+        // and its token request worked at 06:27:34Z. It wrote nothing more
+        // until its token refresh at 07:17:37Z.
+        let refresh = "[2026-10-29 07:17:37Z INFO GitHubActionsService] AAD Correlation ID for this token request: Unknown\n";
+        let log = format!("{OUTAGE}{refresh}");
+        let moment = |hms: &str| at(&format!("2026-10-29T{hms}Z"));
+        let since = moment("06:22:58");
+        fn shown<'a>(t: &'a LogTail, hms: &str) -> Option<Trouble<'a>> {
+            t.trouble(at(&format!("2026-10-29T{hms}Z")))
+        }
+        // Before the error: two failed attempts, 26 s apart, are routine.
+        let before = parse_runner_tail(&until(&log, "06:22:30"));
+        assert_eq!(before.error, None);
+        assert_eq!(shown(&before, "06:22:30"), None);
+        // In the outage: the error, with the listener's reason.
+        let during = parse_runner_tail(&until(&log, "06:24:00"));
+        let Some(Trouble::ConsoleError { since: s, msg }) = shown(&during, "06:24:00") else {
+            panic!("{:?}", shown(&during, "06:24:00"));
+        };
+        assert_eq!(s, since);
+        assert_eq!(
+            msg,
+            "Resource temporarily unavailable (broker.actions.githubusercontent.com:443)."
+        );
+        // The whole log: still in trouble 4 minutes after the last failed
+        // attempt, though the runner has reconnected; over after 5.
+        let all = parse_runner_tail(&log);
+        assert_eq!(all.failure_at, Some(moment("06:27:18")));
+        assert!(shown(&all, "06:31:00").is_some());
+        assert_eq!(shown(&all, "06:32:30"), None);
+        // 12 and 47 minutes after the reconnect, and when the refresh line
+        // arrived: no error. (The old rule showed it until 07:17.)
+        for hms in ["06:40:00", "07:15:00", "07:18:00"] {
+            assert_eq!(shown(&all, hms), None, "{hms}");
+        }
+    }
+
+    #[test]
+    fn a_cached_log_still_clears_its_error_with_no_new_bytes() {
+        // The idle listener writes nothing after it reconnects, so the log
+        // is not read again; the error must still clear by the clock.
+        let dir = scratch("idle-clears");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        std::fs::write(diag.join("Runner_20261026-165301-utc.log"), OUTAGE).unwrap();
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut tails = LogTails::default();
+        let last = at("2026-10-29T06:27:18Z");
+        tails.read(&mut r);
+        assert!(r.runner_tail.as_ref().unwrap().trouble(last + 60).is_some());
+        tails.read(&mut r);
+        let again = r.runner_tail.as_ref().unwrap();
+        assert!(again.trouble(last + 4 * 60).is_some());
+        assert_eq!(again.trouble(last + 12 * 60), None);
+        assert_eq!(again.trouble(last + 47 * 60), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_outage_that_goes_on_keeps_its_error_however_much_is_logged() {
+        // SIMULATED from the real log: its failed-retry block (06:23:24Z to
+        // 06:27:18Z, about 7.5 KB of stack traces) repeated every 108 s
+        // models an outage that continues. Each block adds 7.5 KB, so the
+        // error line leaves the last 64 KiB after nine of them.
+        let block: String = OUTAGE
+            .lines()
+            .skip_while(|l| !l.starts_with("[2026-10-29 06:23:24Z"))
+            .take_while(|l| !l.starts_with("[2026-10-29 06:27:34Z"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let since = at("2026-10-29T06:22:58Z");
+        let mut log = until(OUTAGE, "06:26:55");
+        let one = |n: i64| shifted(&block, 108 * n);
+        for n in 1..=16 {
+            log.push_str(&one(n));
+        }
+        assert!(log.len() as u64 > 2 * TAIL_BYTES, "{}", log.len());
+        let last = at("2026-10-29T06:27:18Z") + 108 * 16;
+        let expect = |t: &LogTail| {
+            assert_eq!(t.error_since, Some(since));
+            let live = t.trouble(last + 3);
+            assert!(
+                matches!(live, Some(Trouble::ConsoleError { since: s, .. }) if s == since),
+                "{live:?}"
+            );
+            // 28 minutes after the error was written: still there.
+            assert!(last + 3 - since > 28 * 60);
+        };
+        // Read whole.
+        expect(&parse_runner_tail(&log));
+        // First looked at by a crowsnest that starts mid-outage: the error
+        // line is more than a block back, and is found by searching back.
+        let dir = scratch("outage-goes-on");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        std::fs::write(diag.join("Runner_20261026-165301-utc.log"), &log).unwrap();
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut tails = LogTails::default();
+        tails.read(&mut r);
+        expect(r.runner_tail.as_ref().unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Followed as it grows, a block at a time.
+        let dir = scratch("outage-followed");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        let path = diag.join("Runner_20261026-165301-utc.log");
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut tails = LogTails::default();
+        std::fs::write(&path, until(OUTAGE, "06:26:55")).unwrap();
+        tails.read(&mut r);
+        for n in 1..=16 {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut f, one(n).as_bytes()).unwrap();
+            tails.read(&mut r);
+        }
+        expect(r.runner_tail.as_ref().unwrap());
+        assert_eq!(
+            r.runner_tail.as_ref().unwrap(),
+            &parse_runner_tail(&log),
+            "following the log gives what reading it whole does"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_error_that_ended_long_ago_is_not_revived_by_a_routine_back_off() {
+        let log = format!(
+            "{OUTAGE}[2026-10-29 09:15:02Z WARN BrokerServer] Back off 5.017 seconds before next retry. 4 attempt left.\n"
+        );
+        let t = parse_runner_tail(&log);
+        let now = at("2026-10-29T09:15:03Z");
+        // One failed attempt is routine, and the old error is not shown.
+        assert_eq!(t.trouble(now), None);
+        assert_eq!((t.error_since, t.errors), (None, 0));
+        assert_eq!(t.failure_since, Some(now - 1));
+        // A second failed attempt half a minute later is still routine: the
+        // third may work.
+        let more = format!(
+            "{log}[2026-10-29 09:15:30Z INFO BrokerMessageListener] Sleeping for 26.1 seconds before retrying.\n"
+        );
+        assert_eq!(parse_runner_tail(&more).trouble(now + 30), None);
+        // Failing on for minutes is the listener retrying.
+        let long = format!(
+            "{more}[2026-10-29 09:17:30Z INFO BrokerMessageListener] Sleeping for 26.1 seconds before retrying.\n"
+        );
+        assert_eq!(
+            parse_runner_tail(&long).trouble(now + 150),
+            Some(Trouble::Retrying { since: now - 1 })
         );
     }
 
     #[test]
-    fn only_the_tail_of_a_log_is_read() {
-        let dir = scratch("tail");
+    fn a_routine_request_timeout_is_not_trouble() {
+        // REPLAY of a real routine event (potful, 2026-11-03): a long poll
+        // timed out after 100 s. The listener writes 7 failure lines for it
+        // in one second (an ERR line per exception, and the back-off), then
+        // carries on. Counting lines would call that trouble; the time the
+        // failing spans does not.
+        let block = include_str!("../../tests/fixtures/runner/runner-routine-timeout.log");
+        let t = parse_runner_tail(block);
+        let at = t.failure_at.unwrap();
+        assert_eq!(t.failure_since, Some(at));
+        assert_eq!(t.trouble(at + 1), None);
+        // The same block twice, 100 s apart (two timeouts in a row), is
+        // still routine; a third, 200 s in, is not.
+        let two = format!("{block}{}", shifted_to(block, "2026-11-03", 100));
+        assert_eq!(parse_runner_tail(&two).trouble(at + 101), None);
+        let three = format!("{two}{}", shifted_to(block, "2026-11-03", 200));
+        assert!(matches!(
+            parse_runner_tail(&three).trouble(at + 201),
+            Some(Trouble::Retrying { .. })
+        ));
+    }
+
+    #[test]
+    fn routine_timeouts_after_an_ordinary_console_line_are_not_retrying() {
+        // Three timed-out requests 100 s apart span over 2 minutes. With no
+        // console line in view the log was read mid-outage: retrying. After
+        // an ordinary console line they are routine and show nothing.
+        let block = include_str!("../../tests/fixtures/runner/runner-routine-timeout.log");
+        let three = format!(
+            "{block}{}{}",
+            shifted_to(block, "2026-11-03", 100),
+            shifted_to(block, "2026-11-03", 200)
+        );
+        let alone = parse_runner_tail(&three);
+        let now = alone.failure_at.unwrap() + 1;
+        assert!(matches!(alone.trouble(now), Some(Trouble::Retrying { .. })));
+        let first = &block[1..20];
+        let listening = format!("[{first}Z INFO Terminal] WRITE LINE: Listening for Jobs\n");
+        let after = parse_runner_tail(&format!("{listening}{three}"));
+        assert!(after.state.is_some());
+        assert_eq!(after.failure_since, alone.failure_since);
+        assert_eq!(after.trouble(now), None);
+    }
+
+    /// `text` with every `day` line `secs` later.
+    fn shifted_to(text: &str, day: &str, secs: i64) -> String {
+        let head = format!("[{day} ");
+        let mut out = String::new();
+        for line in text.lines() {
+            match line.strip_prefix(&head) {
+                Some(rest) if rest.is_char_boundary(8) => {
+                    let (hms, tail) = rest.split_at(8);
+                    let p: Vec<i64> = hms.split(':').map(|n| n.parse().unwrap()).collect();
+                    let s = p[0] * 3600 + p[1] * 60 + p[2] + secs;
+                    out.push_str(&format!(
+                        "{head}{:02}:{:02}:{:02}{tail}\n",
+                        s / 3600,
+                        s / 60 % 60,
+                        s % 60
+                    ));
+                }
+                _ => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn failing_attempts_alone_say_the_listener_is_retrying() {
+        // A log that begins mid-outage, with no console line in view.
+        let failing: String = OUTAGE
+            .lines()
+            .skip_while(|l| !l.starts_with("[2026-10-29 06:23:24Z"))
+            .take_while(|l| !l.starts_with("[2026-10-29 06:27:34Z"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let t = parse_runner_tail(&failing);
+        assert_eq!(t.error, None);
+        let first = at("2026-10-29T06:23:40Z");
+        assert_eq!(t.failure_since, Some(first));
+        assert_eq!(
+            t.trouble(at("2026-10-29T06:28:00Z")),
+            Some(Trouble::Retrying { since: first })
+        );
+        assert_eq!(t.trouble(at("2026-10-29T06:40:00Z")), None);
+        // Other components' errors, and a lone failed attempt, are not it.
+        let other = "[2026-10-29 06:23:24Z ERR  JobDispatcher] Job failed\n[2026-10-29 06:23:25Z ERR  JobDispatcher] Job failed\n";
+        assert_eq!(parse_runner_tail(other).failure_at, None);
+    }
+
+    #[test]
+    fn a_session_conflict_loop_reads_as_a_console_error() {
+        // The real session-conflict messages (glpi-relay, 2026-10-03): the
+        // listener prints a blank console line and then an error, every 30 s.
+        let log = "\
+[2026-10-03 21:09:55Z ERR  GitHubActionsService] POST request to https://broker.actions.githubusercontent.com/session failed. HTTP Status: Conflict
+[2026-10-03 21:09:55Z ERR  BrokerMessageListener] Catch exception during create session.
+[2026-10-03 21:09:55Z ERR  Terminal] WRITE ERROR: A session for this runner already exists.
+[2026-10-03 21:09:55Z ERR  Terminal] WRITE ERROR: 2026-10-03 21:09:55Z: Runner connect error: Error: Conflict. Retrying until reconnected.
+[2026-10-03 21:10:26Z INFO Terminal] WRITE LINE: 
+[2026-10-03 21:10:26Z ERR  GitHubActionsService] POST request to https://broker.actions.githubusercontent.com/session failed. HTTP Status: Conflict
+[2026-10-03 21:10:26Z ERR  Terminal] WRITE ERROR: A session for this runner already exists.
+";
+        let t = parse_runner_tail(log);
+        assert_eq!(t.errors, 3);
+        assert_eq!(t.error_since, Some(at("2026-10-03T21:09:55Z")));
+        assert_eq!(
+            t.error.as_ref().unwrap().1,
+            "A session for this runner already exists."
+        );
+        assert!(matches!(
+            t.trouble(at("2026-10-03T21:10:40Z")),
+            Some(Trouble::ConsoleError { .. })
+        ));
+    }
+
+    /// A worker log line of the kind a running step keeps writing.
+    const WORKER_PAD: &str = "[2026-11-18 17:07:31Z INFO JobServerQueue] Try to append 1 batches web console lines for record '00000000-0000-4000-8000-000000000000', success rate: 1/1.\n";
+
+    const WORKER_STEP: &str = include_str!("../../tests/fixtures/runner/worker-long-step.log");
+
+    #[test]
+    fn a_long_step_keeps_its_line_however_much_the_worker_logs() {
+        // REPLAY of the shape of a real worker log (potful, 2026-11-18): the
+        // step `Run actions/setup-node@v7` started at 17:06:15Z and its
+        // process ran for 20 minutes, while the worker went on writing
+        // JobServerQueue lines. The old reading lost the step line once 64
+        // KiB had been written after it, 5 to 8 minutes in.
+        let dir = scratch("long-step");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        let path = diag.join("Worker_20261118-170610-utc.log");
+        std::fs::write(&path, WORKER_STEP).unwrap();
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut tails = LogTails::default();
+        let step = Some((
+            at("2026-11-18T17:06:15Z"),
+            "Run actions/setup-node@v7".to_string(),
+        ));
+        tails.read(&mut r);
+        let t = r.worker_tail.clone().unwrap();
+        assert_eq!(t.step, step);
+        assert!(t.process_running);
+        // 200 KiB more, in pieces: 27 minutes of this job's logging.
+        let kib = WORKER_PAD.repeat(1024 / WORKER_PAD.len() + 1);
+        for _ in 0..200 {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            std::io::Write::write_all(&mut f, kib.as_bytes()).unwrap();
+            tails.read(&mut r);
+        }
+        let t = r.worker_tail.clone().unwrap();
+        assert_eq!(t.step, step, "the step line is kept");
+        assert!(t.process_running, "so is its running process");
+        // The same log first looked at after it grew by more than a block
+        // (what `--once` does): found by searching back.
+        let mut fresh = LogTails::default();
+        let mut r2 = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        assert!(std::fs::metadata(&path).unwrap().len() > 3 * TAIL_BYTES);
+        fresh.read(&mut r2);
+        assert_eq!(r2.worker_tail, r.worker_tail);
+        // A log that grew by more than a block between two reads.
+        let mut grown = LogTails::default();
+        let mut r3 = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        std::fs::write(&path, WORKER_STEP).unwrap();
+        grown.read(&mut r3);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, WORKER_PAD.repeat(1500).as_bytes()).unwrap();
+        grown.read(&mut r3);
+        assert_eq!(r3.worker_tail.as_ref().unwrap().step, step);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_search_back_for_a_step_line_is_bounded() {
+        let dir = scratch("search-bound");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        let path = diag.join("Worker_20261118-170610-utc.log");
+        let mut text = WORKER_STEP.to_string();
+        text.push_str(&WORKER_PAD.repeat((SEARCH_BYTES as usize) / WORKER_PAD.len() + 800));
+        std::fs::write(&path, &text).unwrap();
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        LogTails::default().read(&mut r);
+        let t = r.worker_tail.unwrap();
+        assert_eq!(t.step, None, "further back than the search goes");
+        assert!(t.last.is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_half_written_line_is_read_once_it_is_whole() {
+        let dir = scratch("half-line");
+        let diag = dir.join("_diag");
+        std::fs::create_dir_all(&diag).unwrap();
+        let path = diag.join("Worker_20261118-170610-utc.log");
+        let line = "[2026-11-18 17:06:15Z INFO StepsRunner] Processing step: DisplayName='Run \u{1b}[31mtests'\n";
+        let (head, rest) = line.split_at(70);
+        std::fs::write(&path, format!("{WORKER_PAD}{head}")).unwrap();
+        let mut r = Runner {
+            dir: dir.clone(),
+            ..Default::default()
+        };
+        let mut tails = LogTails::default();
+        tails.read(&mut r);
+        assert_eq!(r.worker_tail.as_ref().unwrap().step, None);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, rest.as_bytes()).unwrap();
+        tails.read(&mut r);
+        let step = r.worker_tail.take().unwrap().step.unwrap().1;
+        assert_eq!(step, "Run [31mtests", "escape removed");
+        // A log replaced by a shorter one is looked at afresh.
+        std::fs::write(
+            &path,
+            "[2026-11-18 17:30:00Z INFO StepsRunner] Processing step: DisplayName='Test'\n",
+        )
+        .unwrap();
+        tails.read(&mut r);
+        assert_eq!(
+            r.worker_tail.as_ref().unwrap().step.as_ref().unwrap().1,
+            "Test"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_back_goes_a_block_at_a_time_and_stops_at_the_bound() {
+        let dir = scratch("read-back");
         let path = dir.join("Worker_20261119-141834-utc.log");
         let line = "[2026-11-19 14:18:42Z INFO JobServerQueue] padding padding padding padding\n";
         let mut text = line.repeat(2000);
-        text.push_str("[2026-11-19 14:27:02Z INFO StepsRunner] Processing step: DisplayName='Run \u{1b}[31mtests'\n");
+        text.push_str(
+            "[2026-11-19 14:27:02Z INFO StepsRunner] Processing step: DisplayName='Run tests'\n",
+        );
         std::fs::write(&path, &text).unwrap();
         assert!(text.len() as u64 > TAIL_BYTES);
-        let tail = read_tail(&path, TAIL_BYTES).unwrap();
+        // Satisfied by the first block.
+        let (tail, end) = read_back(&path, |t| t.contains("Run tests")).unwrap();
         assert!(tail.len() as u64 <= TAIL_BYTES);
-        assert!(
-            tail.starts_with("[2026-11-19 14:18:42Z"),
-            "starts at a whole line"
-        );
-        assert!(
-            tail.ends_with("DisplayName='Run [31mtests'\n"),
-            "escape removed: {:?}",
-            &tail[tail.len() - 60..]
-        );
-        let short = read_tail(&path, 10).unwrap();
-        assert_eq!(short, "", "no whole line fits");
+        assert!(tail.starts_with("[2026-11-19 14:18:42Z"), "whole lines");
+        assert!(tail.ends_with("DisplayName='Run tests'\n"));
+        assert_eq!(end, text.len() as u64);
+        // Not satisfied: it goes back to the start of this small file.
+        let (all, _) = read_back(&path, |_| false).unwrap();
+        assert_eq!(all, text);
+        // A last line without its newline is left for later.
+        std::fs::write(&path, format!("{line}{}", &line[..20])).unwrap();
+        let (whole, end) = read_back(&path, |_| true).unwrap();
+        assert_eq!((whole.as_str(), end), (line, line.len() as u64));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

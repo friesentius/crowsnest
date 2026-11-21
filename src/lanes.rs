@@ -152,6 +152,15 @@ pub enum QueueState {
     Held,
 }
 
+/// Why a runner's queue is not known: its repository's queue was never read,
+/// or the last attempt to read it failed (its jobs are those of the last
+/// good read, if any).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueGap<'a> {
+    Never,
+    Failed(&'a str),
+}
+
 #[derive(Debug, Clone)]
 pub struct Queued<'a> {
     pub job: &'a Job,
@@ -170,6 +179,8 @@ pub struct Lane<'a> {
     pub current: Option<Current<'a>>,
     /// Oldest first.
     pub queue: Vec<Queued<'a>>,
+    /// Why `queue` may be missing jobs: it was not read, or not lately.
+    pub queue_gap: Option<QueueGap<'a>>,
     /// The job's progress signal and its age in seconds.
     pub signal: Signal,
     pub signal_age: Option<i64>,
@@ -278,6 +289,18 @@ pub fn lanes<'a>(snap: &'a Snapshot, th: &RunnerThresholds) -> Vec<Lane<'a>> {
         .collect()
 }
 
+/// Why the queue of `r`'s repository is not known, if it is not.
+fn queue_gap<'a>(snap: &'a Snapshot, r: &Runner) -> Option<QueueGap<'a>> {
+    match r.repo.as_ref().and_then(|repo| snap.queue_reads.get(repo)) {
+        Some(q) => match (&q.error, q.read_at) {
+            (Some(e), _) => Some(QueueGap::Failed(e)),
+            (None, None) => Some(QueueGap::Never),
+            (None, Some(_)) => None,
+        },
+        None => snap.jobs_read_at.is_none().then_some(QueueGap::Never),
+    }
+}
+
 fn lane<'a>(
     snap: &'a Snapshot,
     th: &RunnerThresholds,
@@ -336,7 +359,18 @@ fn lane<'a>(
         (Signal::None, None)
     };
 
-    let jobs_read = snap.jobs_read_at.unwrap_or(i64::MIN);
+    // A queue that failed to read says nothing about a job being picked up.
+    let queue_gap = queue_gap(snap, r);
+    let jobs_read = match queue_gap {
+        Some(_) => i64::MIN,
+        None => r
+            .repo
+            .as_ref()
+            .and_then(|repo| snap.queue_reads.get(repo))
+            .and_then(|q| q.read_at)
+            .or(snap.jobs_read_at)
+            .unwrap_or(i64::MIN),
+    };
     // Measured from when the runner went idle too: a job that waited an hour
     // behind a busy runner is only late once the runner has been free.
     let unpicked = |j: &Job| -> Option<i64> {
@@ -454,6 +488,7 @@ fn lane<'a>(
         why,
         current,
         queue,
+        queue_gap,
         signal,
         signal_age,
         job_cpu,
@@ -567,7 +602,7 @@ pub fn stats(lane: &Lane, now: i64) -> Option<Stats> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{RepoRunners, RunInfo};
+    use crate::model::{QueueRead, RepoRunners, RunInfo};
 
     const NOW: i64 = 1_000_000;
     const MIN: i64 = 60;
@@ -932,6 +967,61 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(lanes(&s, &th)[0].verdict, Verdict::Idle);
+    }
+
+    #[test]
+    fn a_queue_that_failed_to_read_is_unknown_and_never_not_picking_up() {
+        let mut s = snap();
+        s.jobs.remove(0);
+        let r = &mut s.runners[0];
+        r.busy = false;
+        r.busy_secs = None;
+        r.idle_since = Some(NOW - 6 * MIN);
+        // Read in full: the job queued for nearly two hours is not picked up.
+        let repo = r.repo.clone().unwrap();
+        s.queue_reads.insert(
+            repo.clone(),
+            QueueRead {
+                read_at: Some(NOW - 10),
+                error: None,
+            },
+        );
+        let l = one(&s);
+        assert_eq!(l.verdict, Verdict::NotPickingUp);
+        assert_eq!(l.queue_gap, None);
+        // The repository's last read failed: its jobs are from an older read,
+        // which proves nothing about the runner now.
+        s.queue_reads.insert(
+            repo.clone(),
+            QueueRead {
+                read_at: Some(NOW - 10),
+                error: Some("gh: HTTP 502".into()),
+            },
+        );
+        let l = one(&s);
+        assert_eq!(l.verdict, Verdict::Idle);
+        assert_eq!(l.queue_gap, Some(QueueGap::Failed("gh: HTTP 502")));
+        // Another repository failing says nothing about this one.
+        s.queue_reads.clear();
+        s.queue_reads.insert(
+            "acme/gone".into(),
+            QueueRead {
+                read_at: None,
+                error: Some("gh: HTTP 404".into()),
+            },
+        );
+        s.queue_reads.insert(
+            repo,
+            QueueRead {
+                read_at: Some(NOW - 10),
+                error: None,
+            },
+        );
+        assert_eq!(one(&s).verdict, Verdict::NotPickingUp);
+        // Never read: unknown too.
+        s.queue_reads.clear();
+        s.jobs_read_at = None;
+        assert_eq!(one(&s).queue_gap, Some(QueueGap::Never));
     }
 
     #[test]

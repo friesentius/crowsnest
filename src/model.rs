@@ -645,11 +645,12 @@ pub struct QuotaWindow {
     /// quota-axi's pace: `ahead` (spending faster than the window's clock,
     /// so it runs out before it resets), `on_pace` or `behind`.
     pub pace: Option<String>,
-    /// quota-axi says `ahead`, and the window is far enough in for that to
-    /// be settled: at its rate so far it runs out before it resets.
+    /// quota-axi says `ahead`, its projection is established (not `early`)
+    /// and puts the run-out before the reset: at its rate so far the window
+    /// runs out before it resets.
     pub short: bool,
-    /// When the window runs out at its average rate so far, when that is
-    /// before it resets.
+    /// When quota-axi projects the window runs out, for a window that is
+    /// `short`.
     pub runs_out_at: Option<i64>,
 }
 
@@ -676,11 +677,25 @@ impl RateLimit {
     }
 }
 
+/// The GitHub reads waiting longer than the settings say, because the REST
+/// budget would not last to its reset at the pace they ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Slowed {
+    /// The wait between reads now, in seconds.
+    pub every: i64,
+    /// When the next read is due.
+    pub next_at: i64,
+}
+
 /// The REST and GraphQL budgets, and what the queue read had to leave out.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct GhBudget {
     pub core: RateLimit,
     pub graphql: RateLimit,
+    /// Set after a read while the wait to the next one is stretched past the
+    /// configured cadence (the active one, or the 5 minutes of an idle one)
+    /// by the budget, and no rate-limit pause is on.
+    pub slowed: Option<Slowed>,
     /// Queued or running workflow runs per repository that were not read
     /// (beyond the page size), from GitHub's `total_count`.
     pub runs_unread: BTreeMap<String, u64>,
@@ -699,10 +714,85 @@ pub struct LogTail {
     /// for Jobs`, `Running job: ...`, `Job ... completed with result: ...`).
     pub state: Option<(i64, String)>,
     /// Runner log: the console errors written since that line (`Runner
-    /// connect error: ...`): how many, the first one's time, and the last.
+    /// connect error: ...`): how many, the first one's time, and the last
+    /// (its message without the listener's own framing).
     pub errors: usize,
     pub error_since: Option<i64>,
     pub error: Option<(i64, String)>,
+    /// Runner log: lines that show the listener failing to reach GitHub
+    /// (an `ERR` line, `Attempt N of ... failed`, `Back off ...`, `Sleeping
+    /// for N seconds before retrying`) since its last ordinary console
+    /// line: the first one's time and the newest one's. One failed request
+    /// writes several of these in the same second, so the time they span is
+    /// what tells. The listener prints a console error once per outage, so
+    /// these lines are the evidence that the trouble goes on.
+    pub failure_since: Option<i64>,
+    pub failure_at: Option<i64>,
+}
+
+/// How long after its newest failure line a listener still counts as in
+/// trouble. The listener's request timeout is 100 s, so this covers two
+/// failed attempts.
+pub const FAILURE_LIVE_SECS: i64 = 5 * 60;
+
+/// How long failing attempts must have gone on, with no console line in
+/// view, before the listener reads as retrying. A request that times out
+/// (100 s) or a failed attempt that the next one fixes is routine and spans
+/// less; a real outage spans minutes.
+pub const RETRYING_MIN_SECS: i64 = 2 * 60;
+
+/// What a runner log says is wrong with the listener's connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trouble<'a> {
+    /// A console error, written first at `since`; `msg` is the last one.
+    ConsoleError { since: i64, msg: &'a str },
+    /// Failing attempts since `since`, with no console line in view: the
+    /// log was first read mid-outage.
+    Retrying { since: i64 },
+}
+
+impl LogTail {
+    /// The trouble the log shows as of `now`, by the clock. A listener is in
+    /// trouble while its newest failure line is younger than
+    /// [`FAILURE_LIVE_SECS`]: it prints its console error once and says
+    /// nothing when it reconnects, so how long the log has been quiet in
+    /// its own time says nothing. An ordinary console line, or a failure
+    /// line after a long quiet stretch, has already reset the counts when
+    /// the log was read.
+    pub fn trouble(&self, now: i64) -> Option<Trouble<'_>> {
+        if !self
+            .failure_at
+            .is_some_and(|f| now - f <= FAILURE_LIVE_SECS)
+        {
+            return None;
+        }
+        if let (Some(since), Some((_, msg))) = (self.error_since, self.error.as_ref()) {
+            return Some(Trouble::ConsoleError {
+                since,
+                msg: msg.as_str(),
+            });
+        }
+        // A read that lands mid-outage sees no console line at all. After an
+        // ordinary console line, failing lines without a console error are
+        // routine timeouts.
+        if self.state.is_some() {
+            return None;
+        }
+        // A failed attempt or two is routine; failing for minutes is not.
+        self.failure_since
+            .zip(self.failure_at)
+            .filter(|(first, last)| last - first >= RETRYING_MIN_SECS)
+            .map(|(since, _)| Trouble::Retrying { since })
+    }
+}
+
+/// How the queue of one repository was last read: when it was read in
+/// full, and why the latest attempt failed, if it did. A repository whose
+/// read failed keeps the jobs of its last good read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct QueueRead {
+    pub read_at: Option<i64>,
+    pub error: Option<String>,
 }
 
 /// How fresh one source is.
@@ -725,8 +815,13 @@ pub struct Snapshot {
     pub runner_search: Option<RunnerSearch>,
     /// Queued and running jobs of the repositories with a local runner.
     pub jobs: Vec<Job>,
-    /// Unix time `jobs` was read.
+    /// Unix time a repository's queue was last read in full (the newest of
+    /// them).
     pub jobs_read_at: Option<i64>,
+    /// How each repository's queue was last read, keyed by `owner/repo`. A
+    /// repository that could not be read keeps the jobs of its last good
+    /// read in `jobs`.
+    pub queue_reads: BTreeMap<String, QueueRead>,
     /// GitHub's view of each repository's runners, keyed by `owner/repo`.
     pub gh_runners: BTreeMap<String, RepoRunners>,
     /// Finished jobs and typical durations, keyed by `owner/repo`.
