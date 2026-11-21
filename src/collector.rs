@@ -32,7 +32,7 @@ use crate::sources::{
 use crate::timefmt::now_epoch;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -700,6 +700,9 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         // Reads the last turn made that counted against the budget.
         let calls = Arc::new(AtomicU32::new(0));
         let calls2 = calls.clone();
+        // The end of the last rate-limit pause seen, until a turn runs after it.
+        let resume = Arc::new(AtomicI64::new(0));
+        let resume2 = resume.clone();
         let intervals = intervals.clone();
         let interval = move || {
             let s = shared2.lock().unwrap();
@@ -719,7 +722,13 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 .flatten()
                 .max()
             {
-                Some(until) => every.min(Duration::from_secs((until - now + 1) as u64)),
+                Some(until) => {
+                    resume2.store(until, Ordering::Relaxed);
+                    every.min(Duration::from_secs((until - now + 1) as u64))
+                }
+                // The pause just ended: read at once, not a full interval
+                // after the last paused turn.
+                None if resume2.load(Ordering::Relaxed) != 0 => Duration::ZERO,
                 None => every,
             }
         };
@@ -731,6 +740,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
             paused.clone(),
             interval,
             move |_| {
+                resume.store(0, Ordering::Relaxed);
                 let (urls, runner_list) = {
                     let s = shared.lock().unwrap();
                     (
