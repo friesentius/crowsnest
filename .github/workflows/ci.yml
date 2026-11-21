@@ -4,12 +4,14 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  # Reused by release.yml so a release runs exactly these checks.
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -26,6 +28,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
+      - run: shellcheck scripts/*.sh
+      - run: scripts/test-release-decision.sh
       - run: cargo clippy --all-targets --locked -- -D warnings
 
   test:
