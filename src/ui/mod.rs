@@ -1184,6 +1184,11 @@ fn panel_mark(t: &Theme, p: Panel) -> &'static str {
     t.g(SUP[i], ASCII[i])
 }
 
+/// Below this percent used a window's run-out projection is shown no finer
+/// than the hour: a whole percent of a week is 1.7 hours, so the minutes of
+/// a projection made from so little use mean nothing.
+const COARSE_PROJECTION_BELOW: f64 = 20.0;
+
 fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     let t = &view.theme;
     let w = area.width.saturating_sub(4) as usize;
@@ -1207,10 +1212,20 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     q.sort_by(|a, b| b.pct_used.total_cmp(&a.pct_used));
     let n = 6;
     let with_reset = w >= 44;
-    // `  ↻ Sat 02:00`, or `  out Fri 12:18` for a window that runs out first.
+    // `  ↻ Sat 02:00`, or `  out Fri 12:18` for a window that runs out
+    // first. quota-axi reports whole percents, so with little of the window
+    // used its projection is only good to the hour: `  out ~Fri 12:00`.
     let out_at = |win: &crate::model::QuotaWindow| {
-        win.runs_out_at
-            .map(|o| format!("  out {}", timefmt::short_when(o, view.snap.now)))
+        win.runs_out_at.map(|o| {
+            if win.pct_used < COARSE_PROJECTION_BELOW {
+                format!(
+                    "  out ~{}",
+                    timefmt::short_when(timefmt::nearest_hour(o), view.snap.now)
+                )
+            } else {
+                format!("  out {}", timefmt::short_when(o, view.snap.now))
+            }
+        })
     };
     let reset_w = q
         .iter()

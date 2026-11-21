@@ -15,7 +15,9 @@
           "pace": {
             "status": "behind",
             "reservePercentPoints": 45.9562,
-            "burnMultiple": 0.4715
+            "burnMultiple": 0.4715,
+            "projectedExhaustedAt": "2026-11-19T17:37:09.000Z",
+            "projectionConfidence": "established"
           }
         },
         {
@@ -27,7 +29,9 @@
           "pace": {
             "status": "behind",
             "reservePercentPoints": 43.9769,
-            "burnMultiple": 0.4432
+            "burnMultiple": 0.4432,
+            "projectedExhaustedAt": "2026-11-22T06:11:43.000Z",
+            "projectionConfidence": "established"
           }
         },
         {
@@ -39,7 +43,9 @@
           "pace": {
             "status": "behind",
             "reservePercentPoints": 67.977,
-            "burnMultiple": 0.1393
+            "burnMultiple": 0.1393,
+            "projectedExhaustedAt": "2026-11-27T22:05:12.000Z",
+            "projectionConfidence": "established"
           }
         }
       ],

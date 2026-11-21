@@ -55,7 +55,7 @@ It is written in Rust with [ratatui](https://ratatui.rs), and it is a single bin
 
 Workers that need you sort to the top and stand out.
 The USAGE panel shows how much of each window is used (quota-axi reports what is left, crowsnest flips it), most-used first, with the reset time beside it.
-A window being spent faster than its clock runs (quota-axi's pace `ahead`) will run out before it resets: its percentage turns yellow and gets a `▲`, and where there is room the reset time is replaced by when it runs out at its average rate so far (`86%▲  out Fri 12:18`). Windows on or under pace look as usual.
+A window being spent faster than its clock runs (quota-axi's pace `ahead`) will run out before it resets: its percentage turns yellow and gets a `▲`, and where there is room the reset time is replaced by when quota-axi projects it runs out (`86%▲  out Fri 12:18`). Percentages are reported whole, so while less than 20% of a window is used the projection is too coarse for minutes and is shown to the hour (`4%▲  out ~Fri 12:00`). A window early in its time, whose projection quota-axi calls `early`, is not flagged. Windows on or under pace look as usual.
 Press Enter on a row to open its detail: every pipeline step with its duration, each PR check, the last status line, and the worktree.
 Press Tab to move to the runner panel, pick a runner with the arrows, and press Enter for its detail (see [Runners](#runners)).
 At 140 columns or more the panels move to a right-hand column, and the held captain calls get their own box.
@@ -328,7 +328,7 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
 | Runner registration | `gh api --method GET repos/<owner>/<repo>/actions/runners` (needs admin read) | 5 min |
 | Host | load, memory, swap, disks, and Linux pressure stall information | 2 s |
-| Usage | `quota-axi --no-credential-refresh --json` | 5 min |
+| Usage | `quota-axi --no-credential-refresh --json --full` | 5 min |
 
 Each source runs on its own thread, with a timeout, and never overlaps itself.
 

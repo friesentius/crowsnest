@@ -1,4 +1,5 @@
-//! Agent usage windows from `quota-axi --no-credential-refresh --json`.
+//! Agent usage windows from `quota-axi --no-credential-refresh --json --full`
+//! (`--full` adds each window's projected run-out time to its pace).
 //! `--no-credential-refresh` matters: without it a read may renew an expired
 //! vendor session, which is a write.
 
@@ -9,8 +10,6 @@ use serde::Deserialize;
 #[derive(Deserialize, Default)]
 #[serde(default, rename_all = "camelCase")]
 struct Report {
-    /// When quota-axi made the report: the moment its pace describes.
-    generated_at: Option<String>,
     providers: Vec<Provider>,
 }
 
@@ -35,38 +34,12 @@ struct Window {
 #[serde(default, rename_all = "camelCase")]
 struct Pace {
     status: Option<String>,
-    /// Percent left minus percent of the window's time left: below zero
-    /// the window is being spent faster than its clock runs.
-    reserve_percent_points: Option<f64>,
-}
-
-/// When a window `used` percent spent runs out at its average rate so far,
-/// as of `at`, if that is before it resets. quota-axi's reserve is percent
-/// left minus percent of time left, so the share of the window's time gone
-/// is `used + reserve`, and the window's length follows from the time left
-/// until `resets_at`.
-fn runs_out_at(used: f64, reserve: f64, resets_at: i64, at: i64) -> Option<i64> {
-    let gone = used + reserve;
-    let left = 100.0 - gone;
-    // Spent already: nothing left to run out, the reset is what matters.
-    if used <= 0.0 || used >= 100.0 || gone <= 0.0 || left <= 0.0 || resets_at <= at {
-        return None;
-    }
-    let length = (resets_at - at) as f64 * 100.0 / left;
-    let elapsed = length * gone / 100.0;
-    let out = at + ((100.0 - used) * elapsed / used).round() as i64;
-    (out < resets_at).then_some(out)
-}
-
-/// quota-axi's own bound (`PACE_EARLY_ELAPSED_PERCENT`): before this share
-/// of a window has passed, its projection is `early`, and a little use
-/// reads as a fast pace. Such a window is not flagged yet.
-const EARLY_PERCENT: f64 = 10.0;
-
-/// Whether a window with pace `ahead` will run out before it resets, by a
-/// projection quota-axi calls established.
-fn runs_short(used: f64, reserve: Option<f64>) -> bool {
-    reserve.is_none_or(|r| used + r >= EARLY_PERCENT)
+    /// When the window runs out at its average rate so far, as quota-axi
+    /// projects it (it gives one for windows that will last, too).
+    projected_exhausted_at: Option<String>,
+    /// `early` before a tenth of the window has passed, when a little use
+    /// reads as a fast pace; `established` after.
+    projection_confidence: Option<String>,
 }
 
 /// quota-axi reports what is left; the panel shows what is spent.
@@ -76,7 +49,6 @@ fn used_from_remaining(remaining: f64) -> f64 {
 
 pub fn parse(json: &str) -> Result<Vec<QuotaWindow>, String> {
     let r: Report = serde_json::from_str(json).map_err(|e| format!("invalid quota JSON: {e}"))?;
-    let at = r.generated_at.as_deref().and_then(timefmt::parse_iso);
     Ok(r.providers
         .into_iter()
         .flat_map(|p| {
@@ -92,14 +64,19 @@ pub fn parse(json: &str) -> Result<Vec<QuotaWindow>, String> {
                 let resets_at = w.resets_at.as_deref().and_then(timefmt::parse_iso);
                 let pace = w.pace.unwrap_or_default();
                 let status = pace.status.filter(|s| s != "unknown");
-                let reserve = pace.reserve_percent_points;
-                let short = status.as_deref() == Some("ahead") && runs_short(pct_used, reserve);
-                let runs_out = match (short, reserve, resets_at, at) {
-                    (true, Some(reserve), Some(reset), Some(at)) => {
-                        runs_out_at(pct_used, reserve, reset, at)
-                    }
-                    _ => None,
-                };
+                // Spent faster than its clock, and far enough in for that to
+                // be settled: quota-axi's own projection says when it runs
+                // out, which is only news when that is before the reset.
+                // (quota-axi projects a run-out for windows that will last
+                // too, after their reset.)
+                let projected = pace
+                    .projected_exhausted_at
+                    .as_deref()
+                    .and_then(timefmt::parse_iso);
+                let short = status.as_deref() == Some("ahead")
+                    && pace.projection_confidence.as_deref() != Some("early")
+                    && projected.is_none_or(|out| resets_at.is_none_or(|r| out < r));
+                let runs_out = projected.filter(|_| short);
                 Some(QuotaWindow {
                     provider: provider.clone(),
                     id,
@@ -128,42 +105,54 @@ mod tests {
         assert_eq!(used_from_remaining(104.0), 0.0);
     }
 
+    /// The fixture's week window, 65% left and `behind`, made `ahead`: 14%
+    /// left, projected to run out at `out`, with `confidence`.
+    fn week(out: &str, confidence: &str) -> QuotaWindow {
+        let json = include_str!("../../tests/fixtures/quota.json")
+            .replacen(
+                "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",",
+                "\"percentRemaining\": 14,\n          \"pace\": {\n            \"status\": \"ahead\",",
+                1,
+            )
+            .replacen("2026-11-22T06:11:43.000Z", out, 1)
+            .replacen(
+                "\"projectionConfidence\": \"established\"\n          }\n        },\n        {\n          \"id\": \"model:fable\"",
+                &format!("\"projectionConfidence\": \"{confidence}\"\n          }}\n        }},\n        {{\n          \"id\": \"model:fable\""),
+                1,
+            );
+        parse(&json)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.id == "seven_day")
+            .unwrap()
+    }
+
     #[test]
-    fn a_window_spent_faster_than_its_clock_runs_out_before_reset() {
-        // 35h left is 21% of the window, so 79% of its time (131.7h) is
-        // gone. 86% spent in that time leaves 14%, which lasts 21.4h.
-        let at = 1_000_000;
-        let reset = at + 35 * 3600;
-        let out = runs_out_at(86.0, -7.0, reset, at).unwrap();
-        assert!((out - (at + 77_163)).abs() < 5, "{}", out - at);
-        // On or under pace it lasts until the reset.
-        assert_eq!(runs_out_at(41.0, 45.9, reset, at), None);
-        assert_eq!(runs_out_at(0.0, -1.0, reset, at), None);
-        assert_eq!(runs_out_at(50.0, -5.0, at, at), None);
-        // A spent window has nothing left to run out: its reset matters.
-        assert_eq!(runs_out_at(100.0, -10.0, reset, at), None);
-        // An hour into a week, 3% spent reads as 3x the pace; quota-axi
-        // calls that projection early, so it is not flagged.
-        assert!(!runs_short(3.0, Some(-2.0344)));
-        assert!(runs_short(86.0, Some(-7.0)));
-        assert!(runs_short(50.0, None));
-        let json = include_str!("../../tests/fixtures/quota.json").replacen(
-            "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",\n            \"reservePercentPoints\": 43.9769,",
-            "\"percentRemaining\": 14,\n          \"pace\": {\n            \"status\": \"ahead\",\n            \"reservePercentPoints\": -7.0,",
-            1,
-        );
-        let w = parse(&json).unwrap();
-        let week = w.iter().find(|w| w.id == "seven_day").unwrap();
-        assert_eq!(week.pace.as_deref(), Some("ahead"));
-        assert!(week.short);
-        let made = timefmt::parse_iso("2026-11-19T14:40:52.735Z").unwrap();
-        let out = week.runs_out_at.unwrap();
-        assert!(out > made && out < week.resets_at.unwrap());
-        assert!(
-            w.iter()
-                .filter(|w| w.id != "seven_day")
-                .all(|w| w.runs_out_at.is_none())
-        );
+    fn the_run_out_time_is_quota_axis_own_projection() {
+        // The week resets 2026-11-21T02:00Z. Spent faster than its clock and
+        // projected to run out before: flagged, with quota-axi's time as it
+        // gave it, not rebuilt from whole percents.
+        let w = week("2026-11-20T21:18:42.000Z", "established");
+        assert_eq!(w.pace.as_deref(), Some("ahead"));
+        assert!(w.short);
+        assert_eq!(w.runs_out_at, timefmt::parse_iso("2026-11-20T21:18:42Z"));
+        // Early in the window a little use reads as a fast pace: not flagged.
+        let early = week("2026-11-20T21:18:42.000Z", "early");
+        assert_eq!((early.short, early.runs_out_at), (false, None));
+        // A projection after the reset is not news, whatever the pace says.
+        let after = week("2026-11-21T09:00:00.000Z", "established");
+        assert_eq!((after.short, after.runs_out_at), (false, None));
+        // Windows on or under pace carry a projection too (after their
+        // reset) and are never flagged.
+        let all = parse(include_str!("../../tests/fixtures/quota.json")).unwrap();
+        assert!(all.iter().all(|w| !w.short && w.runs_out_at.is_none()));
+        // A quota-axi without the projection fields still flags `ahead`.
+        let old = parse(
+            r#"{"providers": [{"provider": "x", "windows": [{"id": "d", "label": "day",
+                "percentRemaining": 10, "pace": {"status": "ahead", "reservePercentPoints": -7.0}}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!((old[0].short, old[0].runs_out_at), (true, None));
     }
 
     #[test]

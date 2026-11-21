@@ -2024,17 +2024,25 @@ fn a_long_entry_keeps_its_end_in_view() {
     assert!(t.contains("\u{2026}"), "{t}");
 }
 
-/// The recorded usage, but the claude week is 86% spent with 21% of its
-/// time left: spent faster than its clock, it runs out before it resets.
-fn ahead_week() -> Snapshot {
+/// The recorded usage, but the claude week is `left`% left, `ahead` of its
+/// clock, and quota-axi projects it runs out at `out`.
+fn ahead_week_with(left: u32, out: &str) -> Snapshot {
     let mut s = snapshot();
-    let json = fixture("quota.json").replacen(
-        "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",\n            \"reservePercentPoints\": 43.9769,",
-        "\"percentRemaining\": 14,\n          \"pace\": {\n            \"status\": \"ahead\",\n            \"reservePercentPoints\": -7.0,",
-        1,
-    );
+    let json = fixture("quota.json")
+        .replacen(
+            "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",",
+            &format!("\"percentRemaining\": {left},\n          \"pace\": {{\n            \"status\": \"ahead\","),
+            1,
+        )
+        .replacen("2026-11-22T06:11:43.000Z", out, 1);
     s.quota = quota::parse(&json).unwrap();
     s
+}
+
+/// 86% of the week spent with 21% of its time left: spent faster than its
+/// clock, it runs out before it resets.
+fn ahead_week() -> Snapshot {
+    ahead_week_with(14, "2026-11-20T12:18:42.000Z")
 }
 
 #[test]
@@ -2058,6 +2066,25 @@ fn a_window_spent_faster_than_its_clock_says_when_it_runs_out() {
         "{narrow}"
     );
     insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
+}
+
+#[test]
+fn a_run_out_projected_from_little_use_is_shown_to_the_hour() {
+    utc();
+    // 4% of the week used: whole percents make the minutes meaningless.
+    let s = ahead_week_with(96, "2026-11-20T11:49:00.000Z");
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        lines_with(&wide, "claude week")[0].contains("\u{2500}   4%\u{25b2}  out ~Fri 12:00"),
+        "{wide}"
+    );
+    // 20% used is no longer coarse.
+    let s = ahead_week_with(80, "2026-11-20T11:49:00.000Z");
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        lines_with(&wide, "claude week")[0].contains("out Fri 11:49"),
+        "{wide}"
+    );
 }
 
 /// The runners fleet while GitHub refuses for rate limit: the limit was

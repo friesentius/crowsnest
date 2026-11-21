@@ -375,7 +375,7 @@ esac
                     "actions-runner-pantry.service"
                 ]
             ),
-            "quota-axi" => assert_eq!(args, ["--no-credential-refresh", "--json"]),
+            "quota-axi" => assert_eq!(args, ["--no-credential-refresh", "--json", "--full"]),
             other => panic!("unexpected program {other}"),
         }
     }

@@ -113,6 +113,13 @@ pub fn start_of_day(epoch: i64) -> i64 {
     epoch - (t.hour * 3600 + t.min * 60 + t.sec) as i64
 }
 
+/// `epoch` rounded to the nearest whole hour of local time.
+pub fn nearest_hour(epoch: i64) -> i64 {
+    let t = local(epoch);
+    let into = (t.min * 60 + t.sec) as i64;
+    epoch - into + if into >= 1800 { 3600 } else { 0 }
+}
+
 const DAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
 /// `HH:MM:SS` in local time.
@@ -234,6 +241,26 @@ mod tests {
             parse_iso("2026-11-19T14:15Z")
         );
         assert_eq!(find_until("no wait here"), None);
+    }
+
+    #[test]
+    fn times_round_to_the_nearest_whole_hour() {
+        for e in [
+            1_795_096_692,
+            1_795_097_700,
+            1_795_099_199,
+            1_795_099_200,
+            0,
+        ] {
+            let h = nearest_hour(e);
+            assert_eq!(local(h).min, 0, "{e}");
+            assert_eq!(local(h).sec, 0, "{e}");
+            assert!((h - e).abs() <= 1800, "{e}");
+        }
+        // Half past rounds up, a minute short of it down.
+        let top = start_of_day(1_795_096_692) + 12 * 3600;
+        assert_eq!(nearest_hour(top + 29 * 60 + 59), top);
+        assert_eq!(nearest_hour(top + 30 * 60), top + 3600);
     }
 
     #[test]
