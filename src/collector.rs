@@ -695,6 +695,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     if cfg.github {
         let (shared, shared2) = (shared.clone(), shared.clone());
         let mut state = GhState::default();
+        let mut first = true;
         let changed_gh = changed.clone();
         // Reads the last turn made that counted against the budget.
         let calls = Arc::new(AtomicU32::new(0));
@@ -702,18 +703,25 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
         let intervals = intervals.clone();
         let interval = move || {
             let s = shared2.lock().unwrap();
+            let now = now_epoch();
             let live = Intervals::get(&intervals.github);
             let base = if gh_active(&s) {
                 live
             } else {
                 live.max(Duration::from_secs(300))
             };
-            ghapi::cadence(
-                &s.gh_budget.core,
-                base,
-                calls2.load(Ordering::Relaxed),
-                now_epoch(),
-            )
+            let every =
+                ghapi::cadence(&s.gh_budget.core, base, calls2.load(Ordering::Relaxed), now);
+            // Paused for rate limit: try again as soon as the pause ends.
+            let b = &s.gh_budget;
+            match [b.core.paused(now), b.graphql.paused(now)]
+                .into_iter()
+                .flatten()
+                .max()
+            {
+                Some(until) => every.min(Duration::from_secs((until - now + 1) as u64)),
+                None => every,
+            }
         };
         spawn_tier(
             "gh",
@@ -751,7 +759,12 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 };
                 let _ = changed_gh.send(());
                 let (history, gh_runners) = state.read(&runner_list, &live);
-                calls.store(state.client.take_calls(), Ordering::Relaxed);
+                // The first pass reads every finished run's jobs once; it
+                // says nothing about the pace of later passes.
+                let made = state.client.take_calls();
+                if !std::mem::replace(&mut first, false) {
+                    calls.store(made, Ordering::Relaxed);
+                }
                 let mut s = shared.lock().unwrap();
                 s.history = history;
                 s.gh_runners = gh_runners;

@@ -1215,7 +1215,7 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
         .max()
         .unwrap_or(0)
         .max(13);
-    let ahead = |w: &crate::model::QuotaWindow| w.pace.as_deref() == Some("ahead");
+    let ahead = |w: &crate::model::QuotaWindow| w.short;
     // A column for the mark of a window that will run out, when one does.
     let mark_w = usize::from(q.iter().take(rows).any(|w| ahead(w)));
     let label_w = w

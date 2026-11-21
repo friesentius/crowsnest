@@ -445,7 +445,7 @@ pub fn parse_runner_tail(text: &str) -> LogTail {
         // `WRITE LINE: 2026-11-20 18:28:06Z: Running job: Lint`
         let console = |kind: &str| {
             let m = msg.strip_prefix(kind)?;
-            let m = m.split_once("Z: ").map_or(m, |(_, m)| m).trim();
+            let m = m.split_once("Z:").map_or(m, |(_, m)| m).trim();
             (!m.is_empty()).then(|| m.to_string())
         };
         if let Some(m) = console("WRITE LINE: ") {
@@ -462,8 +462,22 @@ pub fn parse_runner_tail(text: &str) -> LogTail {
             t.error = Some((at, m));
         }
     }
+    // A listener in trouble repeats its error every minute or two; one that
+    // kept logging without another error for a while got through, even if
+    // it wrote no console line to say so.
+    if let (Some((last, _)), Some((err, _))) = (&t.last, &t.error)
+        && last - err > ERROR_QUIET_SECS
+    {
+        t.errors = 0;
+        t.error_since = None;
+        t.error = None;
+    }
     t
 }
+
+/// How long a runner log may go on without repeating a console error
+/// before that error counts as over.
+const ERROR_QUIET_SECS: i64 = 10 * 60;
 
 /// Reads the tails of each runner's newest worker and runner logs, again
 /// only when a file's size or time changed.
@@ -1257,6 +1271,24 @@ mod tests {
         ));
         assert_eq!(back.state.unwrap().1, "Runner reconnected.");
         assert_eq!((back.errors, back.error_since, back.error), (0, None, None));
+        // Blank console lines between errors change nothing.
+        let blank = parse_runner_tail(&format!(
+            "{text}[2026-11-19 13:47:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:47:00Z: \n"
+        ));
+        assert_eq!(blank.errors, 2);
+        // Logging on for over 10 minutes without another error: it is over.
+        let later = |time: &str| {
+            parse_runner_tail(&format!(
+                "{text}[2026-11-19 {time}Z INFO RSAFileKeyManager] Loading RSA key parameters\n"
+            ))
+        };
+        assert_eq!(later("13:55:00").errors, 2, "8m48s on, still in trouble");
+        let over = later("13:57:00");
+        assert_eq!(
+            (over.errors, over.error),
+            (0, None),
+            "10m48s on, it got through"
+        );
     }
 
     #[test]

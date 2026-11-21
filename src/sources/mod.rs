@@ -109,11 +109,15 @@ fn read_run_jobs(
     gh: &mut Client,
     repo: &str,
     run: &crate::model::RunInfo,
+    finished: bool,
 ) -> Result<Vec<Job>, GhError> {
-    let out = gh.get(&format!(
-        "repos/{repo}/actions/runs/{}/jobs?per_page=50",
-        run.id
-    ))?;
+    let path = format!("repos/{repo}/actions/runs/{}/jobs?per_page=50", run.id);
+    // A finished run's jobs never change and are read once: no ETag.
+    let out = if finished {
+        gh.get_once(&path)?
+    } else {
+        gh.get(&path)?
+    };
     let mut jobs = gh::parse_jobs(repo, &out).map_err(GhError::Failed)?;
     for j in &mut jobs {
         j.run = Some(run.clone());
@@ -154,7 +158,7 @@ pub fn read_queue(gh: &mut Client, runners: &[Runner]) -> Result<Queue, GhError>
         runs.sort_by_key(|r| r.id);
         runs.dedup_by_key(|r| r.id);
         for run in &runs {
-            q.jobs.extend(read_run_jobs(gh, &repo, run)?);
+            q.jobs.extend(read_run_jobs(gh, &repo, run, false)?);
         }
         if unread > 0 {
             q.unread.insert(repo, unread);
@@ -179,7 +183,7 @@ pub fn read_history(
         if cache.has(&run) {
             continue;
         }
-        let jobs = read_run_jobs(gh, repo, &run)?;
+        let jobs = read_run_jobs(gh, repo, &run, true)?;
         cache.insert(run, jobs);
         added += 1;
     }

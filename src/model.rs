@@ -645,6 +645,9 @@ pub struct QuotaWindow {
     /// quota-axi's pace: `ahead` (spending faster than the window's clock,
     /// so it runs out before it resets), `on_pace` or `behind`.
     pub pace: Option<String>,
+    /// quota-axi says `ahead`, and the window is far enough in for that to
+    /// be settled: at its rate so far it runs out before it resets.
+    pub short: bool,
     /// When the window runs out at its average rate so far, when that is
     /// before it resets.
     pub runs_out_at: Option<i64>,

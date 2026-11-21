@@ -48,13 +48,25 @@ struct Pace {
 fn runs_out_at(used: f64, reserve: f64, resets_at: i64, at: i64) -> Option<i64> {
     let gone = used + reserve;
     let left = 100.0 - gone;
-    if used <= 0.0 || gone <= 0.0 || left <= 0.0 || resets_at <= at {
+    // Spent already: nothing left to run out, the reset is what matters.
+    if used <= 0.0 || used >= 100.0 || gone <= 0.0 || left <= 0.0 || resets_at <= at {
         return None;
     }
     let length = (resets_at - at) as f64 * 100.0 / left;
     let elapsed = length * gone / 100.0;
     let out = at + ((100.0 - used) * elapsed / used).round() as i64;
     (out < resets_at).then_some(out)
+}
+
+/// quota-axi's own bound (`PACE_EARLY_ELAPSED_PERCENT`): before this share
+/// of a window has passed, its projection is `early`, and a little use
+/// reads as a fast pace. Such a window is not flagged yet.
+const EARLY_PERCENT: f64 = 10.0;
+
+/// Whether a window with pace `ahead` will run out before it resets, by a
+/// projection quota-axi calls established.
+fn runs_short(used: f64, reserve: Option<f64>) -> bool {
+    reserve.is_none_or(|r| used + r >= EARLY_PERCENT)
 }
 
 /// quota-axi reports what is left; the panel shows what is spent.
@@ -80,13 +92,10 @@ pub fn parse(json: &str) -> Result<Vec<QuotaWindow>, String> {
                 let resets_at = w.resets_at.as_deref().and_then(timefmt::parse_iso);
                 let pace = w.pace.unwrap_or_default();
                 let status = pace.status.filter(|s| s != "unknown");
-                let runs_out = match (
-                    status.as_deref(),
-                    pace.reserve_percent_points,
-                    resets_at,
-                    at,
-                ) {
-                    (Some("ahead"), Some(reserve), Some(reset), Some(at)) => {
+                let reserve = pace.reserve_percent_points;
+                let short = status.as_deref() == Some("ahead") && runs_short(pct_used, reserve);
+                let runs_out = match (short, reserve, resets_at, at) {
+                    (true, Some(reserve), Some(reset), Some(at)) => {
                         runs_out_at(pct_used, reserve, reset, at)
                     }
                     _ => None,
@@ -98,6 +107,7 @@ pub fn parse(json: &str) -> Result<Vec<QuotaWindow>, String> {
                     pct_used,
                     resets_at,
                     pace: status,
+                    short,
                     runs_out_at: runs_out,
                 })
             })
@@ -130,6 +140,13 @@ mod tests {
         assert_eq!(runs_out_at(41.0, 45.9, reset, at), None);
         assert_eq!(runs_out_at(0.0, -1.0, reset, at), None);
         assert_eq!(runs_out_at(50.0, -5.0, at, at), None);
+        // A spent window has nothing left to run out: its reset matters.
+        assert_eq!(runs_out_at(100.0, -10.0, reset, at), None);
+        // An hour into a week, 3% spent reads as 3x the pace; quota-axi
+        // calls that projection early, so it is not flagged.
+        assert!(!runs_short(3.0, Some(-2.0344)));
+        assert!(runs_short(86.0, Some(-7.0)));
+        assert!(runs_short(50.0, None));
         let json = include_str!("../../tests/fixtures/quota.json").replacen(
             "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",\n            \"reservePercentPoints\": 43.9769,",
             "\"percentRemaining\": 14,\n          \"pace\": {\n            \"status\": \"ahead\",\n            \"reservePercentPoints\": -7.0,",
@@ -138,6 +155,7 @@ mod tests {
         let w = parse(&json).unwrap();
         let week = w.iter().find(|w| w.id == "seven_day").unwrap();
         assert_eq!(week.pace.as_deref(), Some("ahead"));
+        assert!(week.short);
         let made = timefmt::parse_iso("2026-11-19T14:40:52.735Z").unwrap();
         let out = week.runs_out_at.unwrap();
         assert!(out > made && out < week.resets_at.unwrap());

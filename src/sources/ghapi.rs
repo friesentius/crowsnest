@@ -138,16 +138,18 @@ pub type GraphqlAnswer = (String, Option<String>);
 /// Runs `gh` for one source, remembering ETags and the budget between reads.
 #[derive(Debug, Default)]
 pub struct Client {
-    /// Path -> the ETag and body of its last 200 answer.
-    etags: BTreeMap<String, (String, String)>,
+    /// Path -> when it was last asked for (a counter), and the ETag and
+    /// body of its last 200 answer.
+    etags: BTreeMap<String, (u64, String, String)>,
+    asked: u64,
     pub budget: GhBudget,
     /// Reads that counted against the REST budget (not 304s) since
     /// [`Client::take_calls`] was last asked.
     calls: u32,
 }
 
-/// How many ETag answers are kept. Run job lists are added as runs come
-/// and go; the oldest paths are dropped past this.
+/// How many ETag answers are kept. Job lists of active runs are added as
+/// runs come and go; the path asked for longest ago is dropped past this.
 const MAX_ETAGS: usize = 400;
 
 impl Client {
@@ -194,19 +196,30 @@ impl Client {
 
     /// `gh api --method GET <path>`, asked with the last answer's ETag.
     pub fn get(&mut self, path: &str) -> Result<String, GhError> {
-        self.get_at(path, now_epoch(), |cmd| cmd.run())
+        self.get_at(path, true, now_epoch(), |cmd| cmd.run())
     }
 
-    fn get_at<F>(&mut self, path: &str, now: i64, run: F) -> Result<String, GhError>
+    /// `gh api --method GET <path>` for an answer that is read only once
+    /// (a finished run's jobs never change): no ETag is kept for it.
+    pub fn get_once(&mut self, path: &str) -> Result<String, GhError> {
+        self.get_at(path, false, now_epoch(), |cmd| cmd.run())
+    }
+
+    fn get_at<F>(&mut self, path: &str, keep: bool, now: i64, run: F) -> Result<String, GhError>
     where
         F: FnOnce(&ReadCommand) -> Result<crate::exec::Output, ExecError>,
     {
         if let Some(until) = self.paused(false, now) {
             return Err(GhError::Paused { until });
         }
+        self.asked += 1;
+        let asked = self.asked;
         let cmd = ReadCommand::GhApiGet {
             path: path.to_string(),
-            etag: self.etags.get(path).map(|(e, _)| e.clone()),
+            etag: self.etags.get_mut(path).map(|(at, e, _)| {
+                *at = asked;
+                e.clone()
+            }),
         };
         let (out, failure) = match run(&cmd) {
             Ok(o) => (o.stdout, None),
@@ -221,7 +234,7 @@ impl Client {
         }
         if r.status == 304 {
             return match self.etags.get(path) {
-                Some((_, body)) => Ok(body.clone()),
+                Some((_, _, body)) => Ok(body.clone()),
                 None => Err(GhError::Failed(
                     "gh: HTTP 304 without a cached answer".into(),
                 )),
@@ -232,15 +245,19 @@ impl Client {
             return Err(GhError::Failed(http_error(&r)));
         }
         match r.header("etag") {
-            Some(etag) if crate::exec::valid_etag(etag) => {
+            Some(etag) if keep && crate::exec::valid_etag(etag) => {
                 if self.etags.len() >= MAX_ETAGS && !self.etags.contains_key(path) {
-                    let first = self.etags.keys().next().cloned();
-                    if let Some(k) = first {
+                    let oldest = self
+                        .etags
+                        .iter()
+                        .min_by_key(|(_, (at, _, _))| *at)
+                        .map(|(k, _)| k.clone());
+                    if let Some(k) = oldest {
                         self.etags.remove(&k);
                     }
                 }
                 self.etags
-                    .insert(path.to_string(), (etag.to_string(), r.body.clone()));
+                    .insert(path.to_string(), (asked, etag.to_string(), r.body.clone()));
             }
             _ => {
                 self.etags.remove(path);
@@ -389,13 +406,13 @@ mod tests {
             &with(&[("Etag", "W/\"v1\"")], &h),
             "{\"jobs\":[1]}",
         );
-        let body = c.get_at("repos/o/r/actions/runs/1/jobs", NOW, |cmd| {
+        let body = c.get_at("repos/o/r/actions/runs/1/jobs", true, NOW, |cmd| {
             assert!(matches!(cmd, ReadCommand::GhApiGet { etag: None, .. }));
             ok(first)
         });
         assert_eq!(body.unwrap(), "{\"jobs\":[1]}");
         assert_eq!(c.take_calls(), 1);
-        let again = c.get_at("repos/o/r/actions/runs/1/jobs", NOW + 60, |cmd| {
+        let again = c.get_at("repos/o/r/actions/runs/1/jobs", true, NOW + 60, |cmd| {
             let ReadCommand::GhApiGet { etag, .. } = cmd else {
                 panic!()
             };
@@ -416,6 +433,37 @@ mod tests {
     }
 
     #[test]
+    fn one_shot_answers_keep_no_etag_and_the_oldest_path_goes_first() {
+        let mut c = Client::default();
+        let h = counters("4000");
+        let tagged = |tag: &str| answer("200 OK", &with(&[("Etag", tag)], &h), "{}");
+        c.get_at("repos/o/r/actions/runs/9/jobs", false, NOW, |_| {
+            ok(tagged("\"a\""))
+        })
+        .unwrap();
+        assert!(c.etags.is_empty(), "a finished run's jobs are read once");
+        for i in 0..MAX_ETAGS {
+            let path = format!("repos/o/r/actions/runs/{i}/jobs");
+            c.get_at(&path, true, NOW, |_| ok(tagged("\"a\""))).unwrap();
+        }
+        // Path 0 is asked again (a 304), so path 1 is now the oldest.
+        c.get_at("repos/o/r/actions/runs/0/jobs", true, NOW, |_| {
+            failed(
+                answer("304 Not Modified", &with(&[], &h), ""),
+                "gh: HTTP 304",
+            )
+        })
+        .unwrap();
+        c.get_at("repos/o/r/actions/runs/new/jobs", true, NOW, |_| {
+            ok(tagged("\"b\""))
+        })
+        .unwrap();
+        assert_eq!(c.etags.len(), MAX_ETAGS);
+        assert!(c.etags.contains_key("repos/o/r/actions/runs/0/jobs"));
+        assert!(!c.etags.contains_key("repos/o/r/actions/runs/1/jobs"));
+    }
+
+    #[test]
     fn a_rate_limit_refusal_pauses_reads_until_the_reset() {
         let mut c = Client::default();
         let h = counters("0");
@@ -424,16 +472,19 @@ mod tests {
             &with(&[], &h),
             "{\"message\":\"API rate limit exceeded for user ID 1.\"}",
         );
-        let e = c.get_at("repos/o/r/actions/runs?status=queued", NOW, |_| {
+        let e = c.get_at("repos/o/r/actions/runs?status=queued", true, NOW, |_| {
             failed(refused, "gh: API rate limit exceeded (HTTP 403)")
         });
         assert_eq!(e, Err(GhError::Paused { until: NOW + 1200 }));
         assert_eq!(c.budget.core.paused_until, Some(NOW + 1200));
         assert_eq!(c.budget.core.paused_at, Some(NOW));
         // Nothing is asked while paused.
-        let e = c.get_at("repos/o/r/actions/runs?status=queued", NOW + 600, |_| {
-            panic!("asked GitHub while paused")
-        });
+        let e = c.get_at(
+            "repos/o/r/actions/runs?status=queued",
+            true,
+            NOW + 600,
+            |_| panic!("asked GitHub while paused"),
+        );
         assert_eq!(e, Err(GhError::Paused { until: NOW + 1200 }));
         // GraphQL is a separate budget.
         let q = c.graphql_at("query { viewer { login } }".into(), NOW + 600, |_| {
@@ -441,9 +492,12 @@ mod tests {
         });
         assert!(q.is_ok());
         // After the reset reads resume.
-        let fine = c.get_at("repos/o/r/actions/runs?status=queued", NOW + 1201, |_| {
-            ok(answer("200 OK", &with(&[], &counters("4999")), "{}"))
-        });
+        let fine = c.get_at(
+            "repos/o/r/actions/runs?status=queued",
+            true,
+            NOW + 1201,
+            |_| ok(answer("200 OK", &with(&[], &counters("4999")), "{}")),
+        );
         assert_eq!(fine.unwrap(), "{}");
         assert_eq!(c.budget.core.remaining, 4999);
     }
@@ -468,7 +522,7 @@ mod tests {
     fn a_403_for_rights_is_not_a_rate_limit() {
         let mut c = Client::default();
         let h = counters("4800");
-        let e = c.get_at("repos/o/r/actions/runners?per_page=100", NOW, |_| {
+        let e = c.get_at("repos/o/r/actions/runners?per_page=100", true, NOW, |_| {
             failed(
                 answer(
                     "403 Forbidden",
