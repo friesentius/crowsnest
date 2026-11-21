@@ -350,6 +350,7 @@ When one is missing, its source is marked with `!` and the rest keeps working.
 - `src/exec.rs` is the only place crowsnest starts a program, and it can only start the read commands listed above, with fixed arguments.
 - GraphQL mutations and any REST method other than GET are refused before anything runs; the only header crowsnest sends is `If-None-Match` with an ETag GitHub gave it, checked against the ETag format first.
 - quota-axi always gets `--no-credential-refresh`, so a read can never renew a vendor login.
+- quota-axi is asked with `--full`, which carries each window's projected run-out time and, as quota-axi documents, ignores `QUOTA_AXI_MAX_AGE`: every read (every 5 minutes) asks the vendor.
 - The fleet snapshot's optional summary cache is pointed at crowsnest's own cache directory (`$XDG_CACHE_HOME/crowsnest`), never at the firstmate home.
 - Crowsnest takes no firstmate locks, moves no inbox files, and never runs the `steer` or `watch` commands the snapshot lists.
 - `tests/readonly.rs` runs the real binary against a scratch firstmate home with logging shims for every command, and fails if any file under the home changes or any command was not a read.
