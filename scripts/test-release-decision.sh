@@ -55,6 +55,9 @@ check "dependency versions are not the package version" 0.2.0 \
 manifest "not-a-version"
 check "invalid version -> error" error "$(decision "")"
 
+manifest 0.2.0-rc.1
+check "pre-release version -> error" error "$(decision "")"
+
 manifest 0.1.0
 : >"$work/out"
 GITHUB_OUTPUT=$work/out RELEASE_TAGS="" "$script" "$work/Cargo.toml" >/dev/null

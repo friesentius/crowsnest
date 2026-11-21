@@ -26,10 +26,11 @@ read_version() {
   ' "$1"
 }
 
-# Succeeds (prints nothing) when $1 is a plain release version with no "v"
-# prefix, matching how this project names its tags.
+# Succeeds (prints nothing) when $1 is a plain X.Y.Z release version with no
+# "v" prefix and no pre-release suffix, matching how this project names its
+# tags. Pre-releases are refused because they would be published as Latest.
 valid_version() {
-  [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+  [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 # decide VERSION TAGS: prints "true" when no existing tag equals VERSION
@@ -55,7 +56,7 @@ main() {
   local manifest=${1:-Cargo.toml} version should
   version=$(read_version "$manifest")
   if ! valid_version "$version"; then
-    echo "release-decision: invalid or missing version '$version' in $manifest" >&2
+    echo "release-decision: version '$version' in $manifest is not a plain X.Y.Z release version (pre-release suffixes are not released)" >&2
     exit 1
   fi
   should=$(decide "$version" "$(existing_tags)")

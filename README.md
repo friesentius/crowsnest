@@ -77,6 +77,7 @@ curl -fLO "$BASE/crowsnest-$VERSION-$TARGET.tar.gz"
 curl -fLO "$BASE/SHA256SUMS"
 grep " crowsnest-$VERSION-$TARGET.tar.gz\$" SHA256SUMS | shasum -a 256 --check
 tar -xzf "crowsnest-$VERSION-$TARGET.tar.gz"
+mkdir -p ~/.local/bin
 install "crowsnest-$VERSION-$TARGET/crowsnest" ~/.local/bin/
 ```
 
@@ -401,6 +402,7 @@ The fixtures in `tests/fixtures` are real outputs with names, paths and accounts
 ### Releasing
 
 Pushing to `main` releases the version in `Cargo.toml` unless a release with exactly that version already exists (tags have no `v` prefix).
+Only plain `X.Y.Z` versions are released; a pre-release version such as `0.2.0-rc.1` fails the workflow.
 
 1. On `dev`, bump `version` in `Cargo.toml` (and `Cargo.lock`).
 2. Open a `dev` to `main` pull request titled "Release X.Y.Z". Its body becomes the release notes, so write them there.
