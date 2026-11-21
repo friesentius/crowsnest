@@ -2,7 +2,7 @@
 //! reads them, so a different collector can replace the sources without
 //! touching the UI.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -386,7 +386,8 @@ pub struct Service {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JobStep {
     pub number: u32,
     pub name: String,
@@ -398,7 +399,8 @@ pub struct JobStep {
 }
 
 /// What a workflow run is for, from the runs list.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunInfo {
     pub id: u64,
     pub attempt: u32,
@@ -428,7 +430,8 @@ impl RunInfo {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Job {
     pub repo: String,
     pub name: String,

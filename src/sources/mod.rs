@@ -347,8 +347,9 @@ pub fn read_history(
         "repos/{repo}/actions/runs?status=completed&per_page={}",
         history::LIST_RUNS
     ))?;
-    let new: Vec<_> = gh::parse_runs(&out)
-        .map_err(GhError::Failed)?
+    let listed = gh::parse_runs(&out).map_err(GhError::Failed)?;
+    cache.gap_before(&listed);
+    let new: Vec<_> = listed
         .into_iter()
         .filter(|run| !cache.has(run))
         .map(|run| (repo.to_string(), run))

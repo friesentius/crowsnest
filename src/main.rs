@@ -228,13 +228,14 @@ fn config(
             snapshot.display()
         ));
     }
-    let cache_dir = args
+    let cache_root = args
         .cache_dir
         .clone()
         .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(|d| PathBuf::from(d).join("crowsnest")))
         .or_else(|| home().map(|h| h.join(".cache").join("crowsnest")))
-        .ok_or("cannot pick a cache directory: set --cache-dir")?
-        .join("fm-summary-cache");
+        .ok_or("cannot pick a cache directory: set --cache-dir")?;
+    let cache_dir = cache_root.join("fm-summary-cache");
+    let history_dir = cache_root.join("history");
     let fm_home = args.fm_home.canonicalize().unwrap_or(args.fm_home.clone());
     if cache_dir.starts_with(&fm_home) {
         return Err("the cache directory must be outside the firstmate home".into());
@@ -254,6 +255,7 @@ fn config(
     let cfg = Config {
         fm_home,
         cache_dir,
+        history_dir: Some(history_dir),
         runners,
         disk_paths,
         fleet_interval: fleet_interval(settings),

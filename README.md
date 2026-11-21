@@ -325,7 +325,7 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Runner units | `/proc/<pid>/cgroup` of each running `Runner.Listener` (Linux), and the `.service` file `svc.sh install` writes | when folders are listed |
 | Runner services | `systemctl [--user] show --property=LoadState,ActiveState,SubState,NRestarts` for a runner with a known unit | 30 s |
 | Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress&per_page=100` and each run's `.../jobs` (8 at a time); runs beyond 100 of either are counted as `+N runs unread` | with PR checks, which a queued job keeps on their active cadence |
-| Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
+| Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once, and kept in `$XDG_CACHE_HOME/crowsnest/history` so that a restart does not read them again) | 10 min, or when a watched run finishes |
 | Runner registration | `gh api --method GET repos/<owner>/<repo>/actions/runners` (needs admin read) | 5 min |
 | Host | load, memory, swap, disks, and Linux pressure stall information | 2 s |
 | Usage | `quota-axi --no-credential-refresh --json --full` | 5 min |
@@ -354,7 +354,7 @@ When one is missing, its source is marked with `!` and the rest keeps working.
 - The fleet snapshot's optional summary cache is pointed at crowsnest's own cache directory (`$XDG_CACHE_HOME/crowsnest`), never at the firstmate home.
 - Crowsnest takes no firstmate locks, moves no inbox files, and never runs the `steer` or `watch` commands the snapshot lists.
 - `tests/readonly.rs` runs the real binary against a scratch firstmate home with logging shims for every command, and fails if any file under the home changes or any command was not a read.
-- The only file crowsnest writes is its own `config.toml`, and only when you change a setting; a config path inside the firstmate home is refused, and `--once` never writes it.
+- The only files crowsnest writes are its own `config.toml`, and only when you change a setting, and its cache directory: the finished runs it has read (`history/<owner>+<repo>.json`, which can be deleted at any time) and the fleet snapshot's summary cache; a config path inside the firstmate home is refused, and `--once` never writes it.
 - Runner folders and units in `config.toml` that lie inside the firstmate home are refused and reported, and a search by folder name never enters it, so crowsnest never reads there on a config file's say-so.
 
 There is no telemetry, and crowsnest makes no network calls of its own.

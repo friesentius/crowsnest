@@ -8,7 +8,7 @@
 //! | pipelines| 15 s per live no-mistakes task                               |
 //! | fleet    | 60 s                                                         |
 //! | github   | 60 s (`github_seconds`) while a PR, runner or queued job is active, otherwise 5 min; slower when the rate-limit budget would not last to its reset, paused while GitHub refuses for rate limit |
-//! | ↳ history| completed runs every 10 min, or when a watched run finishes; each run's jobs once |
+//! | ↳ history| completed runs every 10 min, or when a watched run finishes; each run's jobs once, kept on disk between starts |
 //! | ↳ runners API | 5 min per repository                                    |
 //! | quota    | 5 min                                                        |
 //!
@@ -43,6 +43,8 @@ pub struct Config {
     pub fm_home: PathBuf,
     /// Crowsnest's own cache directory (never inside the firstmate home).
     pub cache_dir: PathBuf,
+    /// Where the finished runs of each repository are kept between starts.
+    pub history_dir: Option<PathBuf>,
     /// Where to look for runners and their units.
     pub runners: Discovery,
     pub disk_paths: Vec<PathBuf>,
@@ -261,6 +263,9 @@ const SERVICE_EVERY: Duration = Duration::from_secs(30);
 struct GhState {
     /// Runs `gh`, keeping ETags and the rate-limit budget between reads.
     client: Client,
+    /// Where `cache` is kept on disk, so a start does not read every
+    /// finished run's jobs again.
+    history_dir: Option<PathBuf>,
     cache: BTreeMap<String, RepoCache>,
     history_at: BTreeMap<String, Instant>,
     history_error: BTreeMap<String, String>,
@@ -273,6 +278,18 @@ struct GhState {
 }
 
 impl GhState {
+    fn new(history_dir: Option<PathBuf>) -> GhState {
+        GhState {
+            history_dir,
+            ..Default::default()
+        }
+    }
+
+    /// The file `repo`'s finished runs are kept in.
+    fn history_file(&self, repo: &str) -> Option<PathBuf> {
+        sources::history::cache_file(self.history_dir.as_deref()?, repo)
+    }
+
     /// Read what is due for the repositories of `runner_list`, given the
     /// queue just read. Returns the history and runner lists to show.
     fn read(
@@ -297,8 +314,18 @@ impl GhState {
         for repo in &repos {
             let due = |at: Option<&Instant>, every| at.is_none_or(|t| t.elapsed() >= every);
             if finished || due(self.history_at.get(repo), HISTORY_EVERY) {
-                let cache = self.cache.entry(repo.clone()).or_default();
-                match sources::read_history(&mut self.client, repo, cache) {
+                let file = self.history_file(repo);
+                let cache = self
+                    .cache
+                    .entry(repo.clone())
+                    .or_insert_with(|| file.as_deref().map(RepoCache::load).unwrap_or_default());
+                let read = sources::read_history(&mut self.client, repo, cache);
+                // What was read stays read, whatever else failed. A cache
+                // that cannot be written costs only a longer next start.
+                if let Some(file) = &file {
+                    let _ = cache.save(file);
+                }
+                match read {
                     Ok(_) => {
                         self.history_at.insert(repo.clone(), Instant::now());
                         self.history_error.remove(repo);
@@ -726,7 +753,7 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
     // GitHub.
     if cfg.github {
         let (shared, shared2) = (shared.clone(), shared.clone());
-        let mut state = GhState::default();
+        let mut state = GhState::new(cfg.history_dir.clone());
         let mut first = true;
         let changed_gh = changed.clone();
         // Reads the last turn made that counted against the budget.
@@ -972,7 +999,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     note(&mut s, "nm", item_read(errors, total));
     if cfg.github {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
-        let mut state = GhState::default();
+        let mut state = GhState::new(cfg.history_dir.clone());
         state.client.begin_turn();
         let prs = sources::read_pr_checks(&mut state.client, &urls);
         let queue = sources::read_queue(&mut state.client, &s.runners, &mut state.queue);
@@ -1165,6 +1192,76 @@ mod tests {
         idle.fm_state = "no_active_work".into();
         s.fleet = Some(fleet(vec![idle]));
         assert!(!gh_active(&s));
+    }
+
+    /// A stand-in for `gh` serving the recorded finished runs of one
+    /// repository; counts the job lists it is asked for.
+    fn history_gh(jobs_asked: &Arc<AtomicU32>) -> Client {
+        let asked = jobs_asked.clone();
+        let fixture = |name: &str| {
+            std::fs::read_to_string(format!(
+                "{}/tests/fixtures/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        };
+        Client::with_fake(ghapi::Fake(Arc::new(move |cmd| {
+            let crate::exec::ReadCommand::GhApiGet { path, .. } = cmd else {
+                panic!("{cmd:?}");
+            };
+            let body = if path.contains("status=completed") {
+                fixture("gh-runs-completed.json")
+            } else if let Some(id) = path
+                .split("/runs/")
+                .nth(1)
+                .and_then(|r| r.split('/').next())
+            {
+                asked.fetch_add(1, Ordering::SeqCst);
+                fixture(&format!("gh-jobs-{id}.json"))
+            } else {
+                r#"{"total_count":0,"runners":[]}"#.to_string()
+            };
+            Ok(crate::exec::Output {
+                stdout: body,
+                stderr: String::new(),
+                success: true,
+            })
+        })))
+    }
+
+    #[test]
+    fn a_restart_does_not_read_the_finished_runs_jobs_again() {
+        let dir = std::env::temp_dir().join(format!("crowsnest-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let runners = [Runner {
+            repo: Some("acme/pantry".into()),
+            ..Default::default()
+        }];
+        let queue = || Ok(Queue::default());
+        let start = || {
+            let asked = Arc::new(AtomicU32::new(0));
+            let mut state = GhState::new(Some(dir.clone()));
+            state.client = history_gh(&asked);
+            let (history, _) = state.read(&runners, &queue());
+            (history, asked.load(Ordering::SeqCst))
+        };
+        let (first, jobs_read) = start();
+        assert_eq!(jobs_read, 4, "a first start reads each finished run's jobs");
+        // A second start finds them on disk and reads only the listing.
+        let (second, jobs_read) = start();
+        assert_eq!(jobs_read, 0);
+        let (a, b) = (&first["acme/pantry"], &second["acme/pantry"]);
+        assert_eq!(a.jobs.len(), 16);
+        assert_eq!(a.jobs.len(), b.jobs.len());
+        assert_eq!(a.typical, b.typical);
+        assert_eq!(a.covered_since, b.covered_since);
+        // Without a directory nothing is kept: every start reads again.
+        let asked = Arc::new(AtomicU32::new(0));
+        let mut state = GhState::new(None);
+        state.client = history_gh(&asked);
+        state.read(&runners, &queue());
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
