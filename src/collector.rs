@@ -524,8 +524,8 @@ impl RunnerTier {
         }
         self.scan.apply(&mut self.list, now_epoch());
         for r in &mut self.list {
-            runners::read_diag(r);
-            self.tails.read(r);
+            let logs = runners::read_diag(r);
+            self.tails.read(r, &logs);
         }
         self.tails.keep_only(&self.list);
         self.services.update(&mut self.list);
@@ -966,8 +966,8 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
     scan.apply(&mut list, now_epoch());
     let mut tails = runners::LogTails::default();
     for r in &mut list {
-        runners::read_diag(r);
-        tails.read(r);
+        let logs = runners::read_diag(r);
+        tails.read(r, &logs);
     }
     Services::default().update(&mut list);
     let r = runners_read(&list, &list_errors, &scan);
