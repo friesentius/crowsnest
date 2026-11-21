@@ -700,7 +700,8 @@ pub struct GhBudget {
     /// by the budget, and no rate-limit pause is on.
     pub slowed: Option<Slowed>,
     /// Queued or running workflow runs per repository that were not read
-    /// (beyond the page size), from GitHub's `total_count`.
+    /// (those between the newest and the oldest page), from GitHub's
+    /// `total_count`.
     pub runs_unread: BTreeMap<String, u64>,
 }
 

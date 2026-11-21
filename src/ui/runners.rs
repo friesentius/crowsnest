@@ -684,7 +684,8 @@ pub fn panel(view: &View, buf: &mut Buffer, area: Rect, wide: bool) {
     } else {
         vec![span(format!("q{queued}"), t.warn())]
     };
-    // Runs past one page were not read, so the queue is short by their jobs.
+    // Runs between the newest and the oldest page were not read, so the
+    // queue is short by their jobs.
     let unread: u64 = snap.gh_budget.runs_unread.values().sum();
     if unread > 0 {
         right.push(span(
@@ -1102,7 +1103,7 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
                 wrap_words(vec![label(t, "QUEUE")], LABEL, &text, st, w)
             }
         };
-        out.extend(unread_line(view, lane, w));
+        out.extend(unread_lines(view, lane, w));
         return out;
     }
     let mut out = Vec::new();
@@ -1190,29 +1191,33 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             w,
         ));
     }
-    out.extend(unread_line(view, lane, w));
+    out.extend(unread_lines(view, lane, w));
     out
 }
 
-/// Active runs of the lane's repository that were not read: more than one
-/// page of queued or running runs. The queue above is missing their jobs.
-fn unread_line(view: &View, lane: &Lane, w: usize) -> Option<Line<'static>> {
-    let repo = lane.runner.repo.as_ref()?;
-    let n = *view.snap.gh_budget.runs_unread.get(repo)?;
-    let page = crate::sources::RUNS_PAGE;
-    Some(fit(
-        vec![
-            pad(),
-            span(
-                format!(
-                    "+{n} more active run{} not read: only the {page} newest queued and {page} newest running are",
-                    if n == 1 { "" } else { "s" }
-                ),
-                view.theme.warn(),
+/// What the lane's repository left unread: active runs between the newest
+/// and the oldest page. The queue above is missing their jobs.
+fn unread_lines(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
+    let Some(repo) = lane.runner.repo.as_ref() else {
+        return Vec::new();
+    };
+    let budget = &view.snap.gh_budget;
+    let plural = |n: u64| if n == 1 { "" } else { "s" };
+    let mut out = Vec::new();
+    if let Some(&n) = budget.runs_unread.get(repo) {
+        let page = crate::sources::RUNS_PAGE;
+        out.extend(wrap_words(
+            vec![pad()],
+            LABEL,
+            &format!(
+                "+{n} more active run{} not read: of the queued runs and of the running runs, only the {page} newest and the {page} oldest are read",
+                plural(n)
             ),
-        ],
-        w,
-    ))
+            view.theme.warn(),
+            w,
+        ));
+    }
+    out
 }
 
 fn recent_section(view: &View, lane: &Lane, w: usize, rows: usize) -> Vec<Line<'static>> {

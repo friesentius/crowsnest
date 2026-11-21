@@ -2257,9 +2257,20 @@ fn runs_past_one_page_are_disclosed() {
     let detail = draw_light(&s, &app, 180, 44);
     assert!(
         detail.contains(
-            "+3 more active runs not read: only the 100 newest queued and 100 newest running are"
+            "+3 more active runs not read: of the queued runs and of the running runs, only the 100 newest and the 100 oldest are read"
         ),
         "{detail}"
+    );
+    // The sentence is whole at a narrow width too.
+    let narrow = draw_light(&s, &app, 100, 44);
+    let flat = narrow
+        .replace(['\u{2502}', '"'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        flat.contains("only the 100 newest and the 100 oldest are read"),
+        "{narrow}"
     );
 }
 
