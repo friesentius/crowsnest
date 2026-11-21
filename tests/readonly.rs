@@ -80,11 +80,13 @@ struct Call {
     cache: String,
 }
 
+/// The calls logged under `log`, one file per call.
 fn calls(log: &Path) -> Vec<Call> {
-    fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
+    fs::read_dir(log)
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
         .map(|l| {
+            let l = l.strip_suffix('\n').unwrap_or(&l);
             let mut f = l.split('\u{1e}');
             let mut argv = f.next().unwrap().split('\u{1f}').map(str::to_string);
             Call {
@@ -102,6 +104,7 @@ fn once_reads_everything_and_writes_nothing() {
     let root =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("readonly-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
+    let log = root.join("calls");
     let (home, shims, cache, runners) = (
         root.join("fm"),
         root.join("shims"),
@@ -112,12 +115,12 @@ fn once_reads_everything_and_writes_nothing() {
         home.join("bin"),
         home.join("state"),
         shims.clone(),
+        log.clone(),
         runners.join("actions-runner-pantry"),
         runners.join("actions-runner-bookshop"),
     ] {
         fs::create_dir_all(d).unwrap();
     }
-    let log = root.join("calls.log");
     // The worktrees named in the fixture, relocated under the scratch root.
     let worktrees = root.join("worktrees");
     for wt in [
@@ -143,7 +146,9 @@ fn once_reads_everything_and_writes_nothing() {
     )
     .unwrap();
 
-    let logger = r#"{ printf '%s' "$(basename "$0")"; for a in "$@"; do printf '\037%s' "$a"; done; printf '\036%s\036%s\n' "$PWD" "$FM_SNAPSHOT_CACHE_DIR"; } >> "$CN_LOG"
+    // Each call logs to its own file: gh reads run in parallel, and writes
+    // from concurrent shims to one shared file would interleave.
+    let logger = r#"{ printf '%s' "$(basename "$0")"; for a in "$@"; do printf '\037%s' "$a"; done; printf '\036%s\036%s\n' "$PWD" "$FM_SNAPSHOT_CACHE_DIR"; } > "$(mktemp "$CN_LOG/call.XXXXXX")"
 "#;
     write_exec(
         &home.join("bin/fm-fleet-snapshot.sh"),
