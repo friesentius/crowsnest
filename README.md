@@ -323,7 +323,7 @@ Crowsnest reads documented, stable interfaces only, and never firstmate's intern
 | Runners | `.runner` files in runner folders; a local process scan for `Runner.Listener`, `Runner.Worker` and the CPU time of the processes under the worker (not the worker itself); the modification times of the newest `_diag` logs and step output pages, and the last 64 KiB of the newest worker and runner logs when they changed | 5 s (folders re-listed every 60 s, and when a listener starts or stops) |
 | Runner units | `/proc/<pid>/cgroup` of each running `Runner.Listener` (Linux), and the `.service` file `svc.sh install` writes | when folders are listed |
 | Runner services | `systemctl [--user] show --property=LoadState,ActiveState,SubState,NRestarts` for a runner with a known unit | 30 s |
-| Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress&per_page=100` and each run's `.../jobs`; runs beyond 100 of either are counted as `+N runs unread` | with PR checks, and every 60 s while a job is queued |
+| Runner queue | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=queued\|in_progress&per_page=100` and each run's `.../jobs` (8 at a time); runs beyond 100 of either are counted as `+N runs unread` | with PR checks, and every 60 s while a job is queued |
 | Runner history | `gh api --method GET repos/<owner>/<repo>/actions/runs?status=completed&per_page=10`, and the jobs of each run not read before (a finished run never changes, so it is read once) | 10 min, or when a watched run finishes |
 | Runner registration | `gh api --method GET repos/<owner>/<repo>/actions/runners` (needs admin read) | 5 min |
 | Host | load, memory, swap, disks, and Linux pressure stall information | 2 s |

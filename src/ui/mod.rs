@@ -1421,14 +1421,12 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         let Some(f) = view.snap.fresh.get(tier) else {
             continue;
         };
-        if tier == "gh"
+        if f.error.is_some() {
+            right.push(span(format!("{tier} ! "), t.warn()));
+        } else if tier == "gh"
             && let Some(chip) = gh_budget_chip(view)
         {
             right.push(span(chip, t.warn()));
-            continue;
-        }
-        if f.error.is_some() {
-            right.push(span(format!("{tier} ! "), t.warn()));
         } else if let Some(a) = age_of(view.snap, tier)
             && !matches!(tier, "host" | "runners")
         {

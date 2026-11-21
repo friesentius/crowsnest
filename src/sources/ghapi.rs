@@ -152,6 +152,31 @@ pub struct Client {
 /// runs come and go; the path asked for longest ago is dropped past this.
 const MAX_ETAGS: usize = 400;
 
+/// How many `gh` reads [`Client::get_many`] runs at once.
+pub const PARALLEL: usize = 8;
+
+/// `f` of every item, at most [`PARALLEL`] at a time, in the items' order.
+fn bounded<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<R>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..PARALLEL.min(items.len()) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    *slots[i].lock().unwrap() = Some(f(item));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().expect("every item is run"))
+        .collect()
+}
+
 impl Client {
     /// Reads made against the REST budget since the last call, reset to 0.
     pub fn take_calls(&mut self) -> u32 {
@@ -205,23 +230,69 @@ impl Client {
         self.get_at(path, false, now_epoch(), |cmd| cmd.run())
     }
 
+    /// `gh api --method GET` for each `(path, keep)` of `reads`, at most
+    /// [`PARALLEL`] at a time, answered in the order asked.
+    pub fn get_many(&mut self, reads: &[(String, bool)]) -> Vec<Result<String, GhError>> {
+        self.get_many_at(reads, now_epoch(), |cmd| cmd.run())
+    }
+
+    fn get_many_at<F>(
+        &mut self,
+        reads: &[(String, bool)],
+        now: i64,
+        run: F,
+    ) -> Vec<Result<String, GhError>>
+    where
+        F: Fn(&ReadCommand) -> Result<crate::exec::Output, ExecError> + Sync,
+    {
+        let cmds: Vec<_> = reads.iter().map(|(p, _)| self.request(p, now)).collect();
+        let asked: Vec<&ReadCommand> = cmds.iter().filter_map(|c| c.as_ref().ok()).collect();
+        let mut outs = bounded(&asked, |cmd| run(cmd)).into_iter();
+        reads
+            .iter()
+            .zip(cmds)
+            .map(|((path, keep), cmd)| {
+                cmd?;
+                let out = outs.next().expect("one answer per command run");
+                self.answer(path, *keep, now, out)
+            })
+            .collect()
+    }
+
     fn get_at<F>(&mut self, path: &str, keep: bool, now: i64, run: F) -> Result<String, GhError>
     where
         F: FnOnce(&ReadCommand) -> Result<crate::exec::Output, ExecError>,
     {
+        let cmd = self.request(path, now)?;
+        let out = run(&cmd);
+        self.answer(path, keep, now, out)
+    }
+
+    /// The command for one GET, asked with the last answer's ETag.
+    fn request(&mut self, path: &str, now: i64) -> Result<ReadCommand, GhError> {
         if let Some(until) = self.paused(false, now) {
             return Err(GhError::Paused { until });
         }
         self.asked += 1;
         let asked = self.asked;
-        let cmd = ReadCommand::GhApiGet {
+        Ok(ReadCommand::GhApiGet {
             path: path.to_string(),
             etag: self.etags.get_mut(path).map(|(at, e, _)| {
                 *at = asked;
                 e.clone()
             }),
-        };
-        let (out, failure) = match run(&cmd) {
+        })
+    }
+
+    /// Take in the answer to the GET of `path`.
+    fn answer(
+        &mut self,
+        path: &str,
+        keep: bool,
+        now: i64,
+        out: Result<crate::exec::Output, ExecError>,
+    ) -> Result<String, GhError> {
+        let (out, failure) = match out {
             Ok(o) => (o.stdout, None),
             Err(ExecError::Failed { stdout, .. }) if stdout.starts_with("HTTP/") => {
                 (stdout, Some(()))
@@ -256,8 +327,10 @@ impl Client {
                         self.etags.remove(&k);
                     }
                 }
-                self.etags
-                    .insert(path.to_string(), (asked, etag.to_string(), r.body.clone()));
+                self.etags.insert(
+                    path.to_string(),
+                    (self.asked, etag.to_string(), r.body.clone()),
+                );
             }
             _ => {
                 self.etags.remove(path);
@@ -461,6 +534,48 @@ mod tests {
         assert_eq!(c.etags.len(), MAX_ETAGS);
         assert!(c.etags.contains_key("repos/o/r/actions/runs/0/jobs"));
         assert!(!c.etags.contains_key("repos/o/r/actions/runs/1/jobs"));
+    }
+
+    #[test]
+    fn many_reads_run_in_parallel_at_most_eight_at_a_time_in_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Instant;
+        let mut c = Client::default();
+        let reads: Vec<(String, bool)> = (0..20)
+            .map(|i| (format!("repos/o/r/actions/runs/{i}/jobs"), true))
+            .collect();
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let h = counters("4000");
+        let answers = c.get_many_at(&reads, NOW, |cmd| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            most.fetch_max(now, Ordering::SeqCst);
+            // Hold each read until eight have been seen at once (or give up),
+            // so a ninth would be counted if one ever started.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while most.load(Ordering::SeqCst) < 8 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            running.fetch_sub(1, Ordering::SeqCst);
+            let ReadCommand::GhApiGet { path, .. } = cmd else {
+                panic!()
+            };
+            ok(answer("200 OK", &with(&[("Etag", "\"a\"")], &h), path))
+        });
+        assert_eq!(most.load(Ordering::SeqCst), 8);
+        let bodies: Vec<String> = answers.into_iter().map(Result::unwrap).collect();
+        let paths: Vec<String> = reads.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(bodies, paths, "answers come back in the order asked");
+        assert_eq!(c.take_calls(), 20);
+        assert_eq!(c.etags.len(), 20);
+        // While paused nothing is run.
+        c.budget.core.paused_until = Some(NOW + 60);
+        let paused = c.get_many_at(&reads, NOW, |_| panic!("asked GitHub while paused"));
+        assert!(
+            paused
+                .iter()
+                .all(|r| *r == Err(GhError::Paused { until: NOW + 60 }))
+        );
     }
 
     #[test]

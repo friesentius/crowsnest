@@ -103,26 +103,34 @@ pub fn runner_repos(runners: &[Runner]) -> Vec<String> {
     repos
 }
 
-/// The jobs of a run, each carrying the run it belongs to. An unchanged
-/// list is GitHub's 304, which costs nothing.
-fn read_run_jobs(
+/// The jobs of `runs` of their repositories, each carrying the run it
+/// belongs to, read in parallel. An unchanged list is GitHub's 304, which
+/// costs nothing; a finished run's jobs never change and keep no ETag.
+fn read_runs_jobs(
     gh: &mut Client,
-    repo: &str,
-    run: &crate::model::RunInfo,
+    runs: &[(String, crate::model::RunInfo)],
     finished: bool,
-) -> Result<Vec<Job>, GhError> {
-    let path = format!("repos/{repo}/actions/runs/{}/jobs?per_page=50", run.id);
-    // A finished run's jobs never change and are read once: no ETag.
-    let out = if finished {
-        gh.get_once(&path)?
-    } else {
-        gh.get(&path)?
-    };
-    let mut jobs = gh::parse_jobs(repo, &out).map_err(GhError::Failed)?;
-    for j in &mut jobs {
-        j.run = Some(run.clone());
-    }
-    Ok(jobs)
+) -> Vec<Result<Vec<Job>, GhError>> {
+    let reads: Vec<(String, bool)> = runs
+        .iter()
+        .map(|(repo, run)| {
+            (
+                format!("repos/{repo}/actions/runs/{}/jobs?per_page=50", run.id),
+                !finished,
+            )
+        })
+        .collect();
+    gh.get_many(&reads)
+        .into_iter()
+        .zip(runs)
+        .map(|(out, (repo, run))| {
+            let mut jobs = gh::parse_jobs(repo, &out?).map_err(GhError::Failed)?;
+            for j in &mut jobs {
+                j.run = Some(run.clone());
+            }
+            Ok(jobs)
+        })
+        .collect()
 }
 
 /// How many queued, and how many running, workflow runs of a repository
@@ -142,6 +150,7 @@ pub struct Queue {
 /// that has a local runner: queued, running, and already finished ones.
 pub fn read_queue(gh: &mut Client, runners: &[Runner]) -> Result<Queue, GhError> {
     let mut q = Queue::default();
+    let mut active = Vec::new();
     for repo in runner_repos(runners) {
         let mut runs = Vec::new();
         let mut unread = 0;
@@ -157,12 +166,13 @@ pub fn read_queue(gh: &mut Client, runners: &[Runner]) -> Result<Queue, GhError>
         }
         runs.sort_by_key(|r| r.id);
         runs.dedup_by_key(|r| r.id);
-        for run in &runs {
-            q.jobs.extend(read_run_jobs(gh, &repo, run, false)?);
-        }
         if unread > 0 {
-            q.unread.insert(repo, unread);
+            q.unread.insert(repo.clone(), unread);
         }
+        active.extend(runs.into_iter().map(|run| (repo.clone(), run)));
+    }
+    for jobs in read_runs_jobs(gh, &active, false) {
+        q.jobs.extend(jobs?);
     }
     Ok(q)
 }
@@ -178,13 +188,15 @@ pub fn read_history(
         "repos/{repo}/actions/runs?status=completed&per_page={}",
         history::LIST_RUNS
     ))?;
+    let new: Vec<_> = gh::parse_runs(&out)
+        .map_err(GhError::Failed)?
+        .into_iter()
+        .filter(|run| !cache.has(run))
+        .map(|run| (repo.to_string(), run))
+        .collect();
     let mut added = 0;
-    for run in gh::parse_runs(&out).map_err(GhError::Failed)? {
-        if cache.has(&run) {
-            continue;
-        }
-        let jobs = read_run_jobs(gh, repo, &run, true)?;
-        cache.insert(run, jobs);
+    for ((_, run), jobs) in new.iter().zip(read_runs_jobs(gh, &new, true)) {
+        cache.insert(run.clone(), jobs?);
         added += 1;
     }
     Ok(added)

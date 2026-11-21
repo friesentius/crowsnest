@@ -2134,6 +2134,27 @@ fn a_low_budget_is_shown_in_the_footer() {
 }
 
 #[test]
+fn a_failed_gh_read_is_not_hidden_by_the_budget_chip() {
+    utc();
+    let mut s = fleet_of_runners();
+    s.gh_budget.core = crowsnest::model::RateLimit {
+        limit: 5000,
+        remaining: 380,
+        reset_at: s.now + 900,
+        ..Default::default()
+    };
+    s.fresh.get_mut("gh").unwrap().error = Some("gh: HTTP 401: Bad credentials".into());
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(text.contains("gh !"), "{text}");
+    assert!(!text.contains("% left"), "{text}");
+    let mut s = rate_limited();
+    s.fresh.get_mut("gh").unwrap().error = Some("gh: HTTP 502".into());
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(text.contains("gh !"), "{text}");
+    assert!(!text.contains("gh limit"), "{text}");
+}
+
+#[test]
 fn runs_past_one_page_are_disclosed() {
     utc();
     let mut s = snapshot();
