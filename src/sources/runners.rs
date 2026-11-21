@@ -518,8 +518,26 @@ pub fn parse_worker_tail(text: &str) -> LogTail {
 /// nothing.
 fn console(msg: &str, kind: &str) -> Option<String> {
     let m = msg.strip_prefix(kind)?;
-    let m = m.split_once("Z:").map_or(m, |(_, m)| m).trim();
+    // Only the listener's own time stamp is dropped: a "Z:" further in is
+    // part of the message.
+    let m = match m.split_once("Z:") {
+        Some((stamp, rest)) if is_stamp(stamp) => rest,
+        _ => m,
+    }
+    .trim();
     (!m.is_empty()).then(|| m.to_string())
+}
+
+/// Whether `s` is a time stamp as the listener writes it before its message,
+/// `2026-11-20 18:28:06` (the `Z:` that follows is cut off by the caller).
+fn is_stamp(s: &str) -> bool {
+    s.len() == 19
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b' ',
+            13 | 16 => b == b':',
+            _ => b.is_ascii_digit(),
+        })
 }
 
 /// A console error without the listener's own framing, which only repeats
@@ -568,7 +586,6 @@ fn note_failure(t: &mut LogTail, at: i64) {
     if t.failure_at
         .is_some_and(|f| at - f > crate::model::FAILURE_LIVE_SECS)
     {
-        t.errors = 0;
         t.error_since = None;
         t.error = None;
         t.failure_since = None;
@@ -589,14 +606,12 @@ pub fn fold_runner(t: &mut LogTail, text: &str) {
                     continue;
                 }
                 t.state = Some((at, m));
-                t.errors = 0;
                 t.error_since = None;
                 t.error = None;
                 t.failure_since = None;
                 t.failure_at = None;
             } else if let Some(m) = console(msg, "WRITE ERROR: ") {
                 note_failure(t, at);
-                t.errors += 1;
                 t.error_since.get_or_insert(at);
                 t.error = Some((at, console_error_text(&m)));
             }
@@ -1490,7 +1505,6 @@ mod tests {
         // the second console error, 20 minutes after the first one's
         // failing lines, is a new outage. A routine back-off is not an
         // error.
-        assert_eq!(t.errors, 1);
         assert_eq!(t.error_since, Some(at("2026-11-19T13:46:12Z")));
         assert_eq!(
             t.error,
@@ -1504,16 +1518,36 @@ mod tests {
             "{text}[2026-11-19 13:50:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:50:00Z: Runner reconnected.\n"
         ));
         assert_eq!(back.state.as_ref().unwrap().1, "Runner reconnected.");
-        assert_eq!(
-            (back.errors, back.error_since, back.error.clone()),
-            (0, None, None)
-        );
+        assert_eq!((back.error_since, back.error.clone()), (None, None));
         assert_eq!(back.trouble(at("2026-11-19T13:50:01Z")), None);
         // Blank console lines between errors change nothing.
         let blank = parse_runner_tail(&format!(
             "{text}[2026-11-19 13:47:00Z INFO Terminal] WRITE LINE: 2026-11-19 13:47:00Z: \n"
         ));
-        assert_eq!(blank.errors, 1);
+        assert_eq!(blank.error_since, t.error_since);
+        assert_eq!(blank.error, t.error);
+    }
+
+    #[test]
+    fn only_the_listeners_time_stamp_is_cut_from_a_console_line() {
+        let line = |m: &str| console(m, "WRITE LINE: ");
+        assert_eq!(
+            line("WRITE LINE: 2026-11-20 18:28:06Z: Running job: Lint").as_deref(),
+            Some("Running job: Lint")
+        );
+        // A "Z:" in the message is the message, with or without a stamp.
+        assert_eq!(
+            line("WRITE LINE: 2026-11-20 18:28:06Z: Copy to Z: drive done").as_deref(),
+            Some("Copy to Z: drive done")
+        );
+        assert_eq!(
+            line("WRITE LINE: Waiting for Z: to mount").as_deref(),
+            Some("Waiting for Z: to mount")
+        );
+        // Blank and unrelated lines say nothing.
+        assert_eq!(line("WRITE LINE: 2026-11-20 18:28:06Z: "), None);
+        assert_eq!(line("WRITE LINE: "), None);
+        assert_eq!(line("WRITE ERROR: oops"), None);
     }
 
     #[test]
@@ -1740,7 +1774,7 @@ mod tests {
         let now = at("2026-10-29T09:15:03Z");
         // One failed attempt is routine, and the old error is not shown.
         assert_eq!(t.trouble(now), None);
-        assert_eq!((t.error_since, t.errors), (None, 0));
+        assert_eq!(t.error_since, None);
         assert_eq!(t.failure_since, Some(now - 1));
         // A second failed attempt half a minute later is still routine: the
         // third may work.
@@ -1866,7 +1900,6 @@ mod tests {
 [2026-10-03 21:10:26Z ERR  Terminal] WRITE ERROR: A session for this runner already exists.
 ";
         let t = parse_runner_tail(log);
-        assert_eq!(t.errors, 3);
         assert_eq!(t.error_since, Some(at("2026-10-03T21:09:55Z")));
         assert_eq!(
             t.error.as_ref().unwrap().1,

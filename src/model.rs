@@ -669,8 +669,6 @@ pub struct RateLimit {
     pub read_at: Option<i64>,
     /// GitHub refused for rate limit: nothing is asked until then.
     pub paused_until: Option<i64>,
-    /// When that pause began, so the screen can say how old its data is.
-    pub paused_at: Option<i64>,
 }
 
 impl RateLimit {
@@ -721,9 +719,8 @@ pub struct LogTail {
     /// for Jobs`, `Running job: ...`, `Job ... completed with result: ...`).
     pub state: Option<(i64, String)>,
     /// Runner log: the console errors written since that line (`Runner
-    /// connect error: ...`): how many, the first one's time, and the last
-    /// (its message without the listener's own framing).
-    pub errors: usize,
+    /// connect error: ...`): the first one's time, and the last (its
+    /// message without the listener's own framing).
     pub error_since: Option<i64>,
     pub error: Option<(i64, String)>,
     /// Runner log: lines that show the listener failing to reach GitHub

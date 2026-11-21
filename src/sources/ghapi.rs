@@ -272,9 +272,6 @@ impl Client {
         } else {
             &mut self.budget.core
         };
-        if slot.paused_until.is_none_or(|u| u <= now) {
-            slot.paused_at = Some(now);
-        }
         slot.paused_until = Some(until);
         Some(until)
     }
@@ -924,7 +921,6 @@ mod tests {
         });
         assert_eq!(e, Err(GhError::Paused { until: NOW + 1200 }));
         assert_eq!(c.budget.core.paused_until, Some(NOW + 1200));
-        assert_eq!(c.budget.core.paused_at, Some(NOW));
         // Nothing is asked while paused.
         let e = c.get_at(
             "repos/o/r/actions/runs?status=queued",

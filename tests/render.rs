@@ -2098,7 +2098,6 @@ fn rate_limited() -> Snapshot {
         reset_at: now + 21 * 60,
         read_at: Some(now - 4 * 60),
         paused_until: Some(now + 21 * 60),
-        paused_at: Some(now - 4 * 60),
     };
     s.jobs_read_at = Some(now - 4 * 60 - 25);
     s
@@ -2309,7 +2308,6 @@ fn with_log_tails() -> Snapshot {
             "millwork-runner" => {
                 r.runner_tail = Some(LogTail {
                     state: Some((now - 2 * 3600, "Listening for Jobs".into())),
-                    errors: 6,
                     error_since: Some(now - 61 * 60),
                     error: Some((now - 41 * 60, "Error: Conflict.".into())),
                     failure_since: Some(now - 61 * 60),
@@ -2418,7 +2416,6 @@ fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
         if r.name == "millwork-runner" {
             let t = r.runner_tail.as_mut().unwrap();
             t.state = None;
-            t.errors = 0;
             t.error = None;
             t.error_since = None;
             t.failure_since = Some(now - 4 * 60);
