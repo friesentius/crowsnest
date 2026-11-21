@@ -195,11 +195,19 @@ pub fn read_history(
         .map(|run| (repo.to_string(), run))
         .collect();
     let mut added = 0;
+    let mut failure = None;
     for ((_, run), jobs) in new.iter().zip(read_runs_jobs(gh, &new, true)) {
-        cache.insert(run.clone(), jobs?);
-        added += 1;
+        match jobs {
+            Ok(jobs) => {
+                cache.insert(run.clone(), jobs);
+                added += 1;
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
+        }
     }
-    Ok(added)
+    failure.map_or(Ok(added), Err)
 }
 
 /// GitHub's runner list for `repo`. Reading it needs repository admin

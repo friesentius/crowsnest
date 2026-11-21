@@ -245,16 +245,38 @@ impl Client {
     where
         F: Fn(&ReadCommand) -> Result<crate::exec::Output, ExecError> + Sync,
     {
+        use std::sync::atomic::{AtomicI64, Ordering};
         let cmds: Vec<_> = reads.iter().map(|(p, _)| self.request(p, now)).collect();
         let asked: Vec<&ReadCommand> = cmds.iter().filter_map(|c| c.as_ref().ok()).collect();
-        let mut outs = bounded(&asked, |cmd| run(cmd)).into_iter();
+        let refused_until = AtomicI64::new(0);
+        let outs = bounded(&asked, |cmd| {
+            if refused_until.load(Ordering::SeqCst) != 0 {
+                return None;
+            }
+            let out = run(cmd);
+            let stdout = match &out {
+                Ok(o) => Some(&o.stdout),
+                Err(ExecError::Failed { stdout, .. }) => Some(stdout),
+                Err(_) => None,
+            };
+            if let Some(until) = stdout.and_then(|o| parse_response(o).limited_until(now)) {
+                refused_until.store(until, Ordering::SeqCst);
+            }
+            Some(out)
+        });
+        let refused_until = refused_until.into_inner();
+        let mut outs = outs.into_iter();
         reads
             .iter()
             .zip(cmds)
             .map(|((path, keep), cmd)| {
                 cmd?;
-                let out = outs.next().expect("one answer per command run");
-                self.answer(path, *keep, now, out)
+                match outs.next().expect("one answer per command run") {
+                    Some(out) => self.answer(path, *keep, now, out),
+                    None => Err(GhError::Paused {
+                        until: self.paused(false, now).unwrap_or(refused_until),
+                    }),
+                }
             })
             .collect()
     }
@@ -576,6 +598,53 @@ mod tests {
                 .iter()
                 .all(|r| *r == Err(GhError::Paused { until: NOW + 60 }))
         );
+    }
+
+    #[test]
+    fn a_rate_limit_refusal_in_a_batch_stops_the_reads_not_yet_sent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut c = Client::default();
+        let reads: Vec<(String, bool)> = (0..40)
+            .map(|i| (format!("repos/o/r/actions/runs/{i}/jobs"), true))
+            .collect();
+        let sent = AtomicUsize::new(0);
+        let refused = std::sync::atomic::AtomicBool::new(false);
+        let (fine, spent) = (counters("1"), counters("0"));
+        let answers = c.get_many_at(&reads, NOW, |cmd| {
+            let n = sent.fetch_add(1, Ordering::SeqCst);
+            let ReadCommand::GhApiGet { path, .. } = cmd else {
+                panic!()
+            };
+            if path == "repos/o/r/actions/runs/0/jobs" {
+                refused.store(true, Ordering::SeqCst);
+                return failed(
+                    answer(
+                        "403 Forbidden",
+                        &with(&[], &spent),
+                        "{\"message\":\"API rate limit exceeded for user ID 1.\"}",
+                    ),
+                    "gh: API rate limit exceeded (HTTP 403)",
+                );
+            }
+            // The other reads already in flight finish after the refusal.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !refused.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20 + n as u64));
+            ok(answer("200 OK", &with(&[], &fine), "{}"))
+        });
+        let sent = sent.load(Ordering::SeqCst);
+        assert!(sent <= PARALLEL, "{sent} reads sent after a refusal");
+        assert_eq!(answers[0], Err(GhError::Paused { until: NOW + 1200 }));
+        let unsent = &answers[PARALLEL..];
+        assert!(
+            unsent
+                .iter()
+                .all(|r| *r == Err(GhError::Paused { until: NOW + 1200 })),
+            "{unsent:?}"
+        );
+        assert_eq!(c.budget.core.paused_until, Some(NOW + 1200));
     }
 
     #[test]
