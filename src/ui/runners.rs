@@ -1463,14 +1463,18 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         }
         // The line says when it was written; the file's age is another
         // thing, so the two are never joined into one "ago".
-        (Some(a), Some(Console::State(since, text))) => {
+        (Some(a), Some(Console::State(when, text))) => {
+            let lasting =
+                text.starts_with("Listening for Jobs") || text.starts_with("Running job:");
+            let word = if lasting { "since" } else { "at" };
+            let text = text.strip_suffix('.').unwrap_or(text);
             out.push(fit(l, w));
             out.extend(wrap_words(
                 vec![pad()],
                 LABEL,
                 &format!(
-                    "{text} since {} \u{b7} log {} ago",
-                    at(since, now),
+                    "{text} {word} {} \u{b7} log {} ago",
+                    at(when, now),
                     log_age(a)
                 ),
                 t.dim(),

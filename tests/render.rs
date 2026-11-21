@@ -2367,6 +2367,37 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
 }
 
 #[test]
+fn a_console_event_line_is_stamped_at_its_time_not_since() {
+    utc();
+    let mut s = with_log_tails();
+    let now = s.now;
+    for (line, shown) in [
+        (
+            "Job Unit completed with result: Succeeded",
+            "Job Unit completed with result: Succeeded at 12:27 \u{b7} log 41m ago",
+        ),
+        (
+            "Runner reconnected.",
+            "Runner reconnected at 12:27 \u{b7} log 41m ago",
+        ),
+    ] {
+        for r in &mut s.runners {
+            if r.name == "millwork-runner" {
+                let t = r.runner_tail.as_mut().unwrap();
+                t.state = Some((now - 2 * 3600, line.into()));
+                t.failure_at = Some(now - 6 * 60);
+            }
+        }
+        let mut app = app_for(&s);
+        open_runner(&s, &mut app, "millwork-runner");
+        let text = draw_light(&s, &app, 100, 40);
+        assert!(text.contains(shown), "{text}");
+        assert!(!text.contains(" since 12:27"), "{text}");
+        assert!(!text.contains("reconnected. "), "{text}");
+    }
+}
+
+#[test]
 fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
     utc();
     let mut s = with_log_tails();
