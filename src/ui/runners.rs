@@ -1401,41 +1401,65 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
             t.dim(),
         )),
     }
+    // What the listener's console says: trouble, which is judged now, or the
+    // last line it wrote, which can be much older than the log file.
+    enum Console<'a> {
+        Trouble(String),
+        State(i64, &'a str),
+    }
     let console = r.runner_tail.as_ref().and_then(|rt| {
         rt.trouble(now)
             .map(|trouble| {
-                let text = match trouble {
+                Console::Trouble(match trouble {
                     Trouble::ConsoleError { msg, .. } => {
                         format!("{}: {msg}", trouble_head(trouble, now))
                     }
                     Trouble::Retrying { .. } => trouble_head(trouble, now),
-                };
-                (text, t.warn())
+                })
             })
-            .or_else(|| rt.state.as_ref().map(|(_, s)| (s.clone(), t.dim())))
+            .or_else(|| {
+                rt.state
+                    .as_ref()
+                    .map(|(at, s)| Console::State(*at, s.as_str()))
+            })
     });
+    let log_age = |a: i64| dur((now - a).max(0));
     match (r.runner_log_at, console) {
         // What the listener last wrote to its console, on a line of its own.
-        (Some(a), Some((text, st))) => {
+        (Some(a), Some(Console::Trouble(text))) => {
             out.push(fit(l, w));
             // A long message wraps under the label, as the verdict does.
             out.extend(wrap_words(
                 vec![
                     pad(),
-                    span(
-                        format!("runner log {} ago: ", dur((now - a).max(0))),
-                        t.dim(),
-                    ),
+                    span(format!("runner log {} ago: ", log_age(a)), t.dim()),
                 ],
                 LABEL,
                 &text,
-                st,
+                t.warn(),
+                w,
+            ));
+            return out;
+        }
+        // The line says when it was written; the file's age is another
+        // thing, so the two are never joined into one "ago".
+        (Some(a), Some(Console::State(since, text))) => {
+            out.push(fit(l, w));
+            out.extend(wrap_words(
+                vec![pad()],
+                LABEL,
+                &format!(
+                    "{text} since {} \u{b7} log {} ago",
+                    at(since, now),
+                    log_age(a)
+                ),
+                t.dim(),
                 w,
             ));
             return out;
         }
         (Some(a), None) => l.push(span(
-            format!(" \u{b7} runner log {} ago", dur((now - a).max(0))),
+            format!(" \u{b7} runner log {} ago", log_age(a)),
             t.dim(),
         )),
         (None, _) => {}

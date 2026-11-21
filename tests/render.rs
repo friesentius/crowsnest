@@ -2337,7 +2337,7 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
         "{text}"
     );
     assert!(
-        text.contains("runner log 32s ago: Running job: Unit + e2e tests"),
+        text.contains("Running job: Unit + e2e tests since 14:18 \u{b7} log 32s ago"),
         "{text}"
     );
     let mut app = app_for(&s);
@@ -2403,10 +2403,13 @@ fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
     let mut app = app_for(&s);
     open_runner(&s, &mut app, "millwork-runner");
     let text = draw_light(&s, &app, 100, 40);
+    // The listener's last line is hours old: its own time is given, and the
+    // log file's age is a separate thing.
     assert!(
-        text.contains("runner log 41m ago: Listening for Jobs"),
+        text.contains("Listening for Jobs since 12:27 \u{b7} log 41m ago"),
         "{text}"
     );
+    assert!(!text.contains("log 41m ago: Listening"), "{text}");
     assert!(!text.contains("console error"), "{text}");
     assert!(!draw_light(&s, &app_for(&s), 180, 50).contains("console error"));
     assert!(!draw_light(&s, &app_for(&s), 100, 34).contains("log: console error"));
