@@ -1528,15 +1528,10 @@ mod tests {
         fn shown<'a>(t: &'a LogTail, hms: &str) -> Option<Trouble<'a>> {
             t.trouble(at(&format!("2026-10-29T{hms}Z")))
         }
-        // Before the error: no console error yet, but two failed attempts.
+        // Before the error: two failed attempts, 26 s apart, are routine.
         let before = parse_runner_tail(&until(&log, "06:22:30"));
         assert_eq!(before.error, None);
-        assert_eq!(
-            shown(&before, "06:22:30"),
-            Some(Trouble::Retrying {
-                since: at("2026-10-29T06:22:00Z")
-            })
-        );
+        assert_eq!(shown(&before, "06:22:30"), None);
         // In the outage: the error, with the listener's reason.
         let during = parse_runner_tail(&until(&log, "06:24:00"));
         let Some(Trouble::ConsoleError { since: s, msg }) = shown(&during, "06:24:00") else {
@@ -1670,14 +1665,70 @@ mod tests {
         assert_eq!(t.trouble(now), None);
         assert_eq!((t.error_since, t.errors), (None, 0));
         assert_eq!((t.failures, t.failure_since), (1, Some(now - 1)));
-        // A second one, soon after, is the listener failing again.
+        // A second failed attempt half a minute later is still routine: the
+        // third may work.
         let more = format!(
             "{log}[2026-10-29 09:15:30Z INFO BrokerMessageListener] Sleeping for 26.1 seconds before retrying.\n"
         );
+        assert_eq!(parse_runner_tail(&more).trouble(now + 30), None);
+        // Failing on for minutes is the listener retrying.
+        let long = format!(
+            "{more}[2026-10-29 09:17:30Z INFO BrokerMessageListener] Sleeping for 26.1 seconds before retrying.\n"
+        );
         assert_eq!(
-            parse_runner_tail(&more).trouble(now + 30),
+            parse_runner_tail(&long).trouble(now + 150),
             Some(Trouble::Retrying { since: now - 1 })
         );
+    }
+
+    #[test]
+    fn a_routine_request_timeout_is_not_trouble() {
+        // REPLAY of a real routine event (potful, 2026-11-03): a long poll
+        // timed out after 100 s. The listener writes 7 failure lines for it
+        // in one second (an ERR line per exception, and the back-off), then
+        // carries on. Counting lines would call that trouble; the time the
+        // failing spans does not.
+        let block = include_str!("../../tests/fixtures/runner/runner-routine-timeout.log");
+        let t = parse_runner_tail(block);
+        assert!(t.failures >= 7, "{}", t.failures);
+        let at = t.failure_at.unwrap();
+        assert_eq!(t.failure_since, Some(at));
+        assert_eq!(t.trouble(at + 1), None);
+        // The same block twice, 100 s apart (two timeouts in a row), is
+        // still routine; a third, 200 s in, is not.
+        let two = format!("{block}{}", shifted_to(block, "2026-11-03", 100));
+        assert_eq!(parse_runner_tail(&two).trouble(at + 101), None);
+        let three = format!("{two}{}", shifted_to(block, "2026-11-03", 200));
+        assert!(matches!(
+            parse_runner_tail(&three).trouble(at + 201),
+            Some(Trouble::Retrying { .. })
+        ));
+    }
+
+    /// `text` with every `day` line `secs` later.
+    fn shifted_to(text: &str, day: &str, secs: i64) -> String {
+        let head = format!("[{day} ");
+        let mut out = String::new();
+        for line in text.lines() {
+            match line.strip_prefix(&head) {
+                Some(rest) if rest.is_char_boundary(8) => {
+                    let (hms, tail) = rest.split_at(8);
+                    let p: Vec<i64> = hms.split(':').map(|n| n.parse().unwrap()).collect();
+                    let s = p[0] * 3600 + p[1] * 60 + p[2] + secs;
+                    out.push_str(&format!(
+                        "{head}{:02}:{:02}:{:02}{tail}\n",
+                        s / 3600,
+                        s / 60 % 60,
+                        s % 60
+                    ));
+                }
+                _ => {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 
     #[test]

@@ -722,9 +722,11 @@ pub struct LogTail {
     /// Runner log: lines that show the listener failing to reach GitHub
     /// (an `ERR` line, `Attempt N of ... failed`, `Back off ...`, `Sleeping
     /// for N seconds before retrying`) since its last ordinary console
-    /// line: how many, the first one's time, and the newest one's. The
-    /// listener prints a console error once per outage, so these lines are
-    /// the evidence that the trouble goes on.
+    /// line: how many, the first one's time, and the newest one's. One
+    /// failed request writes several of these in the same second, so the
+    /// count says little; the time they span does. The listener prints a
+    /// console error once per outage, so these lines are the evidence that
+    /// the trouble goes on.
     pub failures: usize,
     pub failure_since: Option<i64>,
     pub failure_at: Option<i64>,
@@ -734,6 +736,12 @@ pub struct LogTail {
 /// trouble. The listener's request timeout is 100 s, so this covers two
 /// failed attempts.
 pub const FAILURE_LIVE_SECS: i64 = 5 * 60;
+
+/// How long failing attempts must have gone on, with no console error in
+/// view, before the listener reads as retrying. A request that times out
+/// (100 s) or a failed attempt that the next one fixes is routine and spans
+/// less; a real outage spans minutes.
+pub const RETRYING_MIN_SECS: i64 = 2 * 60;
 
 /// What a runner log says is wrong with the listener's connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,11 +773,11 @@ impl LogTail {
                 msg: msg.as_str(),
             });
         }
-        // A single failed attempt is routine; a second is trouble.
-        (self.failures >= 2)
-            .then_some(self.failure_since)
-            .flatten()
-            .map(|since| Trouble::Retrying { since })
+        // A failed attempt or two is routine; failing for minutes is not.
+        self.failure_since
+            .zip(self.failure_at)
+            .filter(|(first, last)| last - first >= RETRYING_MIN_SECS)
+            .map(|(since, _)| Trouble::Retrying { since })
     }
 }
 

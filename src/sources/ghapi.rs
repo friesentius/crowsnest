@@ -440,6 +440,24 @@ pub fn cadence(core: &RateLimit, base: Duration, calls: u32, now: i64) -> Durati
     base.max(Duration::from_secs(left as u64 / turns))
 }
 
+/// How long the gh tier really waits from `now` for its next read. The
+/// tier compares the time since its last read with [`cadence`] judged afresh
+/// every half second, and the time to the reset shrinks as the wait goes on,
+/// so a wait of `w` ends at the first `w` with `cadence(now + w) <= w`: sooner
+/// than the cadence `now` gave (by a tenth at 9 turns, by half at 0 or 1).
+pub fn wait(core: &RateLimit, base: Duration, calls: u32, now: i64) -> Duration {
+    let (mut lo, mut hi) = (0, cadence(core, base, calls, now).as_secs());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if cadence(core, base, calls, now + mid as i64) <= Duration::from_secs(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Duration::from_secs(hi)
+}
+
 /// A failed answer in a line: `gh: HTTP 404: Not Found`.
 fn http_error(r: &Response) -> String {
     let msg = serde_json::from_str::<serde_json::Value>(&r.body)
@@ -626,6 +644,41 @@ mod tests {
                 &with(&[("Etag", tag.as_str())], &h),
                 &format!("{{\"path\": \"{path}\"}}"),
             ))
+        }
+    }
+
+    #[test]
+    fn the_wait_to_the_next_read_is_judged_against_the_clock_as_it_runs() {
+        let core = |remaining: u64| RateLimit {
+            limit: 5000,
+            remaining,
+            reset_at: NOW + 3600,
+            ..Default::default()
+        };
+        let base = Duration::from_secs(60);
+        // 100 left keeps half for others: 5 turns of 10 reads. The cadence
+        // now says 720 s, but the tier fires as soon as the time since the
+        // last read reaches the time to the reset over 5: 600 s.
+        let c = core(100);
+        assert_eq!(cadence(&c, base, 10, NOW), Duration::from_secs(720));
+        assert_eq!(wait(&c, base, 10, NOW), Duration::from_secs(600));
+        // Not even one turn left: the time to the reset, which the tier
+        // reaches at the half.
+        let c = core(10);
+        assert_eq!(cadence(&c, base, 10, NOW), Duration::from_secs(3600));
+        assert_eq!(wait(&c, base, 10, NOW), Duration::from_secs(1800));
+        // Plenty left: the base.
+        let c = core(4000);
+        assert_eq!(wait(&c, base, 10, NOW), base);
+        // And the wait is what `cadence` then says.
+        for remaining in [10, 40, 100, 300, 900] {
+            let c = core(remaining);
+            let w = wait(&c, base, 10, NOW);
+            assert!(cadence(&c, base, 10, NOW + w.as_secs() as i64) <= w);
+            let before = w.as_secs().saturating_sub(1) as i64;
+            if w > base {
+                assert!(cadence(&c, base, 10, NOW + before) > Duration::from_secs(before as u64));
+            }
         }
     }
 

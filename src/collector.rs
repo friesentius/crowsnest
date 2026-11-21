@@ -816,9 +816,13 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                     .core
                     .paused(now)
                     .or(s.gh_budget.graphql.paused(now));
+                // The tier fires when the time since this read reaches the
+                // cadence as it will then be, which is sooner than the
+                // cadence now.
+                let soon = ghapi::wait(&s.gh_budget.core, base, calls.load(Ordering::Relaxed), now);
                 s.gh_budget.slowed = (every > base && paused.is_none()).then(|| Slowed {
                     every: every.as_secs() as i64,
-                    next_at: now + every.as_secs() as i64,
+                    next_at: now + soon.as_secs() as i64,
                 });
                 read
             },
