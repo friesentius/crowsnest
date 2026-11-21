@@ -64,6 +64,26 @@ Press `o` for the options menu, where you can also hide single usage providers o
 
 ## Install
 
+### From a release
+
+Each [release](https://github.com/friesentius/crowsnest/releases) has a `.tar.gz` for Linux x86_64 (`x86_64-unknown-linux-gnu`) and for macOS on Apple silicon (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`), plus a `SHA256SUMS` file.
+Download the one for your platform, check it against the checksum, and put `crowsnest` on your `PATH`:
+
+```sh
+VERSION=0.1.0
+TARGET=x86_64-unknown-linux-gnu   # or aarch64-apple-darwin, x86_64-apple-darwin
+BASE=https://github.com/friesentius/crowsnest/releases/download/$VERSION
+curl -fLO "$BASE/crowsnest-$VERSION-$TARGET.tar.gz"
+curl -fLO "$BASE/SHA256SUMS"
+grep " crowsnest-$VERSION-$TARGET.tar.gz\$" SHA256SUMS | shasum -a 256 --check
+tar -xzf "crowsnest-$VERSION-$TARGET.tar.gz"
+install "crowsnest-$VERSION-$TARGET/crowsnest" ~/.local/bin/
+```
+
+The archives also carry a build provenance attestation: `gh attestation verify crowsnest-$VERSION-$TARGET.tar.gz --repo friesentius/crowsnest`.
+
+### From source
+
 Crowsnest needs Rust 1.95 or newer.
 
 ```sh
@@ -377,6 +397,19 @@ The code is split so the data layer can be reused without the UI:
 
 The fixtures in `tests/fixtures` are real outputs with names, paths and accounts replaced.
 `docs/upstream.md` explains how crowsnest relates to firstmate upstream.
+
+### Releasing
+
+Pushing to `main` releases the version in `Cargo.toml` unless a release with exactly that version already exists (tags have no `v` prefix).
+
+1. On `dev`, bump `version` in `Cargo.toml` (and `Cargo.lock`).
+2. Open a `dev` to `main` pull request titled "Release X.Y.Z". Its body becomes the release notes, so write them there.
+3. Squash-merge it. The Release workflow runs the CI checks, builds the three archives and their checksums, attests their provenance, tags the commit, publishes the release and checks that every asset is attached.
+4. Merge `main` back into `dev`, so the squash commit is in `dev`'s history.
+
+Running the Release workflow by hand is a dry run that builds everything but tags and publishes nothing.
+If a run fails after tagging, delete the orphan tag and re-run it.
+`scripts/test-release-decision.sh` tests the "already released" check.
 
 ## License
 

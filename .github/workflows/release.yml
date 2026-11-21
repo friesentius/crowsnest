@@ -1,0 +1,153 @@
+name: Release
+
+# A push to main releases the version in Cargo.toml unless a release with
+# exactly that version already exists. Running it by hand (workflow_dispatch)
+# is a dry run: it decides, checks and builds, but never tags or publishes.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  decide:
+    name: Decide
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/release-decision.sh
+
+  # The same fmt, clippy and test jobs that run on every push.
+  ci:
+    name: CI
+    needs: decide
+    if: needs.decide.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: [decide, ci]
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # An older Ubuntu keeps the binary runnable on older glibc.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.decide.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target "$TARGET"
+      - name: Package
+        run: |
+          name="crowsnest-$VERSION-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/crowsnest" LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/${name:?}"
+          (cd dist && if command -v sha256sum >/dev/null; then sha256sum "$name.tar.gz"; else shasum -a 256 "$name.tar.gz"; fi >"$name.tar.gz.sha256")
+          cat "dist/$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: crowsnest-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish
+    needs: [decide, build]
+    # Dry runs (workflow_dispatch) stop after the build.
+    if: github.event_name == 'push' && needs.decide.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      pull-requests: read
+    env:
+      VERSION: ${{ needs.decide.outputs.version }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist
+          pattern: crowsnest-*
+          merge-multiple: true
+      - name: Check the downloaded assets
+        run: |
+          ls -l dist
+          (cd dist && sha256sum --check ./*.sha256)
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: "dist/*.tar.gz"
+      # Tag only after the checks, builds and attestation pass. The decision
+      # only looks for an existing release, not a tag, so if this tag push
+      # succeeds but a later step fails, the next push finds the tag with no
+      # release and fails here instead of silently skipping: delete the orphan
+      # tag and re-run the failed workflow run to retry.
+      - name: Tag release commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin "$VERSION"
+      - name: Publish release
+        run: |
+          # The squash-merged release PR's description is the release notes
+          # (dev -> main release PRs are written that way). Without one, fall
+          # back to generated notes.
+          gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[0].body // empty' >notes.md
+          if [ -s notes.md ]; then
+            notes=(--notes-file notes.md)
+          else
+            notes=(--generate-notes)
+          fi
+          cat dist/*.sha256 >dist/SHA256SUMS
+          gh release create "$VERSION" \
+            --verify-tag \
+            --title "$VERSION" \
+            "${notes[@]}" \
+            dist/*.tar.gz dist/SHA256SUMS
+      - name: Verify release assets
+        run: |
+          assets=$(gh release view "$VERSION" --json assets --jq '.assets[].name')
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin; do
+            grep -Fxq "crowsnest-$VERSION-$target.tar.gz" <<<"$assets" || { echo "missing asset for $target" >&2; exit 1; }
+          done
+          grep -Fxq SHA256SUMS <<<"$assets" || { echo "missing SHA256SUMS" >&2; exit 1; }
+          echo "release $VERSION has all assets"
