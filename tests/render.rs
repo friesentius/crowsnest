@@ -5,9 +5,9 @@
 use crowsnest::app::{Action, App, all_rows};
 use crowsnest::config::{Overrides, Panel, Setting, Settings};
 use crowsnest::model::{
-    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, LogTail, PrChecks, QuotaWindow,
-    RepoHistory, RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot, StaleKind,
-    Thresholds, Worker, WorkerState,
+    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, LogTail, PrChecks, QueueRead,
+    QuotaWindow, RepoHistory, RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot,
+    StaleKind, Thresholds, Worker, WorkerState,
 };
 use crowsnest::options::Category;
 use crowsnest::sources::{fleet, gh, history, nm, quota};
@@ -2319,6 +2319,86 @@ fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
         "{text}"
     );
     assert!(draw_light(&s, &app_for(&s), 100, 34).contains("log: retrying"));
+}
+
+/// The runners fleet where bookshop's repository cannot be read, as
+/// REPLAYED from the live check of a runner registered to a repository the
+/// `gh` login cannot see: pantry's queue is fine.
+fn with_unreadable_repository() -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.queue_reads.insert(
+        "acme/pantry".into(),
+        QueueRead {
+            read_at: Some(now - 25),
+            error: None,
+        },
+    );
+    s.queue_reads.insert(
+        "acme/bookshop".into(),
+        QueueRead {
+            read_at: None,
+            error: Some("gh: HTTP 404: Not Found".into()),
+        },
+    );
+    s.fresh.insert(
+        "gh".into(),
+        Freshness {
+            ok_at: Some(now - 25),
+            error: Some("acme/bookshop queue: gh: HTTP 404: Not Found".into()),
+        },
+    );
+    s
+}
+
+#[test]
+fn an_unreadable_repository_says_queue_not_read_not_empty() {
+    utc();
+    let s = with_unreadable_repository();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "bookshop-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(text.contains("Idle, queue not read."), "{text}");
+    assert!(
+        text.contains("QUEUE    not read: gh: HTTP 404: Not Found"),
+        "{text}"
+    );
+    assert!(!text.contains("nothing queued"), "{text}");
+    assert!(!text.contains("QUEUE    empty"), "{text}");
+    // The other repository's runner still has its queue.
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(text.contains("Lint & typecheck"), "{text}");
+    assert!(!text.contains("queue not read"), "{text}");
+    // A repository that was read and has nothing queued is empty.
+    let mut ok = s.clone();
+    ok.queue_reads.get_mut("acme/bookshop").unwrap().error = None;
+    ok.queue_reads.get_mut("acme/bookshop").unwrap().read_at = Some(ok.now - 25);
+    let mut app = app_for(&ok);
+    open_runner(&ok, &mut app, "bookshop-runner");
+    let text = draw_light(&ok, &app, 100, 40);
+    assert!(text.contains("QUEUE    empty"), "{text}");
+    // The jobs of a repository whose latest read failed are shown, with
+    // the reason and a note that they are old.
+    let mut stale = s.clone();
+    stale.queue_reads.get_mut("acme/pantry").unwrap().error = Some("gh: HTTP 502".into());
+    let mut app = app_for(&stale);
+    open_runner(&stale, &mut app, "pantry-local-runner");
+    let text = draw_light(&stale, &app, 100, 44);
+    assert!(text.contains("Lint & typecheck"), "{text}");
+    assert!(
+        text.contains("queue not read: gh: HTTP 502; the jobs above are from the last good read"),
+        "{text}"
+    );
+    // Without GitHub the queue was never read either.
+    let mut off = fleet_of_runners();
+    off.fresh.remove("gh");
+    off.jobs_read_at = None;
+    let mut app = app_for(&off);
+    open_runner(&off, &mut app, "bookshop-runner");
+    let text = draw_light(&off, &app, 100, 40);
+    assert!(text.contains("not read (--no-github)"), "{text}");
 }
 
 #[test]

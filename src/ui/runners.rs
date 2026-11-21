@@ -4,7 +4,7 @@
 use super::{Content, View, draw_box, fit, rpad, span, width_of};
 use crate::config::Panel;
 use crate::lanes::{
-    self, Current, Fleet, JobCpu, Lane, Online, QueueState, Queued, Signal, Verdict, Why,
+    self, Current, Fleet, JobCpu, Lane, Online, QueueGap, QueueState, Queued, Signal, Verdict, Why,
     short_name, step_name, tiny_name,
 };
 use crate::model::{Job, RunnerThresholds, Trouble};
@@ -836,7 +836,11 @@ pub fn verdict_sentence(lane: &Lane, th: &RunnerThresholds, now: i64) -> String 
                 .map(|r| format!(" It last finished a job {} ago.", dur(now - r)))
                 .unwrap_or_default();
             if lane.queue.is_empty() {
-                format!("Idle, nothing queued.{ran}")
+                // A queue that was not read says nothing about being empty.
+                match lane.queue_gap {
+                    Some(_) => format!("Idle, queue not read.{ran}"),
+                    None => format!("Idle, nothing queued.{ran}"),
+                }
             } else {
                 format!("Idle, with a job queued: it should start now.{ran}")
             }
@@ -1058,7 +1062,20 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
     let t = &view.theme;
     let now = view.snap.now;
     if lane.queue.is_empty() {
-        let mut out = vec![fit(vec![label(t, "QUEUE"), span("empty", t.dim())], w)];
+        let mut out = match lane.queue_gap {
+            None => vec![fit(vec![label(t, "QUEUE"), span("empty", t.dim())], w)],
+            // Not empty: not read, and why.
+            Some(gap) => {
+                let (text, st) = match gap {
+                    QueueGap::Failed(e) => (format!("not read: {e}"), t.warn()),
+                    QueueGap::Never if view.snap.fresh.contains_key("gh") => {
+                        ("not read yet".to_string(), t.dim())
+                    }
+                    QueueGap::Never => ("not read (--no-github)".to_string(), t.dim()),
+                };
+                wrap_words(vec![label(t, "QUEUE")], LABEL, &text, st, w)
+            }
+        };
         out.extend(unread_line(view, lane, w));
         return out;
     }
@@ -1137,6 +1154,16 @@ fn queue_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         _ => "no estimate yet: fewer than 3 past runs of the running job".into(),
     };
     out.push(fit(vec![pad(), span(summary, t.dim())], w));
+    // The jobs above are those of the last good read.
+    if let Some(QueueGap::Failed(e)) = lane.queue_gap {
+        out.extend(wrap_words(
+            vec![pad()],
+            LABEL,
+            &format!("queue not read: {e}; the jobs above are from the last good read"),
+            t.warn(),
+            w,
+        ));
+    }
     out.extend(unread_line(view, lane, w));
     out
 }

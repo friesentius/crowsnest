@@ -758,6 +758,15 @@ impl LogTail {
     }
 }
 
+/// How the queue of one repository was last read: when it was read in
+/// full, and why the latest attempt failed, if it did. A repository whose
+/// read failed keeps the jobs of its last good read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct QueueRead {
+    pub read_at: Option<i64>,
+    pub error: Option<String>,
+}
+
 /// How fresh one source is.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Freshness {
@@ -778,8 +787,13 @@ pub struct Snapshot {
     pub runner_search: Option<RunnerSearch>,
     /// Queued and running jobs of the repositories with a local runner.
     pub jobs: Vec<Job>,
-    /// Unix time `jobs` was read.
+    /// Unix time a repository's queue was last read in full (the newest of
+    /// them).
     pub jobs_read_at: Option<i64>,
+    /// How each repository's queue was last read, keyed by `owner/repo`. A
+    /// repository that could not be read keeps the jobs of its last good
+    /// read in `jobs`.
+    pub queue_reads: BTreeMap<String, QueueRead>,
     /// GitHub's view of each repository's runners, keyed by `owner/repo`.
     pub gh_runners: BTreeMap<String, RepoRunners>,
     /// Finished jobs and typical durations, keyed by `owner/repo`.

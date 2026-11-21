@@ -200,12 +200,29 @@ fn apply_gh(
     }
     match queue {
         Ok(q) => {
+            // A repository that failed reads as a partial error, and keeps
+            // the jobs of its last good read; every one failing is outright.
+            let errors: Vec<String> = q
+                .reads
+                .iter()
+                .filter_map(|(repo, r)| Some(format!("{repo} queue: {}", r.error.as_ref()?)))
+                .collect();
+            if !errors.is_empty() {
+                if errors.len() == q.reads.len() {
+                    failed.extend(errors);
+                } else {
+                    partial.extend(errors);
+                }
+            }
             s.jobs = q
                 .jobs
                 .into_iter()
                 .filter(|j| j.status != "completed")
                 .collect();
-            s.jobs_read_at = Some(now_epoch());
+            if q.read_at.is_some() {
+                s.jobs_read_at = q.read_at;
+            }
+            s.queue_reads = q.reads;
             s.gh_budget.runs_unread = q.unread;
         }
         Err(GhError::Paused { .. }) => paused += 1,
@@ -238,6 +255,8 @@ struct GhState {
     gh_runners: BTreeMap<String, RepoRunners>,
     /// Runs that were queued or running at the last read.
     active: BTreeSet<u64>,
+    /// What each repository's queue held at its last good read.
+    queue: BTreeMap<String, sources::KeptQueue>,
 }
 
 impl GhState {
@@ -750,13 +769,13 @@ pub fn start(cfg: Config, changed: Sender<()>) -> (Shared, Handle) {
                 };
                 gh_read.lock().unwrap().clone_from(&urls);
                 let prs = sources::read_pr_checks(&mut state.client, &urls);
-                let queue = sources::read_queue(&mut state.client, &runner_list);
+                let queue = sources::read_queue(&mut state.client, &runner_list, &mut state.queue);
                 // Show the checks and the queue first: the first history
                 // read fetches several runs' jobs and takes a while.
                 let live = match &queue {
                     Ok(q) => Ok(Queue {
                         jobs: q.jobs.clone(),
-                        unread: BTreeMap::new(),
+                        ..Default::default()
                     }),
                     Err(e) => Err(e.clone()),
                 };
@@ -930,7 +949,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
         let urls = sources::pr_urls(s.fleet.as_ref(), &s.pipelines);
         let mut state = GhState::default();
         let prs = sources::read_pr_checks(&mut state.client, &urls);
-        let queue = sources::read_queue(&mut state.client, &s.runners);
+        let queue = sources::read_queue(&mut state.client, &s.runners, &mut state.queue);
         let (history, gh_runners) = state.read(&s.runners, &queue);
         s.history = history;
         s.gh_runners = gh_runners;
@@ -955,6 +974,7 @@ pub fn collect_once(cfg: &Config) -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::QueueRead;
 
     #[test]
     fn failing_tiers_back_off_to_five_minutes() {
@@ -1147,12 +1167,91 @@ mod tests {
             Ok(Queue {
                 jobs: vec![job("completed"), job("in_progress"), job("queued")],
                 unread: [("acme/pantry".to_string(), 3)].into(),
+                read_at: Some(4_000),
+                ..Default::default()
             }),
         );
         assert_eq!(r, Read::Ok);
         assert_eq!(s.jobs.len(), 2);
-        assert!(s.jobs_read_at.is_some());
+        assert_eq!(s.jobs_read_at, Some(4_000));
         assert_eq!(s.gh_budget.runs_unread["acme/pantry"], 3);
+    }
+
+    #[test]
+    fn one_repository_that_failed_is_a_partial_error_that_keeps_the_others() {
+        let job = |repo: &str, status: &str| Job {
+            repo: repo.into(),
+            status: status.into(),
+            ..Default::default()
+        };
+        let reads = |bookshop: Option<&str>| {
+            [
+                (
+                    "acme/bookshop".to_string(),
+                    QueueRead {
+                        read_at: None,
+                        error: bookshop.map(String::from),
+                    },
+                ),
+                (
+                    "acme/pantry".to_string(),
+                    QueueRead {
+                        read_at: Some(4_000),
+                        error: None,
+                    },
+                ),
+            ]
+            .into()
+        };
+        let mut s = Snapshot::default();
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(Queue {
+                jobs: vec![job("acme/pantry", "queued"), job("acme/bookshop", "queued")],
+                reads: reads(Some("gh: HTTP 404: Not Found")),
+                read_at: Some(4_000),
+                ..Default::default()
+            }),
+        );
+        // Shown as an error, but not one the tier backs off for.
+        assert_eq!(
+            r,
+            Read::Partial("acme/bookshop queue: gh: HTTP 404: Not Found".into())
+        );
+        assert_eq!(s.jobs.len(), 2, "the failed repository keeps its jobs");
+        assert_eq!(s.jobs_read_at, Some(4_000));
+        assert_eq!(
+            s.queue_reads["acme/bookshop"].error.as_deref(),
+            Some("gh: HTTP 404: Not Found")
+        );
+        // The error clears with the next good read.
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(Queue {
+                reads: reads(None),
+                read_at: Some(4_060),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(r, Read::Ok);
+        assert!(s.queue_reads["acme/bookshop"].error.is_none());
+        // Every repository failing is outright: the tier backs off, and the
+        // last jobs stay.
+        let mut failing = reads(Some("gh: HTTP 404: Not Found"));
+        failing.get_mut("acme/pantry").unwrap().error = Some("gh: HTTP 502".into());
+        let r = apply_gh(
+            &mut s,
+            Ok((vec![], vec![])),
+            Ok(Queue {
+                jobs: vec![job("acme/pantry", "queued")],
+                reads: failing,
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(r, Read::Failed(_)), "{r:?}");
+        assert_eq!(s.jobs_read_at, Some(4_060), "nothing was read in full");
     }
 
     #[test]

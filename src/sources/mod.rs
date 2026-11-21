@@ -13,7 +13,9 @@ pub mod quota;
 pub mod runners;
 
 use crate::exec::ReadCommand;
-use crate::model::{Fleet, Job, Pipeline, PrChecks, QuotaWindow, RepoRunners, Runner, Service};
+use crate::model::{
+    Fleet, Job, Pipeline, PrChecks, QueueRead, QuotaWindow, RepoRunners, Runner, Service,
+};
 use ghapi::{Client, GhError};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -144,37 +146,173 @@ pub struct Queue {
     pub jobs: Vec<Job>,
     /// Active runs per repository beyond the page that were not read.
     pub unread: BTreeMap<String, u64>,
+    /// How each repository's queue was read: when it was last read in full,
+    /// and what failed this turn. A repository that failed keeps the jobs
+    /// of its last good read in `jobs`.
+    pub reads: BTreeMap<String, QueueRead>,
+    /// When a repository's queue was read in full this turn (also when
+    /// there was none to read), else `None`.
+    pub read_at: Option<i64>,
+}
+
+/// What the last good read of one repository's queue found, kept so that a
+/// failing read does not blank it.
+#[derive(Debug, Clone, Default)]
+pub struct KeptQueue {
+    pub jobs: Vec<Job>,
+    pub unread: u64,
+    pub read_at: Option<i64>,
+}
+
+/// One repository's queued and running runs, or why they were not read.
+fn read_run_lists(
+    gh: &mut Client,
+    repo: &str,
+) -> Result<(Vec<crate::model::RunInfo>, u64), GhError> {
+    let mut runs = Vec::new();
+    let mut unread = 0;
+    for status in ["queued", "in_progress"] {
+        let out = gh.get(&format!(
+            "repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}"
+        ))?;
+        let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
+        unread += gh::total_count(&out)
+            .unwrap_or(0)
+            .saturating_sub(page.len() as u64);
+        runs.extend(page);
+    }
+    runs.sort_by_key(|r| r.id);
+    runs.dedup_by_key(|r| r.id);
+    Ok((runs, unread))
 }
 
 /// Every job of the queued and running workflow runs of each repository
 /// that has a local runner: queued, running, and already finished ones.
-pub fn read_queue(gh: &mut Client, runners: &[Runner]) -> Result<Queue, GhError> {
+///
+/// Each repository is read on its own. One that cannot be read (a deleted
+/// or private repository, an organisation that needs SSO, a failed job
+/// list) keeps what `kept` holds of its last good read, or of the runs whose
+/// jobs did answer, and is reported in `reads` with its error: it never
+/// blanks the queue of the others. `Err` only when GitHub refused every
+/// repository for rate limit.
+pub fn read_queue(
+    gh: &mut Client,
+    runners: &[Runner],
+    kept: &mut BTreeMap<String, KeptQueue>,
+) -> Result<Queue, GhError> {
+    let repos = runner_repos(runners);
+    kept.retain(|repo, _| repos.contains(repo));
+    let lists: Vec<_> = repos.iter().map(|repo| read_run_lists(gh, repo)).collect();
+    // The jobs of every repository's runs, 8 at a time.
+    let active: Vec<(String, crate::model::RunInfo)> = repos
+        .iter()
+        .zip(&lists)
+        .filter_map(|(repo, l)| l.as_ref().ok().map(|(runs, _)| (repo, runs)))
+        .flat_map(|(repo, runs)| runs.iter().map(|r| (repo.clone(), r.clone())))
+        .collect();
+    let mut jobs = read_runs_jobs(gh, &active, false).into_iter();
+    let now = crate::timefmt::now_epoch();
     let mut q = Queue::default();
-    let mut active = Vec::new();
-    for repo in runner_repos(runners) {
-        let mut runs = Vec::new();
-        let mut unread = 0;
-        for status in ["queued", "in_progress"] {
-            let out = gh.get(&format!(
-                "repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}"
-            ))?;
-            let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
-            unread += gh::total_count(&out)
-                .unwrap_or(0)
-                .saturating_sub(page.len() as u64);
-            runs.extend(page);
+    let mut paused = Vec::new();
+    for (repo, list) in repos.iter().zip(lists) {
+        let old = kept.get(repo).cloned().unwrap_or_default();
+        let n = list.as_ref().map_or(0, |(runs, _)| runs.len());
+        let answers: Vec<_> = jobs.by_ref().take(n).collect();
+        let mine = merge_repo(&old, list, answers, now);
+        if mine.whole {
+            q.read_at = Some(now);
         }
-        runs.sort_by_key(|r| r.id);
-        runs.dedup_by_key(|r| r.id);
-        if unread > 0 {
-            q.unread.insert(repo.clone(), unread);
+        paused.extend(mine.paused);
+        if mine.unread > 0 {
+            q.unread.insert(repo.clone(), mine.unread);
         }
-        active.extend(runs.into_iter().map(|run| (repo.clone(), run)));
+        kept.insert(
+            repo.clone(),
+            KeptQueue {
+                jobs: mine.jobs.clone(),
+                unread: mine.unread,
+                read_at: mine.read.read_at,
+            },
+        );
+        q.jobs.extend(mine.jobs);
+        q.reads.insert(repo.clone(), mine.read);
     }
-    for jobs in read_runs_jobs(gh, &active, false) {
-        q.jobs.extend(jobs?);
+    if repos.is_empty() {
+        q.read_at = Some(now);
+    }
+    // Nothing was read because GitHub refused: the last data stays as it is.
+    if q.read_at.is_none() && !paused.is_empty() && q.reads.values().all(|r| r.error.is_none()) {
+        return Err(GhError::Paused {
+            until: paused.into_iter().max().unwrap_or(now),
+        });
     }
     Ok(q)
+}
+
+/// What one repository's read came to.
+struct Merged {
+    jobs: Vec<Job>,
+    unread: u64,
+    read: QueueRead,
+    /// Everything answered: the queue was read in full.
+    whole: bool,
+    /// Where GitHub refused for rate limit, until when.
+    paused: Vec<i64>,
+}
+
+/// One repository's queue from this turn's answers and its last good read:
+/// the run lists, then the jobs of each run listed. What did not answer
+/// (the lists, or one run's jobs) is taken from `old`, so a failing read
+/// never blanks what was known; the error is kept for the screen. The
+/// repository counts as read in full at `now` only when everything did
+/// answer.
+fn merge_repo(
+    old: &KeptQueue,
+    list: Result<(Vec<crate::model::RunInfo>, u64), GhError>,
+    jobs: Vec<Result<Vec<Job>, GhError>>,
+    now: i64,
+) -> Merged {
+    let mut m = Merged {
+        jobs: Vec::new(),
+        unread: old.unread,
+        read: QueueRead {
+            read_at: old.read_at,
+            error: None,
+        },
+        whole: false,
+        paused: Vec::new(),
+    };
+    let note = |m: &mut Merged, e: GhError| match e {
+        GhError::Failed(e) => {
+            m.read.error.get_or_insert(e);
+        }
+        GhError::Paused { until } => m.paused.push(until),
+    };
+    match list {
+        Ok((runs, unread)) => {
+            m.unread = unread;
+            m.whole = true;
+            for (run, answer) in runs.iter().zip(jobs) {
+                match answer {
+                    Ok(j) => m.jobs.extend(j),
+                    Err(e) => {
+                        m.whole = false;
+                        m.jobs
+                            .extend(old.jobs.iter().filter(|j| j.run_id == run.id).cloned());
+                        note(&mut m, e);
+                    }
+                }
+            }
+            if m.whole {
+                m.read.read_at = Some(now);
+            }
+        }
+        Err(e) => {
+            m.jobs = old.jobs.clone();
+            note(&mut m, e);
+        }
+    }
+    m
 }
 
 /// Add the latest completed runs of `repo` that `cache` has not read yet.
@@ -254,4 +392,110 @@ pub fn read_quota(providers: &[String]) -> Result<Vec<QuotaWindow>, String> {
     .run()
     .map_err(|e| format!("quota-axi: {e}"))?;
     quota::parse(&out.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::RunInfo;
+
+    fn run(id: u64) -> RunInfo {
+        RunInfo {
+            id,
+            ..Default::default()
+        }
+    }
+
+    fn job(run_id: u64, name: &str) -> Job {
+        Job {
+            run_id,
+            name: name.into(),
+            status: "queued".into(),
+            ..Default::default()
+        }
+    }
+
+    fn names(m: &Merged) -> Vec<&str> {
+        m.jobs.iter().map(|j| j.name.as_str()).collect()
+    }
+
+    fn kept() -> KeptQueue {
+        KeptQueue {
+            jobs: vec![job(1, "old a"), job(2, "old b")],
+            unread: 4,
+            read_at: Some(100),
+        }
+    }
+
+    #[test]
+    fn a_repository_read_in_full_replaces_what_was_kept() {
+        let m = merge_repo(
+            &kept(),
+            Ok((vec![run(2), run(3)], 0)),
+            vec![Ok(vec![job(2, "new b")]), Ok(vec![job(3, "new c")])],
+            200,
+        );
+        assert_eq!(names(&m), ["new b", "new c"]);
+        assert_eq!(
+            (m.read.read_at, m.read.error, m.unread),
+            (Some(200), None, 0)
+        );
+        assert!(m.whole);
+    }
+
+    #[test]
+    fn an_unreadable_repository_keeps_its_last_queue_and_reports_why() {
+        let m = merge_repo(
+            &kept(),
+            Err(GhError::Failed("gh: HTTP 404: Not Found".into())),
+            vec![],
+            200,
+        );
+        assert_eq!(names(&m), ["old a", "old b"]);
+        assert_eq!(m.read.error.as_deref(), Some("gh: HTTP 404: Not Found"));
+        assert_eq!(m.read.read_at, Some(100), "the last good read, not now");
+        assert_eq!(m.unread, 4);
+        assert!(!m.whole);
+        // One never read has nothing to keep.
+        let none = merge_repo(
+            &KeptQueue::default(),
+            Err(GhError::Failed("gh: HTTP 404: Not Found".into())),
+            vec![],
+            200,
+        );
+        assert!(none.jobs.is_empty());
+        assert_eq!(none.read.read_at, None);
+    }
+
+    #[test]
+    fn a_run_whose_jobs_failed_keeps_its_old_jobs_and_the_rest_are_fresh() {
+        let m = merge_repo(
+            &kept(),
+            Ok((vec![run(1), run(2)], 0)),
+            vec![
+                Err(GhError::Failed("gh: HTTP 502".into())),
+                Ok(vec![job(2, "new b")]),
+            ],
+            200,
+        );
+        assert_eq!(names(&m), ["old a", "new b"]);
+        assert_eq!(m.read.error.as_deref(), Some("gh: HTTP 502"));
+        assert_eq!(m.read.read_at, Some(100), "not read in full");
+        assert!(!m.whole);
+    }
+
+    #[test]
+    fn a_refusal_for_rate_limit_keeps_the_queue_without_an_error() {
+        let m = merge_repo(&kept(), Err(GhError::Paused { until: 900 }), vec![], 200);
+        assert_eq!(names(&m), ["old a", "old b"]);
+        assert_eq!((m.read.error, m.paused), (None, vec![900]));
+        let m = merge_repo(
+            &kept(),
+            Ok((vec![run(1)], 0)),
+            vec![Err(GhError::Paused { until: 900 })],
+            200,
+        );
+        assert_eq!(names(&m), ["old a"]);
+        assert_eq!((m.read.error, m.paused, m.whole), (None, vec![900], false));
+    }
 }

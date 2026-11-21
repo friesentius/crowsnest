@@ -252,6 +252,7 @@ A busy runner's lane shows the running job with its PR (or branch), how long it 
 Below it are the jobs queued for that runner, oldest first, with how long each has waited and, for the next one, an estimated start (`→ 14:58`) from the typical durations of what is ahead.
 Below 140 columns the lane folds into one line under the runner.
 GitHub picks which queued job goes next, so only the next start and the time the queue drains are estimates worth trusting; the detail says so.
+Each repository's queue is read on its own. One that cannot be read (a deleted or private repository, an organization that needs SSO) is shown as a partial error (`gh !`), keeps the jobs of its last good read, and never blanks the queue of the other runners; its runners' detail says `Idle, queue not read.` and `QUEUE  not read: gh: HTTP 404: Not Found` instead of `QUEUE  empty`, and no job of that repository is called NOT PICKING UP until it is read again.
 
 A typical duration is the median of the job's (or step's) latest successful runs, at most 10; with fewer than 3 samples crowsnest shows the elapsed time only and never calls the job slow.
 
