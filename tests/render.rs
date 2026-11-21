@@ -2543,3 +2543,99 @@ fn options_menu_refresh_has_the_github_cadence() {
     assert!(text.contains("60 s"), "{text}");
     insta::assert_snapshot!(draw(&s, &app, 100, 40).backend());
 }
+
+/// The fleet with bookshop's runner idle for 3 hours after its last job, and
+/// systemd having restarted its unit `restarts` times.
+fn idle_after_a_run(restarts: u32) -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.history
+        .get_mut("acme/bookshop")
+        .unwrap()
+        .jobs
+        .push(crowsnest::model::DoneJob {
+            runner: "bookshop-runner".into(),
+            workflow: "CI".into(),
+            name: "Unit".into(),
+            label: "#7".into(),
+            conclusion: "success".into(),
+            created_at: Some(now - 3 * 3600 - 600),
+            started_at: Some(now - 3 * 3600 - 300),
+            completed_at: Some(now - 3 * 3600),
+        });
+    for r in &mut s.runners {
+        if r.name == "bookshop-runner" {
+            r.service = Some(Service {
+                active: "active".into(),
+                restarts: Some(restarts),
+                ..Default::default()
+            });
+        }
+    }
+    s
+}
+
+#[test]
+fn the_restart_count_drops_the_ran_age_whole_instead_of_cutting_it() {
+    utc();
+    let lane = |text: &str| -> String {
+        lines_with(text, "bookshop")
+            .into_iter()
+            .find(|l| l.contains("idle"))
+            .map(|l| l[l.find("bookshop").unwrap()..].to_string())
+            .unwrap_or_else(|| panic!("no idle bookshop lane in\n{text}"))
+    };
+    // With room, the age and the count are both there.
+    let s = idle_after_a_run(1);
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(lane(&wide).contains("ran  3h ago"), "{}", lane(&wide));
+    assert!(lane(&wide).contains("\u{21ba}1"), "{}", lane(&wide));
+    // With little room, a count that long takes it and the age goes whole.
+    for restarts in [265, 4169] {
+        let s = idle_after_a_run(restarts);
+        for (w, h) in [(100, 34), (180, 50)] {
+            let text = draw_light(&s, &app_for(&s), w, h);
+            let l = lane(&text);
+            assert!(l.contains(&format!("{restarts}")), "{w}: {l}");
+            // Whole, or not there at all: never `ran 3\u{2026}` or `ra\u{2026}`.
+            let cut = l.contains('\u{2026}');
+            let whole = l.contains("ran  3h");
+            assert!(!cut && (whole || !l.contains("ran")), "{w}: {l}");
+        }
+    }
+}
+
+#[test]
+fn the_restart_count_drops_the_elapsed_time_of_a_busy_lane_whole_too() {
+    utc();
+    let mut s = fleet_of_runners();
+    for r in &mut s.runners {
+        if r.name == "pantry-local-runner" {
+            r.service.as_mut().unwrap().restarts = Some(4169);
+        }
+    }
+    let lane = |text: &str| -> String {
+        lines_with(text, "pantry ")
+            .into_iter()
+            .find(|l| l.contains("moving"))
+            .map(|l| {
+                l[l.find("pantry ").unwrap()..]
+                    .split("\u{2502}\u{2502}")
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap_or_else(|| panic!("no busy pantry lane in\n{text}"))
+    };
+    let text = draw_light(&s, &app_for(&s), 100, 34);
+    let l = lane(&text);
+    assert!(l.contains("\u{21ba}4169"), "{l}");
+    // The verdict and the count are whole; the time that did not fit is gone.
+    assert!(l.contains("moving") && !l.contains('\u{2026}'), "{l}");
+    assert!(!l.contains("8m/40m"), "{l}");
+    // With room it is there.
+    s.runners
+        .iter_mut()
+        .for_each(|r| r.service.as_mut().map_or((), |sv| sv.restarts = Some(2)));
+    assert!(lane(&draw_light(&s, &app_for(&s), 100, 34)).contains("8m/40m"));
+}

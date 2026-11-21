@@ -181,20 +181,23 @@ fn head(
         .last_ran
         .map(|r| (now - r).max(0))
         .map(|a| format!("{:>3}", dur(a)));
+    // What follows the verdict word, last to go first: when the line is
+    // short each piece is dropped whole, never cut in the middle.
+    let mut opt: Spans = Vec::new();
     match (lane.verdict, wide) {
         (Verdict::Idle, false) => {
             l.push(span("idle", t.dim()));
             if let Some(r) = ran {
-                l.push(span(format!(" \u{b7} ran {r}"), t.dim()));
+                opt.push(span(format!(" \u{b7} ran {r}"), t.dim()));
             }
         }
         (Verdict::Idle, true) => {
             l.push(span("idle", t.dim()));
             if let Some(o) = online_text(lane.online) {
-                l.push(span(format!(" \u{b7} {o}"), t.dim()));
+                opt.push(span(format!(" \u{b7} {o}"), t.dim()));
             }
             if let Some(r) = ran {
-                l.push(span(format!(" \u{b7} ran {r} ago"), t.dim()));
+                opt.push(span(format!(" \u{b7} ran {r} ago"), t.dim()));
             }
         }
         (v, false) => {
@@ -206,10 +209,10 @@ fn head(
                     } else {
                         " no listener"
                     };
-                    l.push(span(why, t.dim()));
+                    opt.push(span(why, t.dim()));
                 }
                 (Verdict::NotPickingUp, _) => {}
-                (_, Some(c)) => l.push(span(format!(" {}", elapsed_of(c)), t.plain())),
+                (_, Some(c)) => opt.push(span(format!(" {}", elapsed_of(c)), t.plain())),
                 _ => {}
             }
         }
@@ -220,7 +223,7 @@ fn head(
                 _ => online_text(lane.online),
             };
             if let Some(o) = o {
-                l.push(span(
+                opt.push(span(
                     format!(" \u{b7} {o}"),
                     if lane.online == Online::No {
                         t.bad()
@@ -242,7 +245,7 @@ fn head(
     if let Some(n) = restarts(lane.runner) {
         let words = format!("{n} restart{}", if n == 1 { "" } else { "s" });
         let gap = if right.is_empty() { 0 } else { 2 };
-        let room = w.saturating_sub(width_of(&l) + width_of(&right) + gap + 1);
+        let room = w.saturating_sub(width_of(&l) + width_of(&opt) + width_of(&right) + gap + 1);
         let text = if wide && words.width() <= room {
             words
         } else {
@@ -255,6 +258,13 @@ fn head(
         chip.extend(right);
         right = chip;
     }
+    // The count and the queue wait come first: of what follows the verdict,
+    // the last piece goes whole until the rest fits.
+    let gap = usize::from(!right.is_empty());
+    while !opt.is_empty() && width_of(&l) + width_of(&opt) + width_of(&right) + gap > w {
+        opt.pop();
+    }
+    l.extend(opt);
     lr(l, right, w)
 }
 
