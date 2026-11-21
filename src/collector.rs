@@ -4,7 +4,7 @@
 //! | tier     | default cadence                                              |
 //! |----------|--------------------------------------------------------------|
 //! | host     | 2 s                                                          |
-//! | runners  | 5 s (process scan, `_diag` file times, tails of the newest logs when they changed), directories re-listed every 60 s and whenever a `Runner.Listener` starts or stops, systemd units every 30 s |
+//! | runners  | 5 s (process scan, `_diag` file times, the newest logs followed as they grow), directories re-listed every 60 s and whenever a `Runner.Listener` starts or stops, systemd units every 30 s |
 //! | pipelines| 15 s per live no-mistakes task                               |
 //! | fleet    | 60 s                                                         |
 //! | github   | 60 s (`github_seconds`) while a PR, runner or queued job is active, otherwise 5 min; slower when the rate-limit budget would not last to its reset, paused while GitHub refuses for rate limit |

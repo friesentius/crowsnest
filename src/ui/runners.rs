@@ -7,7 +7,7 @@ use crate::lanes::{
     self, Current, Fleet, JobCpu, Lane, Online, QueueState, Queued, Signal, Verdict, Why,
     short_name, step_name, tiny_name,
 };
-use crate::model::{Job, RunnerThresholds};
+use crate::model::{Job, RunnerThresholds, Trouble};
 use crate::timefmt::{self, dur};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -45,12 +45,28 @@ fn log_step<'a>(lane: &Lane<'a>) -> Option<(i64, &'a str, bool)> {
         .then_some((*at, name.as_str(), wt.process_running))
 }
 
-/// The listener's own console error (`Runner connect error: ...`), when it
-/// has written one since its last ordinary console line.
-fn console_error<'a>(lane: &Lane<'a>) -> Option<(i64, &'a str)> {
-    let rt = lane.runner.runner_tail.as_ref()?;
-    let (_, msg) = rt.error.as_ref()?;
-    Some((rt.error_since?, msg.as_str()))
+/// What the listener's log says is wrong with its connection as of `now`:
+/// a console error it wrote since its last ordinary console line, or
+/// failing attempts, while the newest of them is recent.
+fn trouble<'a>(lane: &Lane<'a>, now: i64) -> Option<Trouble<'a>> {
+    lane.runner.runner_tail.as_ref()?.trouble(now)
+}
+
+/// The trouble in a few words: `console error since 09:03`, or `listener
+/// retrying since 09:03`.
+fn trouble_head(trouble: Trouble, now: i64) -> String {
+    match trouble {
+        Trouble::ConsoleError { since, .. } => format!("console error since {}", at(since, now)),
+        Trouble::Retrying { since } => format!("listener retrying since {}", at(since, now)),
+    }
+}
+
+/// The trouble's short name for the narrow panel.
+fn trouble_tag(trouble: Trouble) -> &'static str {
+    match trouble {
+        Trouble::ConsoleError { .. } => "log: console error",
+        Trouble::Retrying { .. } => "log: retrying",
+    }
 }
 
 /// `left`, then `right` flush against the right edge; `left` gives way.
@@ -257,6 +273,7 @@ fn narrow_detail(view: &View, lane: &Lane) -> Option<Spans> {
     let now = view.snap.now;
     let lead = span(format!("  {} ", t.corner()), t.dim());
     let first = lane.queue.first();
+    let bad = trouble(lane, now);
     let waits = first
         .map(|q| format!(" \u{b7} {} waits", tiny_name(&q.job.name)))
         .unwrap_or_default();
@@ -269,9 +286,7 @@ fn narrow_detail(view: &View, lane: &Lane) -> Option<Spans> {
                 format!("{} waits, blocked", tiny_name(&q.job.name)),
                 t.bad(),
             ),
-            (None, _) if console_error(lane).is_some() => {
-                ("log: connect error".to_string(), t.warn())
-            }
+            (None, _) if bad.is_some() => (trouble_tag(bad.unwrap()).to_string(), t.warn()),
             (None, Some(a)) => (format!("runner log {} ago", dur((now - a).max(0))), t.dim()),
             (None, None) => return None,
         },
@@ -292,10 +307,7 @@ fn narrow_detail(view: &View, lane: &Lane) -> Option<Spans> {
                 let (w, st) = wait_text(t, lane, q, true, now);
                 (format!("{}{more} {w}", tiny_name(&q.job.name)), st)
             }
-            None if lane.current.is_none() => {
-                console_error(lane)?;
-                ("log: connect error".to_string(), t.warn())
-            }
+            None if lane.current.is_none() => (trouble_tag(bad?).to_string(), t.warn()),
             None => {
                 let c = lane.current.as_ref()?;
                 let s = c.step?;
@@ -397,12 +409,12 @@ fn wide_detail(view: &View, lane: &Lane, w: usize) -> Vec<(u8, Line<'static>)> {
             out.push((if stuck { 1 } else { 3 }, line));
         }
     }
-    if let Some((since, _)) = console_error(lane) {
+    if let Some(trouble) = trouble(lane, now) {
         out.push((
             1,
             fit(
                 vec![span(
-                    format!("    runner log: connect error since {}", at(since, now)),
+                    format!("    runner log: {}", trouble_head(trouble, now)),
                     t.warn(),
                 )],
                 w,
@@ -1311,14 +1323,15 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         )),
     }
     let console = r.runner_tail.as_ref().and_then(|rt| {
-        rt.error
-            .as_ref()
-            .zip(rt.error_since)
-            .map(|((_, msg), since)| {
-                (
-                    format!("connect error since {}: {msg}", at(since, now)),
-                    t.warn(),
-                )
+        rt.trouble(now)
+            .map(|trouble| {
+                let text = match trouble {
+                    Trouble::ConsoleError { msg, .. } => {
+                        format!("{}: {msg}", trouble_head(trouble, now))
+                    }
+                    Trouble::Retrying { .. } => trouble_head(trouble, now),
+                };
+                (text, t.warn())
             })
             .or_else(|| rt.state.as_ref().map(|(_, s)| (s.clone(), t.dim())))
     });
@@ -1326,14 +1339,21 @@ fn health_section(view: &View, lane: &Lane, w: usize) -> Vec<Line<'static>> {
         // What the listener last wrote to its console, on a line of its own.
         (Some(a), Some((text, st))) => {
             out.push(fit(l, w));
-            l = vec![
-                pad(),
-                span(
-                    format!("runner log {} ago: ", dur((now - a).max(0))),
-                    t.dim(),
-                ),
-                span(text, st),
-            ];
+            // A long message wraps under the label, as the verdict does.
+            out.extend(wrap_words(
+                vec![
+                    pad(),
+                    span(
+                        format!("runner log {} ago: ", dur((now - a).max(0))),
+                        t.dim(),
+                    ),
+                ],
+                LABEL,
+                &text,
+                st,
+                w,
+            ));
+            return out;
         }
         (Some(a), None) => l.push(span(
             format!(" \u{b7} runner log {} ago", dur((now - a).max(0))),

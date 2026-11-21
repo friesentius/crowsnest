@@ -2199,10 +2199,10 @@ fn with_log_tails() -> Snapshot {
                     state: Some((now - 2 * 3600, "Listening for Jobs".into())),
                     errors: 6,
                     error_since: Some(now - 61 * 60),
-                    error: Some((
-                        now - 41 * 60,
-                        "Runner connect error: Error: Conflict. Retrying until reconnected.".into(),
-                    )),
+                    error: Some((now - 41 * 60, "Error: Conflict.".into())),
+                    failures: 40,
+                    failure_since: Some(now - 61 * 60),
+                    failure_at: Some(now - 20),
                     ..Default::default()
                 });
             }
@@ -2233,16 +2233,16 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
     open_runner(&s, &mut app, "millwork-runner");
     let text = draw_light(&s, &app, 180, 44);
     assert!(
-        text.contains("runner log 41m ago: connect error since 13:26: Runner connect error: Error: Conflict. Retrying until reconnected."),
+        text.contains("runner log 41m ago: console error since 13:26: Error: Conflict."),
         "{text}"
     );
     let wide = draw_light(&s, &app_for(&s), 180, 50);
     assert!(
-        wide.contains("runner log: connect error since 13:26"),
+        wide.contains("runner log: console error since 13:26"),
         "{wide}"
     );
     let narrow = draw_light(&s, &app_for(&s), 100, 34);
-    assert!(narrow.contains("\u{2514} log: connect error"), "{narrow}");
+    assert!(narrow.contains("\u{2514} log: console error"), "{narrow}");
     // A worker log from the job before is not this job's step.
     let mut old = s.clone();
     old.runners[0].worker_tail.as_mut().unwrap().step = Some((
@@ -2252,6 +2252,73 @@ fn log_tails_name_the_step_and_the_listener_s_errors() {
     let mut app = app_for(&old);
     open_runner(&old, &mut app, "pantry-local-runner");
     assert!(!draw_light(&old, &app, 100, 34).contains("worker log: step"));
+}
+
+#[test]
+fn a_console_error_ends_by_the_clock_and_a_long_reason_wraps() {
+    utc();
+    let mut s = with_log_tails();
+    let now = s.now;
+    let long = "Resource temporarily unavailable (broker.actions.githubusercontent.com:443).";
+    // REPLAY of the real message of 2026-10-29: the detail wraps it under
+    // its label instead of cutting it off at 100 columns.
+    for r in &mut s.runners {
+        if r.name == "millwork-runner" {
+            r.runner_tail.as_mut().unwrap().error = Some((now - 41 * 60, long.into()));
+        }
+    }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(
+        text.contains(
+            "runner log 41m ago: console error since 13:26: Resource temporarily unavailable"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("(broker.actions.githubusercontent.com:443)."),
+        "{text}"
+    );
+    assert!(!text.contains("connect error"), "{text}");
+    // The newest failing attempt is 6 minutes old: the listener got through
+    // (it prints nothing when it does), so nothing is shown, in the detail,
+    // on its lane or in the narrow panel.
+    for r in &mut s.runners {
+        if r.name == "millwork-runner" {
+            r.runner_tail.as_mut().unwrap().failure_at = Some(now - 6 * 60);
+        }
+    }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(
+        text.contains("runner log 41m ago: Listening for Jobs"),
+        "{text}"
+    );
+    assert!(!text.contains("console error"), "{text}");
+    assert!(!draw_light(&s, &app_for(&s), 180, 50).contains("console error"));
+    assert!(!draw_light(&s, &app_for(&s), 100, 34).contains("log: console error"));
+    // Failing attempts with no console error in view: retrying.
+    for r in &mut s.runners {
+        if r.name == "millwork-runner" {
+            let t = r.runner_tail.as_mut().unwrap();
+            t.errors = 0;
+            t.error = None;
+            t.error_since = None;
+            t.failures = 5;
+            t.failure_since = Some(now - 4 * 60);
+            t.failure_at = Some(now - 15);
+        }
+    }
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(
+        text.contains("runner log 41m ago: listener retrying since 14:23"),
+        "{text}"
+    );
+    assert!(draw_light(&s, &app_for(&s), 100, 34).contains("log: retrying"));
 }
 
 #[test]

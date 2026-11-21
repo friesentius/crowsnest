@@ -699,10 +699,63 @@ pub struct LogTail {
     /// for Jobs`, `Running job: ...`, `Job ... completed with result: ...`).
     pub state: Option<(i64, String)>,
     /// Runner log: the console errors written since that line (`Runner
-    /// connect error: ...`): how many, the first one's time, and the last.
+    /// connect error: ...`): how many, the first one's time, and the last
+    /// (its message without the listener's own framing).
     pub errors: usize,
     pub error_since: Option<i64>,
     pub error: Option<(i64, String)>,
+    /// Runner log: lines that show the listener failing to reach GitHub
+    /// (an `ERR` line, `Attempt N of ... failed`, `Back off ...`, `Sleeping
+    /// for N seconds before retrying`) since its last ordinary console
+    /// line: how many, the first one's time, and the newest one's. The
+    /// listener prints a console error once per outage, so these lines are
+    /// the evidence that the trouble goes on.
+    pub failures: usize,
+    pub failure_since: Option<i64>,
+    pub failure_at: Option<i64>,
+}
+
+/// How long after its newest failure line a listener still counts as in
+/// trouble. The listener's request timeout is 100 s, so this covers two
+/// failed attempts.
+pub const FAILURE_LIVE_SECS: i64 = 5 * 60;
+
+/// What a runner log says is wrong with the listener's connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trouble<'a> {
+    /// A console error, written first at `since`; `msg` is the last one.
+    ConsoleError { since: i64, msg: &'a str },
+    /// Failing attempts since `since`, with no console error in view.
+    Retrying { since: i64 },
+}
+
+impl LogTail {
+    /// The trouble the log shows as of `now`, by the clock. A listener is in
+    /// trouble while its newest failure line is younger than
+    /// [`FAILURE_LIVE_SECS`]: it prints its console error once and says
+    /// nothing when it reconnects, so how long the log has been quiet in
+    /// its own time says nothing. An ordinary console line, or a failure
+    /// line after a long quiet stretch, has already reset the counts when
+    /// the log was read.
+    pub fn trouble(&self, now: i64) -> Option<Trouble<'_>> {
+        if !self
+            .failure_at
+            .is_some_and(|f| now - f <= FAILURE_LIVE_SECS)
+        {
+            return None;
+        }
+        if let (Some(since), Some((_, msg))) = (self.error_since, self.error.as_ref()) {
+            return Some(Trouble::ConsoleError {
+                since,
+                msg: msg.as_str(),
+            });
+        }
+        // A single failed attempt is routine; a second is trouble.
+        (self.failures >= 2)
+            .then_some(self.failure_since)
+            .flatten()
+            .map(|since| Trouble::Retrying { since })
+    }
 }
 
 /// How fresh one source is.
