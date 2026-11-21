@@ -835,6 +835,28 @@ fn summary(view: &View, rows: &[Row], w: usize) -> Vec<Span<'static>> {
     v
 }
 
+/// The footer's gh marker when the rate-limit budget is the news: reads
+/// paused until GitHub's reset (`gh limit → 14:48`), or under a tenth of
+/// the REST budget left (`gh 7% left`), when reads slow down by themselves.
+fn gh_budget_chip(view: &View) -> Option<String> {
+    let t = &view.theme;
+    let (b, now) = (&view.snap.gh_budget, view.snap.now);
+    let paused = [b.core.paused(now), b.graphql.paused(now)]
+        .into_iter()
+        .flatten()
+        .max();
+    if let Some(until) = paused {
+        return Some(format!(
+            "gh limit {} {} ",
+            t.g("\u{2192}", "->"),
+            timefmt::short_when(until, now)
+        ));
+    }
+    let c = &b.core;
+    (c.limit > 0 && c.reset_at > now && c.remaining * 10 < c.limit)
+        .then(|| format!("gh {}% left ", c.remaining * 100 / c.limit))
+}
+
 fn age_of(snap: &Snapshot, tier: &str) -> Option<i64> {
     snap.fresh
         .get(tier)
@@ -1180,8 +1202,24 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
     q.sort_by(|a, b| b.pct_used.total_cmp(&a.pct_used));
     let n = 6;
     let with_reset = w >= 44;
+    // `  ↻ Sat 02:00`, or `  out Fri 12:18` for a window that runs out first.
+    let out_at = |win: &crate::model::QuotaWindow| {
+        win.runs_out_at
+            .map(|o| format!("  out {}", timefmt::short_when(o, view.snap.now)))
+    };
+    let reset_w = q
+        .iter()
+        .take(rows)
+        .filter_map(|w| out_at(w))
+        .map(|o| o.width())
+        .max()
+        .unwrap_or(0)
+        .max(13);
+    let ahead = |w: &crate::model::QuotaWindow| w.short;
+    // A column for the mark of a window that will run out, when one does.
+    let mark_w = usize::from(q.iter().take(rows).any(|w| ahead(w)));
     let label_w = w
-        .saturating_sub(n + 6 + if with_reset { 13 } else { 0 })
+        .saturating_sub(n + 6 + mark_w + if with_reset { reset_w } else { 0 })
         .clamp(6, 24);
     let shown = if q.len() > rows {
         rows.saturating_sub(1)
@@ -1199,8 +1237,20 @@ fn usage_panel(view: &View, buf: &mut Buffer, area: Rect) {
             span(" ", Style::new()),
         ];
         l.extend(bar(t, win.pct_used, n, t.used(win.pct_used)));
-        l.push(span(format!(" {:>3.0}%", win.pct_used), t.plain()));
-        if let (Some(r), true) = (win.resets_at, with_reset) {
+        // Spent faster than its clock runs: it will run out before reset.
+        // The mark follows the number, as the host panel's warnings do.
+        if ahead(win) {
+            l.push(span(format!(" {:>3.0}%", win.pct_used), t.warn()));
+            l.push(span(t.warn_glyph(), t.warn()));
+        } else {
+            l.push(span(format!(" {:>3.0}%", win.pct_used), t.plain()));
+            if mark_w > 0 {
+                l.push(span(" ", Style::new()));
+            }
+        }
+        if let (Some(o), true) = (out_at(win), with_reset) {
+            l.push(span(o, t.warn()));
+        } else if let (Some(r), true) = (win.resets_at, with_reset) {
             l.push(span(
                 format!(
                     "  {} {}",
@@ -1373,6 +1423,10 @@ fn footer(view: &View, buf: &mut Buffer, area: Rect) {
         };
         if f.error.is_some() {
             right.push(span(format!("{tier} ! "), t.warn()));
+        } else if tier == "gh"
+            && let Some(chip) = gh_budget_chip(view)
+        {
+            right.push(span(chip, t.warn()));
         } else if let Some(a) = age_of(view.snap, tier)
             && !matches!(tier, "host" | "runners")
         {

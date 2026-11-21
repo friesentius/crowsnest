@@ -5,9 +5,9 @@
 use crowsnest::app::{Action, App, all_rows};
 use crowsnest::config::{Overrides, Panel, Setting, Settings};
 use crowsnest::model::{
-    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, PrChecks, QuotaWindow, RepoHistory,
-    RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot, StaleKind, Thresholds, Worker,
-    WorkerState,
+    Check, CheckState, Disk, Freshness, Host, Job, LastEvent, LogTail, PrChecks, QuotaWindow,
+    RepoHistory, RepoRunners, RunInfo, Runner, RunnerSearch, Service, Snapshot, StaleKind,
+    Thresholds, Worker, WorkerState,
 };
 use crowsnest::options::Category;
 use crowsnest::sources::{fleet, gh, history, nm, quota};
@@ -2022,4 +2022,266 @@ fn a_long_entry_keeps_its_end_in_view() {
     let t = draw_light(&s, &app, 100, 40);
     assert!(t.contains("until/the-end-of-it\u{258f}"), "{t}");
     assert!(t.contains("\u{2026}"), "{t}");
+}
+
+/// The recorded usage, but the claude week is 86% spent with 21% of its
+/// time left: spent faster than its clock, it runs out before it resets.
+fn ahead_week() -> Snapshot {
+    let mut s = snapshot();
+    let json = fixture("quota.json").replacen(
+        "\"percentRemaining\": 65,\n          \"pace\": {\n            \"status\": \"behind\",\n            \"reservePercentPoints\": 43.9769,",
+        "\"percentRemaining\": 14,\n          \"pace\": {\n            \"status\": \"ahead\",\n            \"reservePercentPoints\": -7.0,",
+        1,
+    );
+    s.quota = quota::parse(&json).unwrap();
+    s
+}
+
+#[test]
+fn a_window_spent_faster_than_its_clock_says_when_it_runs_out() {
+    utc();
+    let s = ahead_week();
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    let week = lines_with(&wide, "claude week");
+    assert!(
+        week[0].contains("\u{2500}  86%\u{25b2}  out Fri 12:18"),
+        "{wide}"
+    );
+    // Windows on or under pace keep their reset time, in the same column.
+    assert!(
+        lines_with(&wide, "claude session")[0].contains(" 41%   \u{21bb} 15:20"),
+        "{wide}"
+    );
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(
+        lines_with(&narrow, "claude week")[0].contains("86%\u{25b2}"),
+        "{narrow}"
+    );
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
+}
+
+/// The runners fleet while GitHub refuses for rate limit: the limit was
+/// reached 4 minutes ago and resets in 21.
+fn rate_limited() -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    s.gh_budget.core = crowsnest::model::RateLimit {
+        limit: 5000,
+        remaining: 0,
+        reset_at: now + 21 * 60,
+        read_at: Some(now - 4 * 60),
+        paused_until: Some(now + 21 * 60),
+        paused_at: Some(now - 4 * 60),
+    };
+    s.jobs_read_at = Some(now - 4 * 60 - 25);
+    s
+}
+
+#[test]
+fn a_rate_limit_pause_says_until_when_and_how_old_the_queue_is() {
+    utc();
+    let s = rate_limited();
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        wide.contains("\u{25b2} GitHub limit: resumes 14:48, data 4m old"),
+        "{wide}"
+    );
+    assert!(wide.contains("gh limit \u{2192} 14:48"), "{wide}");
+    assert!(!wide.contains("gh !"), "{wide}");
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(
+        narrow.contains("\u{25b2} GitHub limit, resumes 14:48"),
+        "{narrow}"
+    );
+    // Once the reset passes, both go.
+    let mut after = s.clone();
+    after.now += 22 * 60;
+    let text = draw_light(&after, &app_for(&after), 180, 50);
+    assert!(!text.contains("GitHub limit"), "{text}");
+    assert!(!text.contains("gh limit"), "{text}");
+}
+
+#[test]
+fn rate_limited_100() {
+    utc();
+    let s = rate_limited();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 100, 34).backend());
+}
+
+#[test]
+fn rate_limited_180() {
+    utc();
+    let s = rate_limited();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
+}
+
+#[test]
+fn a_low_budget_is_shown_in_the_footer() {
+    utc();
+    let mut s = fleet_of_runners();
+    s.gh_budget.core = crowsnest::model::RateLimit {
+        limit: 5000,
+        remaining: 380,
+        reset_at: s.now + 900,
+        ..Default::default()
+    };
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(text.contains("gh 7% left"), "{text}");
+    s.gh_budget.core.remaining = 600;
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(!text.contains("% left"), "{text}");
+    assert!(text.contains("gh 25s"), "{text}");
+}
+
+#[test]
+fn a_failed_gh_read_is_not_hidden_by_the_budget_chip() {
+    utc();
+    let mut s = fleet_of_runners();
+    s.gh_budget.core = crowsnest::model::RateLimit {
+        limit: 5000,
+        remaining: 380,
+        reset_at: s.now + 900,
+        ..Default::default()
+    };
+    s.fresh.get_mut("gh").unwrap().error = Some("gh: HTTP 401: Bad credentials".into());
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(text.contains("gh !"), "{text}");
+    assert!(!text.contains("% left"), "{text}");
+    let mut s = rate_limited();
+    s.fresh.get_mut("gh").unwrap().error = Some("gh: HTTP 502".into());
+    let text = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(text.contains("gh !"), "{text}");
+    assert!(!text.contains("gh limit"), "{text}");
+}
+
+#[test]
+fn runs_past_one_page_are_disclosed() {
+    utc();
+    let mut s = snapshot();
+    s.gh_budget.runs_unread.insert("acme/pantry".into(), 3);
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(wide.contains("queue 1 +3 runs unread"), "{wide}");
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let detail = draw_light(&s, &app, 180, 44);
+    assert!(
+        detail.contains(
+            "+3 more active runs not read: only the 100 newest queued and 100 newest running are"
+        ),
+        "{detail}"
+    );
+}
+
+/// The runners fleet with log tails: pantry's worker is in setup-node with
+/// its process running, and millwork's listener keeps failing to connect.
+fn with_log_tails() -> Snapshot {
+    let mut s = fleet_of_runners();
+    let now = s.now;
+    let started = parse_iso("2026-11-19T14:18:42Z").unwrap();
+    for r in &mut s.runners {
+        match r.name.as_str() {
+            "pantry-local-runner" => {
+                r.worker_tail = Some(LogTail {
+                    step: Some((started, "Run actions/setup-node@v4".into())),
+                    process_running: true,
+                    ..Default::default()
+                });
+                r.runner_tail = Some(LogTail {
+                    state: Some((
+                        parse_iso("2026-11-19T14:18:34Z").unwrap(),
+                        "Running job: Unit + e2e tests".into(),
+                    )),
+                    ..Default::default()
+                });
+            }
+            "millwork-runner" => {
+                r.runner_tail = Some(LogTail {
+                    state: Some((now - 2 * 3600, "Listening for Jobs".into())),
+                    errors: 6,
+                    error_since: Some(now - 61 * 60),
+                    error: Some((
+                        now - 41 * 60,
+                        "Runner connect error: Error: Conflict. Retrying until reconnected.".into(),
+                    )),
+                    ..Default::default()
+                });
+            }
+            _ => {}
+        }
+    }
+    s
+}
+
+#[test]
+fn log_tails_name_the_step_and_the_listener_s_errors() {
+    utc();
+    let s = with_log_tails();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    let text = draw_light(&s, &app, 100, 34);
+    assert!(
+        text.contains(
+            "worker log: step \"Run actions/setup-node@v4\" since 14:18, process running"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("runner log 32s ago: Running job: Unit + e2e tests"),
+        "{text}"
+    );
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "millwork-runner");
+    let text = draw_light(&s, &app, 180, 44);
+    assert!(
+        text.contains("runner log 41m ago: connect error since 13:26: Runner connect error: Error: Conflict. Retrying until reconnected."),
+        "{text}"
+    );
+    let wide = draw_light(&s, &app_for(&s), 180, 50);
+    assert!(
+        wide.contains("runner log: connect error since 13:26"),
+        "{wide}"
+    );
+    let narrow = draw_light(&s, &app_for(&s), 100, 34);
+    assert!(narrow.contains("\u{2514} log: connect error"), "{narrow}");
+    // A worker log from the job before is not this job's step.
+    let mut old = s.clone();
+    old.runners[0].worker_tail.as_mut().unwrap().step = Some((
+        parse_iso("2026-11-19T13:00:00Z").unwrap(),
+        "Old step".into(),
+    ));
+    let mut app = app_for(&old);
+    open_runner(&old, &mut app, "pantry-local-runner");
+    assert!(!draw_light(&old, &app, 100, 34).contains("worker log: step"));
+}
+
+#[test]
+fn runner_log_tails_100() {
+    utc();
+    let s = with_log_tails();
+    let mut app = app_for(&s);
+    open_runner(&s, &mut app, "pantry-local-runner");
+    insta::assert_snapshot!(draw(&s, &app, 100, 34).backend());
+}
+
+#[test]
+fn runner_log_tails_180() {
+    utc();
+    let s = with_log_tails();
+    insta::assert_snapshot!(draw(&s, &app_for(&s), 180, 50).backend());
+}
+
+#[test]
+fn options_menu_refresh_has_the_github_cadence() {
+    utc();
+    let s = snapshot();
+    let app = with_settings(
+        &s,
+        Settings::default(),
+        Overrides::default(),
+        Some((Category::Refresh, "GitHub every")),
+    );
+    let text = draw_light(&s, &app, 100, 40);
+    assert!(text.contains("GitHub every"), "{text}");
+    assert!(text.contains("60 s"), "{text}");
+    insta::assert_snapshot!(draw(&s, &app, 100, 40).backend());
 }

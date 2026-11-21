@@ -5,14 +5,16 @@
 
 pub mod fleet;
 pub mod gh;
+pub mod ghapi;
 pub mod history;
 pub mod host;
 pub mod nm;
 pub mod quota;
 pub mod runners;
 
-use crate::exec::{ExecError, ReadCommand};
+use crate::exec::ReadCommand;
 use crate::model::{Fleet, Job, Pipeline, PrChecks, QuotaWindow, RepoRunners, Runner, Service};
+use ghapi::{Client, GhError};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -72,21 +74,15 @@ pub fn pr_urls(fleet: Option<&Fleet>, pipelines: &BTreeMap<String, Pipeline>) ->
 
 /// Check rollups of the PRs that resolved, keyed by the input URL, plus one
 /// error per PR GitHub could not resolve. `Err` means nothing resolved.
-pub fn read_pr_checks(urls: &[String]) -> Result<(Vec<PrChecks>, Vec<String>), String> {
+pub fn read_pr_checks(
+    gh: &mut Client,
+    urls: &[String],
+) -> Result<(Vec<PrChecks>, Vec<String>), GhError> {
     let Some(query) = gh::checks_query(urls) else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let (stdout, failure) = match (ReadCommand::GhGraphql { query }).run() {
-        Ok(out) => (out.stdout, None),
-        Err(e) => {
-            let msg = format!("gh: {e}");
-            match e {
-                ExecError::Failed { stdout, .. } => (stdout, Some(msg)),
-                _ => return Err(msg),
-            }
-        }
-    };
-    match gh::parse_checks(&stdout, urls) {
+    let (body, failure) = gh.graphql(query)?;
+    match gh::parse_checks(&body, urls) {
         Ok((prs, mut errors)) => {
             if let Some(f) = failure
                 && errors.is_empty()
@@ -95,7 +91,7 @@ pub fn read_pr_checks(urls: &[String]) -> Result<(Vec<PrChecks>, Vec<String>), S
             }
             Ok((prs, errors))
         }
-        Err(e) => Err(failure.unwrap_or(e)),
+        Err(e) => Err(GhError::Failed(failure.unwrap_or(e))),
     }
 }
 
@@ -107,92 +103,131 @@ pub fn runner_repos(runners: &[Runner]) -> Vec<String> {
     repos
 }
 
-fn gh_get(path: String) -> Result<String, String> {
-    ReadCommand::GhApiGet { path }
-        .run()
-        .map(|o| o.stdout)
-        .map_err(|e| format!("gh: {e}"))
+/// The jobs of `runs` of their repositories, each carrying the run it
+/// belongs to, read in parallel. An unchanged list is GitHub's 304, which
+/// costs nothing; a finished run's jobs never change and keep no ETag.
+fn read_runs_jobs(
+    gh: &mut Client,
+    runs: &[(String, crate::model::RunInfo)],
+    finished: bool,
+) -> Vec<Result<Vec<Job>, GhError>> {
+    let reads: Vec<(String, bool)> = runs
+        .iter()
+        .map(|(repo, run)| {
+            (
+                format!("repos/{repo}/actions/runs/{}/jobs?per_page=50", run.id),
+                !finished,
+            )
+        })
+        .collect();
+    gh.get_many(&reads)
+        .into_iter()
+        .zip(runs)
+        .map(|(out, (repo, run))| {
+            let mut jobs = gh::parse_jobs(repo, &out?).map_err(GhError::Failed)?;
+            for j in &mut jobs {
+                j.run = Some(run.clone());
+            }
+            Ok(jobs)
+        })
+        .collect()
 }
 
-/// The jobs of a run, each carrying the run it belongs to.
-fn read_run_jobs(repo: &str, run: &crate::model::RunInfo) -> Result<Vec<Job>, String> {
-    let out = gh_get(format!(
-        "repos/{repo}/actions/runs/{}/jobs?per_page=50",
-        run.id
-    ))?;
-    let mut jobs = gh::parse_jobs(repo, &out)?;
-    for j in &mut jobs {
-        j.run = Some(run.clone());
-    }
-    Ok(jobs)
+/// How many queued, and how many running, workflow runs of a repository
+/// are read: one page of each, GitHub's largest. Unchanged lists and job
+/// lists are 304s, which cost nothing, so reading them all stays cheap.
+pub const RUNS_PAGE: usize = 100;
+
+/// What the queue read found.
+#[derive(Debug, Default)]
+pub struct Queue {
+    pub jobs: Vec<Job>,
+    /// Active runs per repository beyond the page that were not read.
+    pub unread: BTreeMap<String, u64>,
 }
 
 /// Every job of the queued and running workflow runs of each repository
 /// that has a local runner: queued, running, and already finished ones.
-pub fn read_queue(runners: &[Runner]) -> Result<Vec<Job>, String> {
-    let mut jobs = Vec::new();
+pub fn read_queue(gh: &mut Client, runners: &[Runner]) -> Result<Queue, GhError> {
+    let mut q = Queue::default();
+    let mut active = Vec::new();
     for repo in runner_repos(runners) {
         let mut runs = Vec::new();
+        let mut unread = 0;
         for status in ["queued", "in_progress"] {
-            let out = gh_get(format!(
-                "repos/{repo}/actions/runs?status={status}&per_page=5"
+            let out = gh.get(&format!(
+                "repos/{repo}/actions/runs?status={status}&per_page={RUNS_PAGE}"
             ))?;
-            runs.extend(gh::parse_runs(&out)?);
+            let page = gh::parse_runs(&out).map_err(GhError::Failed)?;
+            unread += gh::total_count(&out)
+                .unwrap_or(0)
+                .saturating_sub(page.len() as u64);
+            runs.extend(page);
         }
         runs.sort_by_key(|r| r.id);
         runs.dedup_by_key(|r| r.id);
-        for run in runs.iter().take(5) {
-            jobs.extend(read_run_jobs(&repo, run)?);
+        if unread > 0 {
+            q.unread.insert(repo.clone(), unread);
         }
+        active.extend(runs.into_iter().map(|run| (repo.clone(), run)));
     }
-    Ok(jobs)
+    for jobs in read_runs_jobs(gh, &active, false) {
+        q.jobs.extend(jobs?);
+    }
+    Ok(q)
 }
 
 /// Add the latest completed runs of `repo` that `cache` has not read yet.
 /// Returns how many runs were added.
-pub fn read_history(repo: &str, cache: &mut history::RepoCache) -> Result<usize, String> {
-    let out = gh_get(format!(
+pub fn read_history(
+    gh: &mut Client,
+    repo: &str,
+    cache: &mut history::RepoCache,
+) -> Result<usize, GhError> {
+    let out = gh.get(&format!(
         "repos/{repo}/actions/runs?status=completed&per_page={}",
         history::LIST_RUNS
     ))?;
+    let new: Vec<_> = gh::parse_runs(&out)
+        .map_err(GhError::Failed)?
+        .into_iter()
+        .filter(|run| !cache.has(run))
+        .map(|run| (repo.to_string(), run))
+        .collect();
     let mut added = 0;
-    for run in gh::parse_runs(&out)? {
-        if cache.has(&run) {
-            continue;
+    let mut failure = None;
+    for ((_, run), jobs) in new.iter().zip(read_runs_jobs(gh, &new, true)) {
+        match jobs {
+            Ok(jobs) => {
+                cache.insert(run.clone(), jobs);
+                added += 1;
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
         }
-        let jobs = read_run_jobs(repo, &run)?;
-        cache.insert(run, jobs);
-        added += 1;
     }
-    Ok(added)
+    failure.map_or(Ok(added), Err)
 }
 
 /// GitHub's runner list for `repo`. Reading it needs repository admin
-/// rights; without them the answer is `denied`, not an error.
-pub fn read_gh_runners(repo: &str) -> RepoRunners {
+/// rights; without them the answer is `denied`, not an error. `Err` means
+/// the read paused for rate limit, so the last list should stay.
+pub fn read_gh_runners(gh: &mut Client, repo: &str) -> Result<RepoRunners, i64> {
     let mut r = RepoRunners {
         read_at: Some(crate::timefmt::now_epoch()),
         ..Default::default()
     };
-    match (ReadCommand::GhApiGet {
-        path: format!("repos/{repo}/actions/runners?per_page=100"),
-    })
-    .run()
-    {
-        Ok(out) => match gh::parse_runners(&out.stdout) {
+    match gh.get(&format!("repos/{repo}/actions/runners?per_page=100")) {
+        Ok(out) => match gh::parse_runners(&out) {
             Ok(list) => r.runners = list,
             Err(e) => r.error = Some(e),
         },
-        Err(ExecError::Failed { stderr, stdout, .. })
-            if [&stderr, &stdout].iter().any(|t| {
-                t.contains("HTTP 403") || t.contains("HTTP 404") || t.contains("admin rights")
-            }) =>
-        {
-            r.denied = true
-        }
-        Err(e) => r.error = Some(format!("gh: {e}")),
+        Err(GhError::Paused { until }) => return Err(until),
+        Err(e) if ghapi::denied(&e) => r.denied = true,
+        Err(e) => r.error = Some(e.to_string()),
     }
-    r
+    Ok(r)
 }
 
 /// The state of a runner's systemd unit, or `None` when systemd has no such

@@ -80,11 +80,13 @@ struct Call {
     cache: String,
 }
 
+/// The calls logged under `log`, one file per call.
 fn calls(log: &Path) -> Vec<Call> {
-    fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
+    fs::read_dir(log)
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
         .map(|l| {
+            let l = l.strip_suffix('\n').unwrap_or(&l);
             let mut f = l.split('\u{1e}');
             let mut argv = f.next().unwrap().split('\u{1f}').map(str::to_string);
             Call {
@@ -102,6 +104,7 @@ fn once_reads_everything_and_writes_nothing() {
     let root =
         PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("readonly-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
+    let log = root.join("calls");
     let (home, shims, cache, runners) = (
         root.join("fm"),
         root.join("shims"),
@@ -112,12 +115,12 @@ fn once_reads_everything_and_writes_nothing() {
         home.join("bin"),
         home.join("state"),
         shims.clone(),
+        log.clone(),
         runners.join("actions-runner-pantry"),
         runners.join("actions-runner-bookshop"),
     ] {
         fs::create_dir_all(d).unwrap();
     }
-    let log = root.join("calls.log");
     // The worktrees named in the fixture, relocated under the scratch root.
     let worktrees = root.join("worktrees");
     for wt in [
@@ -143,7 +146,9 @@ fn once_reads_everything_and_writes_nothing() {
     )
     .unwrap();
 
-    let logger = r#"{ printf '%s' "$(basename "$0")"; for a in "$@"; do printf '\037%s' "$a"; done; printf '\036%s\036%s\n' "$PWD" "$FM_SNAPSHOT_CACHE_DIR"; } >> "$CN_LOG"
+    // Each call logs to its own file: gh reads run in parallel, and writes
+    // from concurrent shims to one shared file would interleave.
+    let logger = r#"{ printf '%s' "$(basename "$0")"; for a in "$@"; do printf '\037%s' "$a"; done; printf '\036%s\036%s\n' "$PWD" "$FM_SNAPSHOT_CACHE_DIR"; } > "$(mktemp "$CN_LOG/call.XXXXXX")"
 "#;
     write_exec(
         &home.join("bin/fm-fleet-snapshot.sh"),
@@ -162,12 +167,18 @@ esac
 "#
         ),
     );
+    // Like `gh api --include`: the status and rate-limit headers first.
     write_exec(
         &shims.join("gh"),
         &format!(
-            r#"{logger}case "$*" in
-  "api graphql"*) cat "$CN_FIXTURES/gh-checks.json" ;;
-  *"repos/acme/bookshop/actions/runners"*) echo "gh: Must have admin rights to Repository. (HTTP 403)" >&2; exit 1 ;;
+            r#"{logger}head() {{ printf 'HTTP/2.0 %s\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 4321\r\nX-Ratelimit-Reset: 4102444800\r\nX-Ratelimit-Resource: %s\r\n\r\n' "$1" "$2"; }}
+case "$*" in
+  "api graphql"*) head "200 OK" graphql; cat "$CN_FIXTURES/gh-checks.json" ;;
+  *"repos/acme/bookshop/actions/runners"*) head "403 Forbidden" core; echo '{{"message": "Must have admin rights to Repository."}}'; echo "gh: Must have admin rights to Repository. (HTTP 403)" >&2; exit 1 ;;
+  *) head "200 OK" core ;;
+esac
+case "$*" in
+  "api graphql"*) ;;
   *"repos/acme/bookshop/"*) echo '{{"total_count": 0, "workflow_runs": []}}' ;;
   *"/actions/runners"*) cat "$CN_FIXTURES/gh-runners.json" ;;
   *"status=completed"*) cat "$CN_FIXTURES/gh-runs-completed.json" ;;
@@ -291,6 +302,10 @@ esac
     assert_eq!(snap["runners"][1]["service"]["active"], "active");
     assert_eq!(snap["runners"][1]["service"]["restarts"], 2);
     assert_eq!(snap["quota"].as_array().unwrap().len(), 6);
+    // The rate-limit counters came with the answers.
+    assert_eq!(snap["gh_budget"]["core"]["remaining"], 4321);
+    assert_eq!(snap["gh_budget"]["graphql"]["limit"], 5000);
+    assert!(snap["gh_budget"]["core"]["paused_until"].is_null());
 
     // Nothing under the firstmate home changed, and nothing was added.
     assert_eq!(
@@ -333,13 +348,14 @@ esac
                 assert!(c.cwd.starts_with(worktrees.to_str().unwrap()));
             }
             "gh" => match args.as_slice() {
-                ["api", "graphql", "-f", q] => {
+                ["api", "graphql", "--include", "-f", q] => {
                     assert!(
                         q.starts_with("query=query {") && !q.contains("mutation"),
                         "{q}"
                     )
                 }
-                ["api", "--method", "GET", p] => {
+                ["api", "--method", "GET", "--include", p]
+                | ["api", "--method", "GET", "--include", "-H", _, p] => {
                     assert!(
                         ["repos/acme/pantry/actions/", "repos/acme/bookshop/actions/"]
                             .iter()
@@ -376,10 +392,16 @@ fn the_allowlist_refuses_writes() {
         query: "query { x } mutation { y }".into()
     }));
     assert!(refused(ReadCommand::GhApiGet {
-        path: "user".into()
+        path: "user".into(),
+        etag: None,
     }));
     assert!(refused(ReadCommand::GhApiGet {
-        path: "repos/a/b/pulls/1 -X DELETE".into()
+        path: "repos/a/b/pulls/1 -X DELETE".into(),
+        etag: None,
+    }));
+    assert!(refused(ReadCommand::GhApiGet {
+        path: "repos/a/b/actions/runs".into(),
+        etag: Some("\"x\" -X DELETE".into()),
     }));
     assert!(refused(ReadCommand::QuotaAxi {
         providers: vec!["claude --login".into()]
@@ -402,6 +424,11 @@ fn the_allowlist_refuses_writes() {
         },
         ReadCommand::GhApiGet {
             path: "repos/a/b/actions/runs?status=queued".into(),
+            etag: None,
+        },
+        ReadCommand::GhApiGet {
+            path: "repos/a/b/actions/runs?status=queued".into(),
+            etag: Some("W/\"36458da1f62c\"".into()),
         },
         ReadCommand::QuotaAxi {
             providers: vec!["claude".into()],

@@ -23,10 +23,14 @@ pub enum ReadCommand {
     },
     /// `no-mistakes axi status`, run inside a task worktree.
     NoMistakesStatus { worktree: PathBuf },
-    /// `gh api graphql -f query=<query>`; the query must be a read query.
+    /// `gh api graphql --include -f query=<query>`; the query must be a read
+    /// query. `--include` puts the response's status and headers (GitHub's
+    /// rate-limit counters) before its body.
     GhGraphql { query: String },
-    /// `gh api --method GET <path>`.
-    GhApiGet { path: String },
+    /// `gh api --method GET --include [-H 'If-None-Match: <etag>'] <path>`.
+    /// With the ETag of an earlier answer, GitHub answers 304 when nothing
+    /// changed, and that answer does not count against the rate limit.
+    GhApiGet { path: String, etag: Option<String> },
     /// `quota-axi --no-credential-refresh --json [--provider a,b]`.
     QuotaAxi { providers: Vec<String> },
     /// `systemctl [--user] show --property=... -- <unit>`: a runner's service.
@@ -35,6 +39,21 @@ pub enum ReadCommand {
 
 /// The unit properties [`ReadCommand::SystemctlShow`] asks for.
 pub const UNIT_PROPERTIES: &str = "LoadState,ActiveState,SubState,NRestarts";
+
+/// An HTTP entity tag as GitHub sends it: `"<opaque>"` or `W/"<opaque>"`,
+/// printable ASCII without quotes or backslashes inside.
+pub fn valid_etag(etag: &str) -> bool {
+    let inner = etag
+        .strip_prefix("W/")
+        .unwrap_or(etag)
+        .strip_prefix('"')
+        .and_then(|e| e.strip_suffix('"'));
+    etag.len() <= 256
+        && inner.is_some_and(|i| {
+            i.chars()
+                .all(|c| c.is_ascii_graphic() && c != '"' && c != '\\')
+        })
+}
 
 /// A systemd unit name: no options, paths or shell syntax.
 pub fn valid_unit(unit: &str) -> bool {
@@ -140,6 +159,7 @@ impl ReadCommand {
                     args: vec![
                         "api".into(),
                         "graphql".into(),
+                        "--include".into(),
                         "-f".into(),
                         format!("query={query}"),
                     ],
@@ -148,7 +168,7 @@ impl ReadCommand {
                     timeout: Duration::from_secs(20),
                 }
             }
-            ReadCommand::GhApiGet { path } => {
+            ReadCommand::GhApiGet { path, etag } => {
                 let ok = path.starts_with("repos/")
                     && path
                         .chars()
@@ -156,9 +176,23 @@ impl ReadCommand {
                 if !ok {
                     return Err(ExecError::Refused(format!("unexpected API path {path}")));
                 }
+                let mut args: Vec<String> = vec![
+                    "api".into(),
+                    "--method".into(),
+                    "GET".into(),
+                    "--include".into(),
+                ];
+                if let Some(etag) = etag {
+                    if !valid_etag(etag) {
+                        return Err(ExecError::Refused(format!("unexpected ETag {etag}")));
+                    }
+                    args.push("-H".into());
+                    args.push(format!("If-None-Match: {etag}"));
+                }
+                args.push(path.clone());
                 Invocation {
                     program: "gh".into(),
-                    args: vec!["api".into(), "--method".into(), "GET".into(), path.clone()],
+                    args,
                     cwd: None,
                     env: quiet_env,
                     timeout: Duration::from_secs(20),
@@ -313,7 +347,10 @@ mod tests {
             "repos/a/b; rm -rf /",
             "repos/a/b --method POST",
         ] {
-            let c = ReadCommand::GhApiGet { path: bad.into() };
+            let c = ReadCommand::GhApiGet {
+                path: bad.into(),
+                etag: None,
+            };
             assert!(
                 matches!(c.invocation(), Err(ExecError::Refused(_))),
                 "{bad}"
@@ -321,9 +358,51 @@ mod tests {
         }
         let c = ReadCommand::GhApiGet {
             path: "repos/o/r/actions/runs?status=queued&per_page=10".into(),
+            etag: None,
         };
         let inv = c.invocation().unwrap();
-        assert_eq!(inv.args[..3], ["api", "--method", "GET"]);
+        assert_eq!(
+            inv.args,
+            [
+                "api",
+                "--method",
+                "GET",
+                "--include",
+                "repos/o/r/actions/runs?status=queued&per_page=10"
+            ]
+        );
+    }
+
+    #[test]
+    fn etags_are_constrained() {
+        let get = |etag: &str| ReadCommand::GhApiGet {
+            path: "repos/o/r/actions/runs/1/jobs?per_page=50".into(),
+            etag: Some(etag.into()),
+        };
+        let inv = get("W/\"36458da1f62c\"").invocation().unwrap();
+        assert_eq!(
+            inv.args[4..],
+            [
+                "-H",
+                "If-None-Match: W/\"36458da1f62c\"",
+                "repos/o/r/actions/runs/1/jobs?per_page=50"
+            ]
+        );
+        assert!(get("\"abc\"").invocation().is_ok());
+        for bad in [
+            "",
+            "abc",
+            "\"a\" -X POST",
+            "\"a\nb\"",
+            "W/abc",
+            "\"a\"b\"",
+            "\"a\\\\b\"",
+        ] {
+            assert!(
+                matches!(get(bad).invocation(), Err(ExecError::Refused(_))),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
